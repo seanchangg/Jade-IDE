@@ -19,11 +19,14 @@ mod asm;
 mod cmake;
 mod compile;
 mod dylib;
+// Visualize (§4.15): the private Manim venv and the sandboxed render.
+pub mod manim;
 mod parse;
 mod run;
 mod symbolicate;
 mod types;
 mod util;
+pub mod venv;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

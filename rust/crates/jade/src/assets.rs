@@ -55,6 +55,11 @@ icons![
     "plus", "minus", "arrow-down", "arrow-down-to-line", "arrow-up-from-line",
     // CLion hand-off (research-studio seam)
     "external-link",
+    // Explain / Visualize cards (§4.14, §4.15): retry a failed request,
+    // pause the playing clip (play is already registered).
+    "rotate-ccw", "pause",
+    // Hardware mode (board panel): step one clock, flash the real board.
+    "skip-forward", "zap",
 ];
 
 /// GPUI asset source over the compile-time-embedded icon set. Registered on the
@@ -122,6 +127,12 @@ mod tests {
         "arrow-down", "arrow-down-to-line", "arrow-up-from-line",
         // bottom panel (app.rs)
         "plus",
+        // Explain card (panels/explain_card.rs)
+        "external-link", "rotate-ccw",
+        // Visualize card (panels/visualize_card.rs)
+        "pause", "play",
+        // Hardware mode: board panel + action bar (panels/board_view.rs)
+        "skip-forward", "zap", "timer", "cpu",
     ];
 
     #[test]

@@ -1,10 +1,11 @@
 //! Typing & editing helpers (`impl Buffer`) that reproduce the Electron editor's
 //! feel (§4.1): bracket-pair auto-close with type-over, auto-surround, Enter
-//! auto-indent, and tab-as-spaces. Table-driven via [`PAIRS`] so the behavior is
-//! auditable and unit-tested.
+//! auto-indent, and a Tab key that inserts a hard tab. Table-driven via
+//! [`PAIRS`] so the behavior is auditable and unit-tested.
 
 use crate::buffer::{Buffer, PlannedEdit};
 use crate::edit::EditRecord;
+use crate::point::Point;
 use crate::selection::Selection;
 
 /// Auto-close / surround pairs, `(open, close)`. Quotes are self-closing (open ==
@@ -17,7 +18,8 @@ pub const PAIRS: &[(char, char)] = &[
     ('\'', '\''),
 ];
 
-/// Spaces per tab stop (§4.1: tabSize 4, insert-spaces).
+/// Display columns per tab stop. The code view draws a hard tab to the next
+/// multiple of this width.
 pub const TAB_WIDTH: usize = 4;
 
 /// If `ch` opens a pair, its closing char.
@@ -133,6 +135,9 @@ impl Buffer {
 
     /// Insert a newline at each caret, copying the current line's leading
     /// whitespace (auto-indent). A non-empty selection is replaced.
+    ///
+    /// Enter closes the undo group on both sides, so one undo takes back the
+    /// line you just typed and leaves the lines above it alone.
     pub fn insert_newline(&mut self) -> EditRecord {
         let mut plans = Vec::new();
         let mut finals = Vec::new();
@@ -152,30 +157,120 @@ impl Buffer {
             finals.push(Selection::at(caret));
             delta += tlen as i64 - (end - start) as i64;
         }
-        self.transact(plans, finals, true)
+        // `false`: a standalone group, so one undo takes back the line you just
+        // typed and leaves the lines above it alone.
+        self.transact(plans, finals, false)
     }
 
-    /// Insert spaces to the next tab stop at each caret (insert-spaces mode). A
-    /// non-empty selection is replaced by the spaces.
+    /// Insert one hard tab (U+0009) at each caret. A non-empty selection is
+    /// replaced by the tab.
+    ///
+    /// The buffer holds the tab as a single char, so Backspace removes a whole
+    /// indent step and the arrow keys step over one. The code view draws it to
+    /// the next [`TAB_WIDTH`] stop (see `DisplayLine`), so the indent still
+    /// looks 4 columns wide.
     pub fn insert_tab(&mut self) -> EditRecord {
         let mut plans = Vec::new();
         let mut finals = Vec::new();
         let mut delta: i64 = 0;
         for sel in self.cursors.selections() {
             let (start, end) = (sel.start(), sel.end());
-            let col = self.offset_to_point(start).col;
-            let n = TAB_WIDTH - (col % TAB_WIDTH);
-            let text = " ".repeat(n);
             plans.push(PlannedEdit {
                 start,
                 end,
-                text,
+                text: "\t".to_string(),
             });
-            let caret = (start as i64 + delta) as usize + n;
+            let caret = (start as i64 + delta) as usize + 1;
             finals.push(Selection::at(caret));
-            delta += n as i64 - (end - start) as i64;
+            delta += 1 - (end - start) as i64;
         }
         self.transact(plans, finals, true)
+    }
+
+    /// True when a selection covers more than one row. Tab indents the block in
+    /// that case, and inserts one tab in every other case.
+    pub fn selection_spans_rows(&self) -> bool {
+        self.cursors.selections().iter().any(|sel| {
+            !sel.is_empty()
+                && self.offset_to_point(sel.start()).row != self.offset_to_point(sel.end()).row
+        })
+    }
+
+    /// Add one hard tab to the start of every line the cursors touch (Tab on a
+    /// multi-row selection). An empty line stays empty, so the edit adds no
+    /// trailing whitespace. The selections keep the same text.
+    pub fn indent_lines(&mut self) -> EditRecord {
+        let mut plans = Vec::new();
+        for row in self.selected_rows() {
+            if self.line(row).is_empty() {
+                continue;
+            }
+            let start = self.point_to_offset(Point::new(row, 0));
+            plans.push(PlannedEdit {
+                start,
+                end: start,
+                text: "\t".to_string(),
+            });
+        }
+        self.reindent(plans)
+    }
+
+    /// Remove one indent step from the start of every line the cursors touch
+    /// (⇧Tab): a hard tab, else up to [`TAB_WIDTH`] spaces. A line that starts
+    /// with no whitespace does not change.
+    pub fn outdent_lines(&mut self) -> EditRecord {
+        let mut plans = Vec::new();
+        for row in self.selected_rows() {
+            let n = outdent_len(&self.line(row));
+            if n == 0 {
+                continue;
+            }
+            let start = self.point_to_offset(Point::new(row, 0));
+            plans.push(PlannedEdit {
+                start,
+                end: start + n,
+                text: String::new(),
+            });
+        }
+        self.reindent(plans)
+    }
+
+    /// Every row a cursor sits on or a selection covers, sorted and unique. A
+    /// selection that ends at column 0 does not reach into that last row, so
+    /// the row drops out (else a full-line drag indents one row too many).
+    fn selected_rows(&self) -> Vec<usize> {
+        let mut rows = Vec::new();
+        for sel in self.cursors.selections() {
+            let first = self.offset_to_point(sel.start()).row;
+            let end = self.offset_to_point(sel.end());
+            let last = if end.row > first && end.col == 0 {
+                end.row - 1
+            } else {
+                end.row
+            };
+            rows.extend(first..=last);
+        }
+        rows.sort_unstable();
+        rows.dedup();
+        rows
+    }
+
+    /// Apply whole-line indent plans and carry the cursors along, so the
+    /// selection still covers the same text after the shift. One press is one
+    /// undo step (no coalescing).
+    fn reindent(&mut self, plans: Vec<PlannedEdit>) -> EditRecord {
+        let finals: Vec<Selection> = self
+            .cursors
+            .selections()
+            .iter()
+            .map(|sel| {
+                Selection::new(
+                    map_offset(&plans, sel.anchor),
+                    map_offset(&plans, sel.head),
+                )
+            })
+            .collect();
+        self.transact(plans, finals, false)
     }
 
     /// Insert arbitrary text at each caret / over each selection (e.g. paste).
@@ -265,6 +360,36 @@ impl Buffer {
             .take_while(|c| *c == ' ' || *c == '\t')
             .collect()
     }
+}
+
+/// The bytes one outdent step removes from the start of `line`: a hard tab, or
+/// up to [`TAB_WIDTH`] spaces. Zero when the line starts with other text.
+fn outdent_len(line: &str) -> usize {
+    if line.starts_with('\t') {
+        1
+    } else {
+        line.chars().take(TAB_WIDTH).take_while(|c| *c == ' ').count()
+    }
+}
+
+/// Where `off` lands after `plans` apply. The plans are whole-line indent edits:
+/// sorted by start, non-overlapping, and each one inside the leading whitespace.
+fn map_offset(plans: &[PlannedEdit], off: usize) -> usize {
+    let mut delta: i64 = 0;
+    for p in plans {
+        if off >= p.end {
+            delta += p.text.len() as i64 - (p.end - p.start) as i64;
+        } else if off > p.start {
+            // Inside a run that an outdent removes: clamp to the new line start.
+            return (p.start as i64 + delta) as usize + p.text.len();
+        } else if off == p.start {
+            // An insert at the line start pushes the text, and this offset with
+            // it, to the right of the new indent.
+            delta += p.text.len() as i64;
+        }
+        // off < p.start: this plan, and every later one, sits after `off`.
+    }
+    (off as i64 + delta) as usize
 }
 
 fn is_word(c: char) -> bool {

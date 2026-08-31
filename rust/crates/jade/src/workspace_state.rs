@@ -64,6 +64,22 @@ pub struct WorkspaceUi {
     /// "user has no bundles"; absence must only ever mean "older writer".
     #[serde(default)]
     pub timer_groups: Vec<crate::timer_groups::TimerGroupDef>,
+    /// App mode for this workspace: `"software"` or `"hardware"` (hardware
+    /// mode, §B8). Absent = software.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Board DIP-switch positions (hardware mode), LSB first. `true` = ON.
+    #[serde(default)]
+    pub dip_switches: Vec<bool>,
+    /// Board drawer width in px (hardware mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board_width: Option<f64>,
+    /// Whether the Markdown preview panel is shown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub markdown_visible: Option<bool>,
+    /// Markdown preview panel width in px.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub markdown_width: Option<f64>,
 }
 
 /// The keys Jade writes into the `ui` object (everything except `stickyNotes`,
@@ -79,6 +95,11 @@ const OWNED_KEYS: &[&str] = &[
     "benchmarks",
     "aiCompletionEnabled",
     "timerGroups",
+    "mode",
+    "dipSwitches",
+    "boardWidth",
+    "markdownVisible",
+    "markdownWidth",
 ];
 
 /// Load Jade's UI state for a workspace (`ui` key), or the default on any error.
@@ -186,6 +207,11 @@ mod tests {
                 name: "Forward".into(),
                 members: vec!["embedForward".into(), "linearForward".into()],
             }],
+            mode: Some("hardware".into()),
+            dip_switches: vec![true, false, true, false, false],
+            board_width: Some(440.0),
+            markdown_visible: Some(true),
+            markdown_width: Some(420.0),
         };
         save_to(&path, &ui);
         assert_eq!(load_from(&path), ui);
@@ -284,5 +310,29 @@ mod tests {
         let ui = load_from(Path::new("/nonexistent/jade/workspace.json"));
         assert_eq!(ui, WorkspaceUi::default());
         assert!(ui.open_tabs.is_empty());
+    }
+
+    /// Hardware-mode fields round-trip; a file without them defaults to
+    /// software with no DIP state (§B8).
+    #[test]
+    fn mode_and_dips_roundtrip_and_default_absent() {
+        let path = tmp("hw");
+        let ui = WorkspaceUi {
+            mode: Some("hardware".into()),
+            dip_switches: vec![false, true, false, false, true],
+            board_width: Some(512.0),
+            ..Default::default()
+        };
+        save_to(&path, &ui);
+        let back = load_from(&path);
+        assert_eq!(back.mode.as_deref(), Some("hardware"));
+        assert_eq!(back.dip_switches, vec![false, true, false, false, true]);
+        assert_eq!(back.board_width, Some(512.0));
+
+        let fresh = WorkspaceUi::default();
+        assert_eq!(fresh.mode, None);
+        assert!(fresh.dip_switches.is_empty());
+        assert_eq!(fresh.board_width, None);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
 }

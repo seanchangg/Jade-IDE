@@ -4,17 +4,24 @@
 use gpui::{div, prelude::*, px, rgb, Div};
 
 pub mod asm_view;
+pub mod board_view;
 pub mod code_view;
 pub mod debug_panel;
+pub mod explain_card;
+pub mod explain_popout;
 pub mod file_tree;
+pub mod md_view;
 pub mod metric_popout;
 pub mod pre_run;
 pub mod quick_open;
 pub mod runtime_panel;
+pub mod schematic_view;
 pub mod structure_panel;
 pub mod telemetry_sidebar;
 pub mod terminal_panel;
 pub mod training_view;
+pub mod visualize_card;
+pub mod visualize_popout;
 
 /// A captured-keystroke text field's visual line, shared by every fake input
 /// (find bar, quick open, pre-run filter/bundle name). The caret is a thin

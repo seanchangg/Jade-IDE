@@ -6,6 +6,11 @@
 //! and the key→bytes encoding are factored into pure, unit-tested functions;
 //! the renderer is a thin projection over them.
 //!
+//! # Many terminals, one panel
+//! `JadeApp` keeps a [`TermSession`] per open shell and renders the active one.
+//! The header's tab strip (`app::bottom_panel`) switches between them, and this
+//! module claims the ⌘T / ⌘W / ⌘⌥←→ / ⌘1…⌘9 chords while the grid holds focus.
+//!
 //! # jade-term contract (see `crates/jade-term`)
 //! - on `TermEvent::Damaged` → `snapshot(id)` → repaint (cached in `JadeApp`);
 //! - on `TermEvent::Exited` → a dim `[exited <code>]` line;
@@ -309,6 +314,91 @@ impl TermSelection {
     }
 }
 
+/// One open terminal: its PTY id plus the view state that belongs to that
+/// terminal alone. The panel renders the active session; the others keep their
+/// snapshot, scrollback offset, and selection while they wait in the tab strip.
+pub struct TermSession {
+    /// PTY id handed out by [`TermManager`].
+    pub id: TermId,
+    /// Tab label — the base name of the directory the shell started in.
+    pub title: String,
+    /// This terminal's slot in the theme's `series` palette, which colors its
+    /// segment of the header bar. Assigned by [`next_color`] and never changes,
+    /// so a terminal keeps its color when its neighbors close.
+    pub color: usize,
+    /// Latest grid snapshot (refreshed on `Damaged` while this session is the
+    /// active one; rendered by [`render`]).
+    pub snapshot: Option<GridSnapshot>,
+    /// Set once the child exits — renders the dim `[exited <code>]` line. The
+    /// tab stays until the user closes it.
+    pub exited: bool,
+    pub exit_code: Option<i32>,
+    /// Rows scrolled up into scrollback (0 = pinned to the live bottom).
+    /// Scroll-wheel-up increases it; typing / new snapshots pin back.
+    pub scroll_back: usize,
+    /// Mouse selection over the grid, in logical (row, col) cells of the
+    /// combined `scrollback ++ viewport` buffer. ⌘C copies it as text.
+    pub sel: Option<TermSelection>,
+    /// True while the left button is down extending `sel`.
+    pub sel_dragging: bool,
+    /// The shell wrote while this terminal was in the background. The tab marks
+    /// it until the user switches to it.
+    pub activity: bool,
+}
+
+impl TermSession {
+    /// A fresh session for the terminal `id`, before its first snapshot.
+    pub fn new(id: TermId, title: String, color: usize) -> Self {
+        Self {
+            id,
+            title,
+            color,
+            snapshot: None,
+            exited: false,
+            exit_code: None,
+            scroll_back: 0,
+            sel: None,
+            sel_dragging: false,
+            activity: false,
+        }
+    }
+}
+
+/// The palette slot a new terminal takes, given the slots the open terminals
+/// already hold and a palette of `len` colors: the lowest free slot, so the bar
+/// stays as colorful as it can and a re-opened slot is re-used. Past `len` open
+/// terminals the colors have to repeat, and it wraps.
+pub fn next_color(used: &[usize], len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    (0..len)
+        .find(|slot| !used.contains(slot))
+        .unwrap_or(used.len() % len)
+}
+
+/// The tab `delta` steps along a strip of `len` tabs, wrapping at both ends
+/// (⌘⌥← / ⌘⌥→). `None` when there is nothing to move to.
+pub fn wrap_index(current: usize, len: usize, delta: i32) -> Option<usize> {
+    if len < 2 {
+        return None;
+    }
+    Some((current as i32 + delta).rem_euclid(len as i32) as usize)
+}
+
+/// The tab ⌘`nth` selects out of `len` open tabs, counting from 1. As on macOS,
+/// 9 means the last tab however many are open. `None` for a tab that is not
+/// open.
+pub fn nth_index(nth: usize, len: usize) -> Option<usize> {
+    if len == 0 || nth == 0 {
+        return None;
+    }
+    if nth == 9 {
+        return Some(len - 1);
+    }
+    (nth <= len).then_some(nth - 1)
+}
+
 /// Extract the selected cells as plain text: one line per logical row, each
 /// trimmed of trailing whitespace (grid rows are space-padded to `cols`), joined
 /// with `\n`.
@@ -346,7 +436,7 @@ const SEL_ALPHA: f32 = 0.25;
 
 /// Blend `over` onto `base` (both `0xRRGGBB`) at alpha `a`, returning opaque
 /// `0xRRGGBB` (runs render solid colors, so the wash is pre-composited).
-fn blend(base: u32, over: u32, a: f32) -> u32 {
+pub fn blend(base: u32, over: u32, a: f32) -> u32 {
     let ch = |shift: u32| {
         let b = ((base >> shift) & 0xff) as f32;
         let o = ((over >> shift) & 0xff) as f32;
@@ -392,8 +482,9 @@ fn row_runs(
     runs
 }
 
-/// Render the terminal body: a resize-measuring canvas underlay plus the grid
-/// rows. Focusable so `on_key_down` reaches [`key_to_bytes`] → `write()`.
+/// Render the active terminal's body: a resize-measuring canvas underlay plus
+/// the grid rows. Focusable so `on_key_down` reaches [`key_to_bytes`] →
+/// `write()`. Renders empty until the first [`TermSession`] opens.
 pub fn render(app: &JadeApp, handle: FocusHandle, cx: &mut Context<JadeApp>) -> impl IntoElement {
     let theme = app.theme.clone();
     let def_fg = theme.text;
@@ -431,9 +522,10 @@ pub fn render(app: &JadeApp, handle: FocusHandle, cx: &mut Context<JadeApp>) -> 
         MouseButton::Left,
         cx.listener(move |app: &mut JadeApp, ev: &MouseDownEvent, window, cx| {
             window.focus(&focus, cx);
-            if let Some(cell) = cell_at(app, &origin_down, cell_w, ev.position) {
-                app.term_sel = Some(TermSelection { anchor: cell, head: cell });
-                app.term_sel_dragging = true;
+            let cell = cell_at(app, &origin_down, cell_w, ev.position);
+            if let (Some(cell), Some(session)) = (cell, app.active_term_mut()) {
+                session.sel = Some(TermSelection { anchor: cell, head: cell });
+                session.sel_dragging = true;
                 cx.notify();
             }
         }),
@@ -444,15 +536,18 @@ pub fn render(app: &JadeApp, handle: FocusHandle, cx: &mut Context<JadeApp>) -> 
     let origin_move = app.term_origin.clone();
     let body = body.on_mouse_move(cx.listener(
         move |app: &mut JadeApp, ev: &MouseMoveEvent, _w, cx| {
-            if !app.term_sel_dragging {
+            if !app.active_term().is_some_and(|s| s.sel_dragging) {
                 return;
             }
             if ev.pressed_button != Some(MouseButton::Left) {
-                app.term_sel_dragging = false;
+                if let Some(session) = app.active_term_mut() {
+                    session.sel_dragging = false;
+                }
                 return;
             }
             let cell = cell_at(app, &origin_move, cell_w, ev.position);
-            if let (Some(cell), Some(sel)) = (cell, app.term_sel.as_mut()) {
+            let Some(session) = app.active_term_mut() else { return };
+            if let (Some(cell), Some(sel)) = (cell, session.sel.as_mut()) {
                 if sel.head != cell {
                     sel.head = cell;
                     cx.notify();
@@ -463,10 +558,11 @@ pub fn render(app: &JadeApp, handle: FocusHandle, cx: &mut Context<JadeApp>) -> 
     let body = body.on_mouse_up(
         MouseButton::Left,
         cx.listener(|app: &mut JadeApp, _ev: &MouseUpEvent, _w, cx| {
-            if app.term_sel_dragging {
-                app.term_sel_dragging = false;
-                if app.term_sel.is_some_and(|s| s.anchor == s.head) {
-                    app.term_sel = None;
+            let Some(session) = app.active_term_mut() else { return };
+            if session.sel_dragging {
+                session.sel_dragging = false;
+                if session.sel.is_some_and(|s| s.anchor == s.head) {
+                    session.sel = None;
                 }
                 cx.notify();
             }
@@ -478,7 +574,7 @@ pub fn render(app: &JadeApp, handle: FocusHandle, cx: &mut Context<JadeApp>) -> 
     // payloads. Any keystroke also pins the view back to the live bottom (like
     // every terminal: typing jumps you out of scrollback).
     let body = body.on_key_down(cx.listener(|app: &mut JadeApp, ev: &gpui::KeyDownEvent, _window, cx| {
-        let Some(id) = app.term_id else { return };
+        let Some(id) = app.active_term().map(|s| s.id) else { return };
         let ks = &ev.keystroke;
         let mods = KeyMods {
             control: ks.modifiers.control,
@@ -486,11 +582,47 @@ pub fn render(app: &JadeApp, handle: FocusHandle, cx: &mut Context<JadeApp>) -> 
             shift: ks.modifiers.shift,
             platform: ks.modifiers.platform,
         };
-        let bracketed = app.term_snapshot.as_ref().is_some_and(|s| s.bracketed_paste);
-        let app_cursor = app.term_snapshot.as_ref().is_some_and(|s| s.app_cursor);
+        let snap = app.active_term().and_then(|s| s.snapshot.as_ref());
+        let bracketed = snap.is_some_and(|s| s.bracketed_paste);
+        let app_cursor = snap.is_some_and(|s| s.app_cursor);
+        // Terminal-tab chords. Safe to claim here: `key_to_bytes` drops every
+        // cmd chord, so none of these ever reached the shell.
+        if mods.platform && !mods.control {
+            match ks.key.as_str() {
+                "t" => {
+                    app.action_new_terminal();
+                    cx.notify();
+                    return;
+                }
+                "w" => {
+                    app.action_close_terminal(id, cx);
+                    cx.notify();
+                    return;
+                }
+                "left" if mods.alt => {
+                    app.cycle_terminal(-1);
+                    cx.notify();
+                    return;
+                }
+                "right" if mods.alt => {
+                    app.cycle_terminal(1);
+                    cx.notify();
+                    return;
+                }
+                // ⌘1…⌘8 jump to that tab, ⌘9 to the last one (macOS tab order).
+                d if !mods.alt && matches!(d, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9") => {
+                    app.select_terminal_at(d.parse::<usize>().unwrap_or(1));
+                    cx.notify();
+                    return;
+                }
+                _ => {}
+            }
+        }
         // ⌘C copies the mouse selection (Ctrl+C stays the shell interrupt).
         if mods.platform && ks.key == "c" {
-            if let (Some(sel), Some(snap)) = (app.term_sel, app.term_snapshot.as_ref()) {
+            let session = app.active_term();
+            let sel = session.and_then(|s| s.sel);
+            if let (Some(sel), Some(snap)) = (sel, session.and_then(|s| s.snapshot.as_ref())) {
                 let text = selection_text(snap, &sel);
                 if !text.is_empty() {
                     cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -502,16 +634,14 @@ pub fn render(app: &JadeApp, handle: FocusHandle, cx: &mut Context<JadeApp>) -> 
         if mods.platform && ks.key == "v" {
             if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
                 app.term.write(id, &paste_bytes(&text, bracketed));
-                app.term_scroll_back = 0;
-                app.term_sel = None;
+                app.pin_terminal_to_bottom();
                 cx.notify();
             }
             return;
         }
         if let Some(bytes) = key_to_bytes(&ks.key, ks.key_char.as_deref(), mods, app_cursor) {
             app.term.write(id, &bytes);
-            app.term_scroll_back = 0;
-            app.term_sel = None;
+            app.pin_terminal_to_bottom();
             cx.notify();
         }
     }));
@@ -519,8 +649,8 @@ pub fn render(app: &JadeApp, handle: FocusHandle, cx: &mut Context<JadeApp>) -> 
     // Scroll wheel walks up/down through the scrollback window. One wheel line
     // is one grid row; clamped to the available scrollback at render time.
     let scroll_max = app
-        .term_snapshot
-        .as_ref()
+        .active_term()
+        .and_then(|s| s.snapshot.as_ref())
         .map(|s| s.scrollback.len())
         .unwrap_or(0);
     let body = body.on_scroll_wheel(cx.listener(move |app: &mut JadeApp, ev: &ScrollWheelEvent, _w, cx| {
@@ -530,9 +660,10 @@ pub fn render(app: &JadeApp, handle: FocusHandle, cx: &mut Context<JadeApp>) -> 
         };
         // Wheel-up (positive dy) reveals older lines; wheel-down returns to live.
         let rows = dy.round() as i64;
-        let next = (app.term_scroll_back as i64 + rows).clamp(0, scroll_max as i64);
-        if next != app.term_scroll_back as i64 {
-            app.term_scroll_back = next as usize;
+        let Some(session) = app.active_term_mut() else { return };
+        let next = (session.scroll_back as i64 + rows).clamp(0, scroll_max as i64);
+        if next != session.scroll_back as i64 {
+            session.scroll_back = next as usize;
             cx.notify();
         }
     }));
@@ -540,7 +671,7 @@ pub fn render(app: &JadeApp, handle: FocusHandle, cx: &mut Context<JadeApp>) -> 
     // Resize underlay: derive cols×rows from bounds, resize only on change.
     let resize = resize_canvas(
         app.term.clone(),
-        app.term_id,
+        app.active_term().map(|s| s.id),
         app.term_last_size.clone(),
         app.term_origin.clone(),
         cell_w,
@@ -548,13 +679,14 @@ pub fn render(app: &JadeApp, handle: FocusHandle, cx: &mut Context<JadeApp>) -> 
 
     let mut grid = div().absolute().top_0().left_0().flex().flex_col();
     let mut cursor_block = None;
-    if let Some(snap) = &app.term_snapshot {
+    let session = app.active_term();
+    if let Some(snap) = session.and_then(|s| s.snapshot.as_ref()) {
         // Window `rows` display lines out of `scrollback ++ cells`, offset up
         // from the live bottom by `term_scroll_back` (clamped). At offset 0 the
         // window is exactly the viewport; scrolling up reveals scrollback.
         let n = snap.scrollback.len();
         let rows = snap.rows;
-        let back = app.term_scroll_back.min(n);
+        let back = session.map(|s| s.scroll_back).unwrap_or(0).min(n);
         // Logical index of the first displayed row (0 = oldest scrollback line).
         let top = n.saturating_sub(back);
         grid = render_window(
@@ -565,14 +697,14 @@ pub fn render(app: &JadeApp, handle: FocusHandle, cx: &mut Context<JadeApp>) -> 
             def_fg,
             def_bg,
             palette,
-            app.term_sel,
+            session.and_then(|s| s.sel),
             theme.accent,
         );
         // Block cursor: fg-colored cell with the covered glyph in bg color.
         // Ink/Claude Code position the real cursor in the input box; without
         // this there is no visible caret at all. Its display row shifts down by
         // the scrollback offset, and it hides once scrolled off the top.
-        if snap.cursor.visible && !app.term_exited {
+        if snap.cursor.visible && !session.is_some_and(|s| s.exited) {
             let cur = snap.cursor;
             let disp_row = cur.line as isize + back as isize;
             if disp_row >= 0 && (disp_row as usize) < rows {
@@ -596,9 +728,9 @@ pub fn render(app: &JadeApp, handle: FocusHandle, cx: &mut Context<JadeApp>) -> 
             }
         }
     }
-    if app.term_exited {
-        let code = app
-            .term_exit_code
+    if session.is_some_and(|s| s.exited) {
+        let code = session
+            .and_then(|s| s.exit_code)
             .map(|c| c.to_string())
             .unwrap_or_else(|| "signal".to_string());
         grid = grid.child(
@@ -620,12 +752,13 @@ fn cell_at(
     cell_w: f32,
     pos: gpui::Point<Pixels>,
 ) -> Option<(usize, usize)> {
-    let snap = app.term_snapshot.as_ref()?;
+    let session = app.active_term()?;
+    let snap = session.snapshot.as_ref()?;
     let packed = origin.load(Ordering::Relaxed);
     let ox = f32::from_bits((packed >> 32) as u32);
     let oy = f32::from_bits(packed as u32);
     let n = snap.scrollback.len();
-    let top = n - app.term_scroll_back.min(n);
+    let top = n - session.scroll_back.min(n);
     Some(hit_cell(
         f32::from(pos.x) - ox,
         f32::from(pos.y) - oy,
@@ -965,5 +1098,47 @@ mod tests {
         assert_eq!(resolve_color_pal(Color::Named(1), 0, &ANSI_DARK), 0xCF6B6B);
         // Default falls back to the supplied theme default regardless of palette.
         assert_eq!(resolve_color_pal(Color::Default, 0x123456, light), 0x123456);
+    }
+
+    #[test]
+    fn tab_cycling_wraps_both_ways() {
+        // One terminal (or none) has nowhere to go — ⌘⌥←→ must not move.
+        assert_eq!(wrap_index(0, 0, 1), None);
+        assert_eq!(wrap_index(0, 1, 1), None);
+        assert_eq!(wrap_index(0, 1, -1), None);
+        // Forward, then over the end and back to the first tab.
+        assert_eq!(wrap_index(0, 3, 1), Some(1));
+        assert_eq!(wrap_index(1, 3, 1), Some(2));
+        assert_eq!(wrap_index(2, 3, 1), Some(0));
+        // Backward, then off the front and around to the last tab.
+        assert_eq!(wrap_index(2, 3, -1), Some(1));
+        assert_eq!(wrap_index(0, 3, -1), Some(2));
+    }
+
+    #[test]
+    fn colors_fill_the_lowest_free_slot_and_survive_a_close() {
+        // Terminals opened in order take the palette in order.
+        assert_eq!(next_color(&[], 5), 0);
+        assert_eq!(next_color(&[0], 5), 1);
+        assert_eq!(next_color(&[0, 1], 5), 2);
+        // Closing the middle terminal frees its slot, and the terminals that
+        // stay open keep the colors they had.
+        assert_eq!(next_color(&[0, 2], 5), 1);
+        // Past the palette the colors have to repeat.
+        assert_eq!(next_color(&[0, 1, 2, 3, 4], 5), 0);
+        assert_eq!(next_color(&[0, 1, 2, 3, 4, 0], 5), 1);
+    }
+
+    #[test]
+    fn digit_shortcuts_count_from_one_and_nine_is_last() {
+        assert_eq!(nth_index(1, 3), Some(0));
+        assert_eq!(nth_index(3, 3), Some(2));
+        // 9 is the last tab, not the ninth.
+        assert_eq!(nth_index(9, 3), Some(2));
+        assert_eq!(nth_index(9, 1), Some(0));
+        // A tab that is not open leaves the strip alone.
+        assert_eq!(nth_index(4, 3), None);
+        assert_eq!(nth_index(1, 0), None);
+        assert_eq!(nth_index(0, 3), None);
     }
 }

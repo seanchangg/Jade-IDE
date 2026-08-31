@@ -6,13 +6,20 @@
 //! stored as an [`UndoGroup`] of [`EditOp`]s plus the cursor state before/after,
 //! so undo/redo restores both text and carets.
 
+use crate::buffer::PlannedEdit;
 use crate::point::LspPosition;
 use crate::selection::Selection;
 
 /// Coalescing window: edits landing within this many milliseconds of the
-/// previous one (and not separated by a [`crate::Buffer::group_boundary`]) merge
-/// into a single undo group. Monaco-ish "typing burst" grouping.
-pub const COALESCE_MS: u64 = 300;
+/// previous one merge into a single undo group. Monaco-ish "typing burst"
+/// grouping.
+///
+/// The window is one of four gates. An edit also has to continue the group: the
+/// same [`EditKind`], at the caret the last edit left behind, with no
+/// [`crate::Buffer::group_boundary`] between them. Those gates catch the cases a
+/// timer alone gets wrong (the user clicks elsewhere and types on), so the
+/// window itself can be generous.
+pub const COALESCE_MS: u64 = 500;
 
 /// A monotonic millisecond time source, injectable so undo coalescing is
 /// deterministic under test. The real editor uses [`SystemClock`]; tests use a
@@ -149,4 +156,57 @@ pub(crate) struct UndoStack {
     /// Set by `group_boundary()`; forces the next edit to start a fresh group.
     pub boundary: bool,
     pub last_time: Option<u64>,
+    /// What the newest group did. A run merges only with its own kind.
+    pub last_kind: Option<EditKind>,
+    /// Where the newest group left each caret, sorted. Empty when it left a
+    /// live selection, which always starts a fresh group.
+    pub last_carets: Vec<usize>,
+}
+
+/// What an edit does, for undo grouping: only a run of one kind merges into one
+/// group, so a Backspace never joins the letters it deletes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum EditKind {
+    /// Every cursor inserted text and removed none (typing).
+    Insert,
+    /// Every cursor removed text and inserted none (Backspace, Delete).
+    Delete,
+    /// Anything else: a replace, a paste over a selection, a mixed batch.
+    Other,
+}
+
+impl EditKind {
+    /// Classify one transaction's plans (sorted by start, non-overlapping).
+    pub fn of(plans: &[PlannedEdit]) -> EditKind {
+        if plans.is_empty() {
+            EditKind::Other
+        } else if plans.iter().all(|p| p.start == p.end && !p.text.is_empty()) {
+            EditKind::Insert
+        } else if plans.iter().all(|p| p.start < p.end && p.text.is_empty()) {
+            EditKind::Delete
+        } else {
+            EditKind::Other
+        }
+    }
+
+    /// True when `plans` picks up exactly where `carets` left off, cursor for
+    /// cursor. A caret that moved between the two edits (a click, an arrow key,
+    /// a jump to another line) breaks the match, so the next edit opens a new
+    /// group.
+    pub fn continues(self, plans: &[PlannedEdit], carets: &[usize]) -> bool {
+        if plans.len() != carets.len() {
+            return false;
+        }
+        match self {
+            // Typing goes on at the caret the last keystroke left.
+            EditKind::Insert => plans.iter().zip(carets).all(|(p, c)| p.start == *c),
+            // Backspace takes the text before the caret, Delete the text after
+            // it. Both continue a delete run.
+            EditKind::Delete => plans
+                .iter()
+                .zip(carets)
+                .all(|(p, c)| p.start == *c || p.end == *c),
+            EditKind::Other => false,
+        }
+    }
 }

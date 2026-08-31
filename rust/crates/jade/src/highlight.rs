@@ -193,16 +193,108 @@ pub const HIGHLIGHT_QUERY: &str = r##"
 (attribute_declaration) @annotation
 "##;
 
-/// Which extensions are highlighted with the C++ grammar. Everything else falls
-/// back to plain text (§4 deliverable). Metal + CUDA reuse the C++ grammar.
-pub fn is_highlightable(path: &Path) -> bool {
-    matches!(
-        ext_lower(path).as_deref(),
+/// The Verilog highlight query (hardware mode, §B9). Same architecture as the
+/// C++ one: captures map onto the existing [`TokenPalette`].
+pub const VERILOG_HIGHLIGHT_QUERY: &str = r##"
+; ── Comments / strings / numbers ──
+(comment) @comment
+(string_literal) @string
+(integral_number) @number
+(real_number) @number
+(unsigned_number) @number
+(time_literal) @number
+
+; ── Compiler directives ──
+(include_compiler_directive) @preprocessor
+(timescale_compiler_directive) @preprocessor
+(default_nettype_compiler_directive) @preprocessor
+(text_macro_usage) @preprocessor
+
+; ── Declarations ──
+(module_header (simple_identifier) @function)
+(module_instantiation (simple_identifier) @type)
+(name_of_instance (instance_identifier) @variable)
+(port_identifier) @variable
+; $display / $finish and friends.
+(system_tf_identifier) @function
+
+; ── Keywords ──
+[
+  "module" "endmodule" "macromodule"
+  "input" "output" "inout"
+  "reg" "wire" "logic" "integer" "genvar" "real"
+  "parameter" "localparam" "defparam"
+  "assign" "always" "always_ff" "always_comb" "always_latch" "initial"
+  "posedge" "negedge"
+  "begin" "end"
+  "if" "else" "case" "casex" "casez" "endcase" "default"
+  "for" "while" "repeat" "forever"
+  "function" "endfunction" "task" "endtask" "return"
+  "generate" "endgenerate"
+  "signed" "unsigned"
+] @keyword
+
+; ── Operators / punctuation ──
+[
+  "+" "-" "*" "/" "%" "=" "==" "!=" "===" "!==" "<" ">" "<=" ">="
+  "&&" "||" "!" "&" "|" "^" "~" "<<" ">>" "<<<" ">>>" "?" "@" "#"
+] @operator
+
+[
+  "(" ")" "{" "}" "[" "]" ";" "," "." ":"
+] @delimiter
+"##;
+
+/// Which tree-sitter grammar highlights a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Grammar {
+    /// C/C++/Objective-C, plus Metal and CUDA through the same grammar.
+    Cpp,
+    /// Plain Verilog (hardware mode). SystemVerilog files parse best-effort.
+    Verilog,
+}
+
+/// The grammar for a path, or `None` for plain text.
+pub fn grammar_for(path: &Path) -> Option<Grammar> {
+    match ext_lower(path).as_deref() {
         Some(
             "cpp" | "cc" | "cxx" | "c++" | "c" | "h" | "hpp" | "hxx" | "hh" | "inl"
-                | "metal" | "cu" | "cuh" | "mm" | "m"
-        )
-    )
+            | "metal" | "cu" | "cuh" | "mm" | "m",
+        ) => Some(Grammar::Cpp),
+        Some("v" | "sv" | "svh" | "vh") => Some(Grammar::Verilog),
+        _ => None,
+    }
+}
+
+/// The auto-indent dialect for a path (Enter indent, closer re-align). Covers
+/// more extensions than [`grammar_for`]: brace languages without a grammar
+/// (Rust, JS/TS, Java …) still get brace indentation.
+pub fn indent_lang_for(path: &Path) -> jade_buffer::IndentLang {
+    use jade_buffer::IndentLang;
+    match grammar_for(path) {
+        Some(Grammar::Cpp) => IndentLang::CFamily,
+        Some(Grammar::Verilog) => IndentLang::Verilog,
+        None => match ext_lower(path).as_deref() {
+            Some("py") => IndentLang::Python,
+            Some(
+                "rs" | "js" | "jsx" | "ts" | "tsx" | "java" | "cs" | "go" | "json" | "swift"
+                | "kt",
+            ) => IndentLang::CFamily,
+            _ => IndentLang::None,
+        },
+    }
+}
+
+/// Which extensions are highlighted. Everything else falls back to plain text.
+pub fn is_highlightable(path: &Path) -> bool {
+    grammar_for(path).is_some()
+}
+
+/// True for files the C++ analysis pipeline applies to (flow arrows, size
+/// annotations, structure outline). Verilog files highlight but must not run
+/// the C++ analyzers.
+pub fn is_cpp_family(path: &Path) -> bool {
+    grammar_for(path) == Some(Grammar::Cpp)
 }
 
 fn ext_lower(path: &Path) -> Option<String> {
@@ -214,6 +306,7 @@ fn ext_lower(path: &Path) -> Option<String> {
 /// A reusable highlighter: owns the compiled [`Query`] and a per-capture color
 /// table. Cheap to construct once and reuse across files.
 pub struct Highlighter {
+    language: tree_sitter::Language,
     query: Query,
     /// `capture_colors[i]` is the palette color for capture index `i`, if the
     /// capture name maps to a token color (some captures like `@variable` on
@@ -225,14 +318,40 @@ impl Highlighter {
     /// Build the C++ highlighter with the given palette. Returns an error only if
     /// the (static) query fails to compile against the grammar.
     pub fn new_cpp(palette: TokenPalette) -> Result<Self, tree_sitter::QueryError> {
-        let language = tree_sitter_cpp::LANGUAGE;
-        let query = Query::new(&language.into(), HIGHLIGHT_QUERY)?;
+        Self::new(tree_sitter_cpp::LANGUAGE.into(), HIGHLIGHT_QUERY, palette)
+    }
+
+    /// Build the Verilog highlighter (hardware mode).
+    pub fn new_verilog(palette: TokenPalette) -> Result<Self, tree_sitter::QueryError> {
+        Self::new(
+            tree_sitter_verilog::LANGUAGE.into(),
+            VERILOG_HIGHLIGHT_QUERY,
+            palette,
+        )
+    }
+
+    /// Build the highlighter that matches `path`, or `None` for plain text or
+    /// a query-compile failure.
+    pub fn for_path(path: &Path, palette: TokenPalette) -> Option<Self> {
+        match grammar_for(path)? {
+            Grammar::Cpp => Self::new_cpp(palette).ok(),
+            Grammar::Verilog => Self::new_verilog(palette).ok(),
+        }
+    }
+
+    fn new(
+        language: tree_sitter::Language,
+        query_src: &str,
+        palette: TokenPalette,
+    ) -> Result<Self, tree_sitter::QueryError> {
+        let query = Query::new(&language, query_src)?;
         let capture_colors = query
             .capture_names()
             .iter()
             .map(|name| color_for_capture(name, &palette))
             .collect();
         Ok(Highlighter {
+            language,
             query,
             capture_colors,
         })
@@ -251,10 +370,7 @@ impl Highlighter {
         let mut bytes = vec![u32::MAX; text.len()];
 
         let mut parser = tree_sitter::Parser::new();
-        if parser
-            .set_language(&tree_sitter_cpp::LANGUAGE.into())
-            .is_err()
-        {
+        if parser.set_language(&self.language).is_err() {
             return vec![Vec::new(); line_count];
         }
         let Some(tree) = parser.parse(text, None) else {
@@ -307,12 +423,9 @@ impl Highlighter {
 /// viewer's open path and the smoke hook.
 pub fn highlight_file(path: &Path, text: &str, palette: TokenPalette) -> Vec<Vec<Span>> {
     let line_count = line_starts(text).len();
-    if !is_highlightable(path) {
-        return vec![Vec::new(); line_count];
-    }
-    match Highlighter::new_cpp(palette) {
-        Ok(h) => h.highlight(text),
-        Err(_) => vec![Vec::new(); line_count],
+    match Highlighter::for_path(path, palette) {
+        Some(h) => h.highlight(text),
+        None => vec![Vec::new(); line_count],
     }
 }
 
@@ -444,6 +557,39 @@ mod tests {
         // At least one keyword-colored span exists for the Metal qualifiers.
         let has_keyword = spans[0].iter().any(|s| s.color == p.keyword);
         assert!(has_keyword, "expected a Metal keyword span");
+    }
+
+    /// The Verilog query must compile against its grammar.
+    #[test]
+    fn verilog_query_compiles() {
+        assert!(Highlighter::new_verilog(TokenPalette::jade_dark()).is_ok());
+    }
+
+    #[test]
+    fn verilog_keywords_and_literals() {
+        let text = "// count\nmodule blink (input wire clk, output wire [4:0] led);\n    reg [25:0] count = 26'd0;\n    always @(posedge clk) count <= count + 1;\n    assign led = ~count[25:21];\nendmodule\n";
+        let p = TokenPalette::jade_dark();
+        let h = Highlighter::new_verilog(p).unwrap();
+        let spans = h.highlight(text);
+        assert_eq!(color_of(&spans, text, 0, "// count"), Some(p.comment));
+        assert_eq!(color_of(&spans, text, 1, "module"), Some(p.keyword));
+        assert_eq!(color_of(&spans, text, 1, "blink"), Some(p.function));
+        assert_eq!(color_of(&spans, text, 1, "wire"), Some(p.keyword));
+        assert_eq!(color_of(&spans, text, 2, "26'd0"), Some(p.number));
+        assert_eq!(color_of(&spans, text, 3, "posedge"), Some(p.keyword));
+        assert_eq!(color_of(&spans, text, 5, "endmodule"), Some(p.keyword));
+    }
+
+    #[test]
+    fn grammar_dispatch_by_path() {
+        assert_eq!(grammar_for(Path::new("a.cpp")), Some(Grammar::Cpp));
+        assert_eq!(grammar_for(Path::new("a.metal")), Some(Grammar::Cpp));
+        assert_eq!(grammar_for(Path::new("blink.v")), Some(Grammar::Verilog));
+        assert_eq!(grammar_for(Path::new("top.sv")), Some(Grammar::Verilog));
+        assert_eq!(grammar_for(Path::new("notes.txt")), None);
+        assert!(is_cpp_family(Path::new("a.cpp")));
+        assert!(!is_cpp_family(Path::new("blink.v")));
+        assert!(is_highlightable(Path::new("blink.v")));
     }
 
     #[test]

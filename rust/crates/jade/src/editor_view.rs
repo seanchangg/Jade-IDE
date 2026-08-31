@@ -104,6 +104,10 @@ pub struct OpenTab {
     /// switching away and back — or between tabs — restores where you were
     /// reading. Updated when the tab is switched away from; applied on return.
     pub scroll_top: usize,
+    /// True while this is the single preview ("temp") tab. A preview open
+    /// replaces this tab. The first edit clears the flag and makes the tab
+    /// permanent.
+    pub preview: bool,
 }
 
 /// The longest line's width in **display** columns — the horizontal-scroll
@@ -125,15 +129,14 @@ impl OpenTab {
     /// Build a tab from already-loaded text (fs path + tests + smokes).
     pub fn from_text(path: &Path, text: &str, palette: TokenPalette) -> OpenTab {
         let buffer = Buffer::from_text(text);
-        let highlightable = highlight::is_highlightable(path);
-        let highlighter = highlightable
-            .then(|| highlight::Highlighter::new_cpp(palette).ok())
-            .flatten();
+        let highlighter = highlight::Highlighter::for_path(path, palette);
         let highlights = match &highlighter {
             Some(h) => h.highlight(text),
             None => highlight::highlight_file(path, text, palette),
         };
-        let (sizes, flow, symbols) = if highlightable {
+        // Only the C++ family runs the static analyzers; Verilog highlights
+        // without flow/size/structure decorations.
+        let (sizes, flow, symbols) = if highlight::is_cpp_family(path) {
             (
                 size_annotations::collect_size_annotations(text),
                 flow::analyze(text),
@@ -167,6 +170,7 @@ impl OpenTab {
             highlighter,
             max_cols: max_line_cols(text),
             scroll_top: 0,
+            preview: false,
         }
     }
 
@@ -185,15 +189,22 @@ impl OpenTab {
         self.highlights.iter().map(|l| l.len()).sum()
     }
 
-    /// Whether this file's extension is highlighted / decorated.
+    /// Whether this file's extension is highlighted.
     pub fn is_code(&self) -> bool {
         highlight::is_highlightable(&self.path)
+    }
+
+    /// Whether the C++ analysis pipeline (flow/sizes/structure) applies.
+    pub fn is_cpp_family(&self) -> bool {
+        highlight::is_cpp_family(&self.path)
     }
 
     /// Post-edit bookkeeping: re-highlight eagerly (rendering must be correct on
     /// the very next frame) and arm the three decoration debounces (§10: sizes
     /// 1000ms, flow 300ms, structure 800ms). Called from every edit entry point.
     pub fn on_edited(&mut self, now_ms: u64) {
+        // The first edit makes a preview tab permanent.
+        self.preview = false;
         self.rehighlight();
         self.sizes_debounce.arm(now_ms);
         self.flow_debounce.arm(now_ms);
@@ -218,7 +229,7 @@ impl OpenTab {
     pub fn set_palette(&mut self, palette: TokenPalette) {
         self.palette = palette;
         if self.highlighter.is_some() {
-            self.highlighter = highlight::Highlighter::new_cpp(palette).ok();
+            self.highlighter = highlight::Highlighter::for_path(&self.path, palette);
         }
         self.rehighlight();
     }
@@ -228,19 +239,19 @@ impl OpenTab {
     pub fn poll_decorations(&mut self, now_ms: u64) -> bool {
         let mut changed = false;
         if self.sizes_debounce.poll(now_ms) {
-            if self.is_code() {
+            if self.is_cpp_family() {
                 self.sizes = size_annotations::collect_size_annotations(&self.buffer.to_string());
             }
             changed = true;
         }
         if self.flow_debounce.poll(now_ms) {
-            if self.is_code() {
+            if self.is_cpp_family() {
                 self.flow = flow::analyze(&self.buffer.to_string());
             }
             changed = true;
         }
         if self.struct_debounce.poll(now_ms) {
-            if self.is_code() {
+            if self.is_cpp_family() {
                 self.symbols = structure::parse_symbols(&self.buffer.to_string());
             }
             changed = true;
@@ -386,6 +397,30 @@ impl EditorState {
             return Ok(i);
         }
         let tab = OpenTab::from_file(path, self.palette)?;
+        Ok(self.push_tab(tab))
+    }
+
+    /// The index of the single preview ("temp") tab, if one is open.
+    pub fn preview_index(&self) -> Option<usize> {
+        self.tabs.iter().position(|t| t.preview)
+    }
+
+    /// Open a file as the preview tab (interactive opens): dedupe by path;
+    /// else the new tab replaces the current preview tab in place, or appends
+    /// when there is none. The first edit makes the tab permanent
+    /// ([`OpenTab::on_edited`]).
+    pub fn open_preview(&mut self, path: &Path) -> std::io::Result<usize> {
+        if let Some(i) = self.index_of(path) {
+            self.active = Some(i);
+            return Ok(i);
+        }
+        let mut tab = OpenTab::from_file(path, self.palette)?;
+        tab.preview = true;
+        if let Some(i) = self.preview_index() {
+            self.tabs[i] = tab;
+            self.active = Some(i);
+            return Ok(i);
+        }
         Ok(self.push_tab(tab))
     }
 
@@ -1179,6 +1214,43 @@ mod tests {
         e.close(0);
         assert_eq!(e.active, Some(0));
         assert_eq!(e.active_tab().unwrap().name, "b.cpp");
+    }
+
+    #[test]
+    fn preview_tab_replaces_until_edit() {
+        let dir = std::env::temp_dir().join("jade-preview-tab-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.cpp");
+        let b = dir.join("b.cpp");
+        let c = dir.join("c.cpp");
+        std::fs::write(&a, "int a;\n").unwrap();
+        std::fs::write(&b, "int b;\n").unwrap();
+        std::fs::write(&c, "int c;\n").unwrap();
+
+        let mut e = EditorState::new(TokenPalette::jade_dark());
+        // A tab from push_tab (restore path) is permanent.
+        e.push_tab(tab_from("solid.cpp", "int s;\n"));
+        // The first preview open appends.
+        e.open_preview(&a).unwrap();
+        assert_eq!(e.tabs.len(), 2);
+        assert_eq!(e.preview_index(), Some(1));
+        // The next preview open replaces the preview tab in place.
+        e.open_preview(&b).unwrap();
+        assert_eq!(e.tabs.len(), 2);
+        assert_eq!(e.tabs[1].path, b);
+        assert_eq!(e.active, Some(1));
+        // An edit makes the preview tab permanent.
+        e.tabs[1].buffer.type_char('x');
+        e.tabs[1].on_edited(0);
+        assert_eq!(e.preview_index(), None);
+        // The next preview open appends a new preview tab.
+        e.open_preview(&c).unwrap();
+        assert_eq!(e.tabs.len(), 3);
+        assert_eq!(e.preview_index(), Some(2));
+        // A re-open of an already open file only switches.
+        e.open_preview(&b).unwrap();
+        assert_eq!(e.tabs.len(), 3);
+        assert_eq!(e.active, Some(1));
     }
 
     #[test]

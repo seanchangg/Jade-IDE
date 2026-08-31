@@ -19,8 +19,15 @@
 //! wiring to consume.
 
 mod backend;
+pub mod chat;
+pub mod presets;
 
 pub use backend::InlineCompletionBackend;
+pub use chat::{
+    ApiKey, ChatBackend, ChatDelta, ChatError, ChatModel, ChatProviderId, ChatRequest, Effort,
+    KeySource, Lane, LocalStatus, StopReason,
+};
+pub use presets::ChatTier;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

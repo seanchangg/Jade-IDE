@@ -61,6 +61,8 @@ pub enum FileKind {
     Header,
     /// `.metal .cu .cl .wgsl .glsl .hlsl .vert .frag .comp` — a GPU kernel.
     Shader,
+    /// `.v .sv .svh .vh .vhd .vhdl` — a hardware description (hardware mode).
+    Hdl,
     /// `.rs .py .js .ts .go .java .swift .kt .rb .lua .cs .sql` — other code.
     Script,
     /// `.sh .bash .zsh .fish .command` — a shell script.
@@ -95,19 +97,20 @@ impl FileKind {
         match self {
             FileKind::Source => 0,
             FileKind::Header => 1,
-            FileKind::Shader => 2,
-            FileKind::Script => 3,
-            FileKind::Shell => 4,
-            FileKind::Build => 5,
-            FileKind::Config => 6,
-            FileKind::Data => 7,
-            FileKind::Table => 8,
-            FileKind::Model => 9,
-            FileKind::Doc => 10,
-            FileKind::Image => 11,
-            FileKind::Archive => 12,
-            FileKind::Lock => 13,
-            FileKind::Other => 14,
+            FileKind::Hdl => 2,
+            FileKind::Shader => 3,
+            FileKind::Script => 4,
+            FileKind::Shell => 5,
+            FileKind::Build => 6,
+            FileKind::Config => 7,
+            FileKind::Data => 8,
+            FileKind::Table => 9,
+            FileKind::Model => 10,
+            FileKind::Doc => 11,
+            FileKind::Image => 12,
+            FileKind::Archive => 13,
+            FileKind::Lock => 14,
+            FileKind::Other => 15,
         }
     }
 }
@@ -135,6 +138,9 @@ pub fn classify(name: &str) -> FileKind {
         Some("h" | "hh" | "hpp" | "hxx" | "h++" | "inl" | "ipp") => FileKind::Header,
         Some("metal" | "cu" | "cuh" | "cl" | "wgsl" | "glsl" | "hlsl" | "vert" | "frag"
         | "comp" | "spv") => FileKind::Shader,
+        // Hardware sources (hardware mode). Quartus settings files rank as
+        // Config, bitstreams as Data (below).
+        Some("v" | "sv" | "svh" | "vh" | "vhd" | "vhdl") => FileKind::Hdl,
         Some(
             "rs" | "py" | "pyi" | "js" | "mjs" | "cjs" | "ts" | "tsx" | "jsx" | "go" | "java"
             | "swift" | "kt" | "rb" | "lua" | "cs" | "php" | "pl" | "r" | "jl" | "zig"
@@ -144,9 +150,13 @@ pub fn classify(name: &str) -> FileKind {
         Some("cmake" | "mk" | "ninja" | "mak" | "gradle" | "bazel" | "bzl") => FileKind::Build,
         Some(
             "toml" | "yaml" | "yml" | "ini" | "cfg" | "conf" | "plist" | "xml" | "properties"
-            | "entitlements" | "env" | "editorconfig" | "gitignore" | "gitattributes",
+            | "entitlements" | "env" | "editorconfig" | "gitignore" | "gitattributes"
+            | "qsf" | "sdc" | "qpf",
         ) => FileKind::Config,
-        Some("json" | "jsonc" | "jsonl" | "ndjson" | "proto" | "graphql") => FileKind::Data,
+        Some(
+            "json" | "jsonc" | "jsonl" | "ndjson" | "proto" | "graphql" | "sof" | "pof"
+            | "svf" | "rbf",
+        ) => FileKind::Data,
         Some("csv" | "tsv" | "parquet" | "arrow" | "xlsx" | "db" | "sqlite" | "sqlite3") => {
             FileKind::Table
         }

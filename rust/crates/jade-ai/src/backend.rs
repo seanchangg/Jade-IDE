@@ -49,6 +49,9 @@ struct Lifecycle {
     /// run exits instead of clobbering the new server's status.
     startup_gen: u64,
     model_id: AiModelId,
+    /// The instruct tier the router's chat preset serves. Lives beside the
+    /// completion tier because both are written into one preset file.
+    chat_tier: crate::presets::ChatTier,
 }
 
 struct Shared {
@@ -99,6 +102,7 @@ impl InlineCompletionBackend {
                     proc: None,
                     startup_gen: 0,
                     model_id: AiModelId::default(),
+                    chat_tier: crate::presets::ChatTier::default(),
                 }),
                 stopped: AtomicBool::new(false),
                 managed_pid: AtomicU32::new(0),
@@ -386,7 +390,7 @@ impl Shared {
 
         // A local GGUF that is not there can never become ready, and the poll
         // loop would just time out. Say so now, with the path we looked for.
-        let (src_flag, src_value) = match model.source() {
+        let (_src_flag, _src_value) = match model.source() {
             ModelSource::Hf(repo) => ("-hf", repo.to_string()),
             ModelSource::Local(path) => {
                 if !path.exists() {
@@ -407,30 +411,44 @@ impl Shared {
 
         self.set_status(AiStatus::new(
             AiState::Starting,
-            format!("Starting {} (downloads on first use)…", model.label()),
+            format!(
+                "Starting {} + {} (downloads on first use)…",
+                model.label(),
+                life.chat_tier.label()
+            ),
         ));
 
-        // Spawn args, verbatim (TS :201-210), except that the weights may now
-        // come off disk and the batch size is per-model (see AiModelId::batch).
-        let batch = model.batch().to_string();
+        // Router mode: ONE server, two presets, each loaded on demand.
+        //
+        // The completion model cannot also serve chat — asked to follow an
+        // instruction it emits ChatML control tokens on a loop — so Jade needs
+        // a second, instruct model. Rather than supervise a second process, the
+        // server is started in llama.cpp's router mode over a generated preset
+        // file; `/infill` and `/v1/chat/completions` then select between them
+        // with the request's `model` field. An idle Jade holds no weights,
+        // because the router only loads a preset when one is asked for.
+        //
+        // The per-model flags that used to live here (`-ngl`, `-b`/`-ub`,
+        // `--ctx-size`, `--cache-reuse`) moved into the preset file, which is
+        // where the router expects them (`crate::presets::render`).
+        let preset_path = crate::presets::default_path();
+        if let Err(e) = crate::presets::write(&preset_path, model, life.chat_tier) {
+            self.set_status(AiStatus::new(
+                AiState::Error,
+                format!("Could not write the model preset file: {e}"),
+            ));
+            return;
+        }
         let mut cmd = Command::new(bin);
         cmd.args([
-            src_flag,
-            &src_value,
+            "--models-preset",
+            &preset_path.to_string_lossy(),
+            "--models-max",
+            crate::presets::MODELS_MAX,
             "--host",
             "127.0.0.1",
             "--port",
             &MANAGED_PORT.to_string(),
-            "-ngl",
-            "99", // full GPU offload (Metal)
-            "-ub",
-            &batch,
-            "-b",
-            &batch,
-            "--ctx-size",
-            "0", // use the model's full context window
-            "--cache-reuse",
-            "256", // KV-prefix reuse — the JetBrains-style cache trick
         ])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -567,6 +585,8 @@ impl Shared {
 /// Build the `/infill` request body exactly as the TS did (TS :132-142).
 fn infill_body(req: &InfillRequest) -> serde_json::Value {
     serde_json::json!({
+        // Router mode serves two presets; name the one that can do this.
+        "model": crate::presets::FIM_MODEL,
         "input_prefix": req.prefix,
         "input_suffix": req.suffix,
         "n_predict": if req.single_line { 64 } else { 96 },

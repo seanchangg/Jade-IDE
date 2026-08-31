@@ -25,6 +25,11 @@ pub struct AiPrefs {
     /// Multi-line ghost mode (`aiMultiline`): 6-line blocks vs single line.
     #[serde(default)]
     pub multiline: bool,
+    /// Visualize (§4.15) consent. Defaults to FALSE on purpose: the feature
+    /// executes model-authored Python locally, and the first ⌘⇧M shows a
+    /// one-time consent card instead of a request. Explain works without it.
+    #[serde(default)]
+    pub visualize_enabled: bool,
 
     #[serde(skip)]
     path: Option<PathBuf>,
@@ -78,18 +83,22 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("ai.json");
 
-        // Fresh (missing file) → defaults: Fast tier, single-line.
+        // Fresh (missing file) → defaults: Fast tier, single-line, and —
+        // security-relevant — Visualize OFF until consented.
         let mut p = AiPrefs::load_from(&path);
         assert_eq!(p.model, AiModelId::Fast);
         assert!(!p.multiline);
+        assert!(!p.visualize_enabled, "visualize must default to off");
 
         p.model = AiModelId::Balanced;
         p.multiline = true;
+        p.visualize_enabled = true;
         p.save();
 
         let loaded = AiPrefs::load_from(&path);
         assert_eq!(loaded.model, AiModelId::Balanced);
         assert!(loaded.multiline);
+        assert!(loaded.visualize_enabled);
 
         // Tier serializes as the lowercase tag the old Jade wrote.
         let raw = std::fs::read_to_string(&path).unwrap();

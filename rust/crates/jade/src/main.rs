@@ -39,16 +39,19 @@ mod ai_prefs;
 mod app;
 mod asm;
 mod assets;
+mod beautiful;
 mod benchmark;
 mod debug;
 mod decorations;
 mod editor_view;
+mod explain;
 mod find;
 mod fonts;
 mod format;
 mod frequency;
 mod ghost;
 mod highlight;
+mod hw;
 mod kumo;
 #[cfg(test)]
 mod interaction_tests;
@@ -64,6 +67,8 @@ mod sync;
 mod theme;
 mod timer_groups;
 mod training;
+mod video;
+mod visualize;
 mod wg3d;
 mod workspace_state;
 mod workspace_tree;
@@ -72,7 +77,7 @@ mod xp;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use jade_ai::InlineCompletionBackend;
+use jade_ai::{ChatBackend, InlineCompletionBackend};
 use jade_build::{BuildEngine, EngineConfig};
 use jade_sysmon::SystemMonitor;
 use jade_telemetry::{Event, TelemetryServer};
@@ -85,7 +90,7 @@ use gpui_platform::application;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use app::{AppDeps, AppEvent, JadeApp};
+use app::{AppDeps, AppEvent, AppMode, JadeApp};
 use workspace_tree::{is_watch_relevant, WatchDebounce};
 
 /// Match the Electron app's crisp text (`-webkit-font-smoothing: antialiased`,
@@ -195,6 +200,10 @@ fn main() {
     ));
     let sysmon = Arc::new(SystemMonitor::new());
     let ai = Arc::new(InlineCompletionBackend::new()); // constructed, NOT started
+    // Chat backend for the Explain / Visualize selection features (§4.14,
+    // §4.15). Nothing is resolved here: the credential is looked up lazily on
+    // the first request, so startup never touches the keychain.
+    let chat = Arc::new(ChatBackend::new());
     {
         let _guard = runtime.enter();
         sysmon.start(); // SystemMonitor runs from app start
@@ -220,9 +229,17 @@ fn main() {
         });
     }
 
-    let active_file = resolve_active_file(&args);
+    let mut active_file = resolve_active_file(&args);
     let workspace_root = resolve_workspace_root(&args, active_file.as_deref(), &root);
     let demo = args.iter().any(|a| a == "--train");
+    // Hardware mode (§B1): `--hardware` wins, else the folder's persisted
+    // `ui.mode`, else software.
+    let mode = resolve_mode(&args, &workspace_root);
+    // A hardware project seeds the editor with its top Verilog file — the
+    // C++-only pick above finds nothing in a Verilog folder.
+    if active_file.is_none() && mode == AppMode::Hardware {
+        active_file = hw::first_hw_file(&workspace_root);
+    }
     // "No workspace open" (inventory §2): neither --project nor --file AND no
     // restored tabs → the welcome overlay covers the editor and the tree does
     // NOT scan the fallback repo root.
@@ -251,10 +268,14 @@ fn main() {
     // managed llama-server down; `deps` moves into the window.
     let ai_cleanup = ai.clone();
 
+    // A second sender for the hardware source watch below (`app_tx` itself
+    // moves into `deps`).
+    let app_tx2 = app_tx.clone();
     let deps = AppDeps {
         server: server.clone(),
         engine,
         ai,
+        chat,
         sysmon,
         term: term.clone(),
         runtime: handle.clone(),
@@ -266,6 +287,18 @@ fn main() {
         fs_watch,
         demo,
         prefs_path: None, // real ~/.config/jade prefs
+        mode,
+        // The GUI has no test channel: the app spawns the real engine session
+        // when hardware mode starts.
+        hw_tx: None,
+        hw_watch: {
+            let handle = handle.clone();
+            let app_tx2 = app_tx2.clone();
+            Arc::new(move |root: &Path| {
+                spawn_hw_watch(root, &handle, app_tx2.clone())
+                    .map(|w| Box::new(w) as Box<dyn Send>)
+            })
+        },
     };
 
     // ── Headless smoke hook (deliverable §7) ──────────────────────────────────
@@ -301,6 +334,8 @@ fn main() {
             run_smoke_lsp(runtime, deps, target);
         } else if mode == "sighelp" {
             run_smoke_sighelp(runtime, deps, app_rx);
+        } else if mode == "hw" {
+            run_smoke_hw(runtime, deps);
         } else {
             run_smoke(runtime, deps, app_rx, &mode);
         }
@@ -334,6 +369,10 @@ fn main() {
         // no runtime to await here, and quit does not wait for us.
         cx.on_app_quit(move |_cx| {
             ai_cleanup.kill_managed_now();
+            // The same hole for the Visualize render: GPUI ends the process
+            // without dropping the tokio Child, so the sandboxed manim would
+            // outlive the app. Kill it by pid, synchronously.
+            jade_build::manim::kill_active_render();
             async {}
         })
         .detach();
@@ -431,6 +470,7 @@ fn spawn_signal_cleanup(handle: &Handle, ai: Arc<InlineCompletionBackend>) {
             _ = hup.recv() => 129,              // 128 + SIGHUP
         };
         ai.kill_managed_now();
+        jade_build::manim::kill_active_render();
         std::process::exit(code);
     });
 }
@@ -541,6 +581,84 @@ fn spawn_fs_watch(
                 }
                 if deb.poll(start.elapsed().as_millis() as u64)
                     && app_tx.send(AppEvent::TreeChanged).is_err()
+                {
+                    break;
+                }
+            } else {
+                match raw_rx.recv().await {
+                    Some(()) => deb.on_event(start.elapsed().as_millis() as u64),
+                    None => break,
+                }
+            }
+        }
+    });
+
+    Some(watcher)
+}
+
+/// Watch the workspace root for hardware-source changes (plan A5): only
+/// `.v/.qsf/.sdc` files, and never anything under `.jade/` — the build writes
+/// its artifacts there, and `is_watch_relevant` allows `.jade`, so without
+/// the exclusion every build would re-trigger itself. Each settled 250 ms
+/// burst emits one `AppEvent::Hw(SourcesChanged)`.
+fn spawn_hw_watch(
+    root: &Path,
+    handle: &Handle,
+    app_tx: UnboundedSender<AppEvent>,
+) -> Option<notify::RecommendedWatcher> {
+    use notify::{RecursiveMode, Watcher};
+
+    let (raw_tx, mut raw_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let rel_root = root.to_path_buf();
+    let watcher = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+        if let Ok(ev) = res {
+            let relevant = ev.paths.iter().any(|p| {
+                let rel = p.strip_prefix(&rel_root).unwrap_or(p);
+                let under_jade = rel
+                    .components()
+                    .any(|c| c.as_os_str() == ".jade");
+                let hw_ext = matches!(
+                    rel.extension().and_then(|e| e.to_str()),
+                    Some("v" | "sv" | "svh" | "vh" | "qsf" | "sdc")
+                );
+                !under_jade && hw_ext
+            });
+            if relevant {
+                let _ = raw_tx.send(());
+            }
+        }
+    });
+    let mut watcher = match watcher {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("[jade] hw watch unavailable: {e}");
+            return None;
+        }
+    };
+    if let Err(e) = watcher.watch(root, RecursiveMode::Recursive) {
+        eprintln!("[jade] hw watch failed for {}: {e}", root.display());
+        return None;
+    }
+
+    handle.spawn(async move {
+        let start = std::time::Instant::now();
+        let mut deb = WatchDebounce::new(250);
+        loop {
+            if deb.is_pending() {
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(50),
+                    raw_rx.recv(),
+                )
+                .await
+                {
+                    Ok(Some(())) => deb.on_event(start.elapsed().as_millis() as u64),
+                    Ok(None) => break,
+                    Err(_) => {}
+                }
+                if deb.poll(start.elapsed().as_millis() as u64)
+                    && app_tx
+                        .send(AppEvent::Hw(jade_hw::HwEvent::SourcesChanged))
+                        .is_err()
                 {
                     break;
                 }
@@ -818,6 +936,135 @@ fn run_smoke(
     });
 }
 
+/// `--smoke hw` (hardware mode, plan A10): run the headless engine loop
+/// against the workspace — build, HELLO, deterministic STEP, live LED
+/// activity, hot swap with input replay — and print `[smoke]` lines. Skips
+/// cleanly when verilator is not installed.
+fn run_smoke_hw(runtime: tokio::runtime::Runtime, deps: AppDeps) {
+    use jade_hw::{HwCommand, HwEvent, HwRunState};
+
+    if jade_hw::detect_verilator().is_err() {
+        println!("[smoke] SKIP hw: verilator is not installed (brew install verilator)");
+        return;
+    }
+    /// Drain events until `pred` matches, or report a timeout.
+    async fn wait_hw(
+        ev: &mut tokio::sync::mpsc::UnboundedReceiver<jade_hw::HwEvent>,
+        what: &str,
+        timeout_s: u64,
+        mut pred: impl FnMut(&jade_hw::HwEvent) -> bool,
+    ) -> Option<jade_hw::HwEvent> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_s);
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match tokio::time::timeout(left, ev.recv()).await {
+                Ok(Some(e)) => {
+                    if pred(&e) {
+                        return Some(e);
+                    }
+                }
+                _ => {
+                    println!("[smoke] FAIL hw: timed out waiting for {what}");
+                    return None;
+                }
+            }
+        }
+    }
+
+    let root = deps.workspace_root.clone();
+    runtime.block_on(async move {
+        let (ev_tx, mut ev) = tokio::sync::mpsc::unbounded_channel();
+        let engine = jade_hw::start_session(root.clone(), ev_tx);
+
+        let Some(done) = wait_hw(&mut ev, "the first CompileDone", 120, |e| {
+            matches!(e, HwEvent::CompileDone { .. })
+        })
+        .await
+        else {
+            return;
+        };
+        if done != (HwEvent::CompileDone { ok: true }) {
+            println!("[smoke] FAIL hw: first build failed");
+            return;
+        }
+        let Some(HwEvent::PortsDiscovered { top }) = wait_hw(&mut ev, "HELLO", 10, |e| {
+            matches!(e, HwEvent::PortsDiscovered { .. })
+        })
+        .await
+        else {
+            return;
+        };
+        println!("[smoke] hw build ok top={top}");
+
+        // Deterministic step while paused.
+        let _ = engine.commands.send(HwCommand::Pause);
+        if wait_hw(&mut ev, "paused", 5, |e| {
+            matches!(e, HwEvent::RunState(HwRunState::Paused))
+        })
+        .await
+        .is_none()
+        {
+            return;
+        }
+        let t0 = std::time::Instant::now();
+        let _ = engine.commands.send(HwCommand::Step(1 << 25));
+        let Some(HwEvent::LedFrame { bitmask, .. }) = wait_hw(&mut ev, "the stepped LED frame", 60, |e| {
+            matches!(e, HwEvent::LedFrame { .. })
+        })
+        .await
+        else {
+            return;
+        };
+        let rate = (1u64 << 25) as f64 / t0.elapsed().as_secs_f64();
+        println!(
+            "[smoke] hw step mask={bitmask:#07b} rate={:.1}Mcyc/s",
+            rate / 1e6
+        );
+
+        // Live run shows LED activity.
+        let _ = engine.commands.send(HwCommand::Resume);
+        let mut masks = std::collections::HashSet::new();
+        let live_deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(1500);
+        while std::time::Instant::now() < live_deadline && masks.len() < 2 {
+            let left = live_deadline.saturating_duration_since(std::time::Instant::now());
+            match tokio::time::timeout(left, ev.recv()).await {
+                Ok(Some(HwEvent::LedFrame { bitmask, .. })) => {
+                    masks.insert(bitmask);
+                }
+                Ok(Some(_)) => {}
+                _ => break,
+            }
+        }
+
+        // Hot swap with DIP replay.
+        let _ = engine.commands.send(HwCommand::SetDip(2, true));
+        let _ = engine.commands.send(HwCommand::Recompile);
+        if wait_hw(&mut ev, "the hot-swap CompileDone", 60, |e| {
+            matches!(e, HwEvent::CompileDone { ok: true })
+        })
+        .await
+        .is_none()
+        {
+            return;
+        }
+        if wait_hw(&mut ev, "HELLO after the hot swap", 10, |e| {
+            matches!(e, HwEvent::PortsDiscovered { .. })
+        })
+        .await
+        .is_none()
+        {
+            return;
+        }
+        engine.stop();
+        let _ = engine.task.await;
+        println!(
+            "[smoke] hw ok live_masks={} hot_swap=ok replay=ok",
+            masks.len()
+        );
+    });
+}
+
 /// `--smoke decorations <file>` (Phase-4 wave 3): run the static size scanner
 /// and the flow analyzer over a file and print a machine-readable line proving
 /// both pure pipelines work headlessly. No window; no app state needed.
@@ -1088,6 +1335,18 @@ fn resolve_workspace_root(args: &[String], active: Option<&std::path::Path>, roo
         }
     }
     root.to_path_buf()
+}
+
+/// The app mode at launch (§B1): `--hardware` forces hardware mode; else the
+/// workspace's persisted `ui.mode`; else software.
+fn resolve_mode(args: &[String], workspace_root: &Path) -> AppMode {
+    if args.iter().any(|a| a == "--hardware") {
+        return AppMode::Hardware;
+    }
+    if workspace_state::load(workspace_root).mode.as_deref() == Some("hardware") {
+        return AppMode::Hardware;
+    }
+    AppMode::Software
 }
 
 /// Whether a workspace is considered "open" at launch (inventory §2): true when

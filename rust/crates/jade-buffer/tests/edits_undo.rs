@@ -122,7 +122,7 @@ fn typing_past_window_splits_groups() {
     let (mut b, clock) = manual();
     clock.set(0);
     b.type_char('a');
-    clock.set(400); // > 300ms COALESCE window
+    clock.set(700); // > the 500ms COALESCE window
     b.type_char('b');
     assert_eq!(b.to_string(), "ab");
     assert!(b.undo());
@@ -148,10 +148,10 @@ fn redo_stack_cleared_by_new_edit() {
     let (mut b, clock) = manual();
     clock.set(0);
     b.type_char('a');
-    clock.set(400);
+    clock.set(700);
     b.type_char('b');
     b.undo(); // "a", 'b' on redo stack
-    clock.set(800);
+    clock.set(1400);
     b.type_char('c'); // new edit clears redo
     assert_eq!(b.to_string(), "ac");
     assert!(!b.redo());
@@ -202,4 +202,114 @@ fn set_selection_and_edit_over_selection() {
     b.insert_text("bye");
     assert_eq!(b.to_string(), "bye");
     assert_eq!(b.selection().caret(), 3);
+}
+
+// ── Chunked undo: what joins a typing burst and what breaks it ──────────────
+
+#[test]
+fn typed_keystrokes_coalesce_into_one_undo() {
+    // The platform text-input path: one `edit_typed` per character.
+    let (mut b, clock) = manual();
+    for (i, ch) in "hello".chars().enumerate() {
+        clock.set(i as u64 * 80);
+        let caret = b.selection().caret();
+        b.edit_typed(caret..caret, &ch.to_string());
+    }
+    assert_eq!(b.to_string(), "hello");
+    assert!(b.undo());
+    assert_eq!(b.to_string(), "", "one undo takes back the whole word");
+    assert!(b.redo());
+    assert_eq!(b.to_string(), "hello", "one redo puts it back");
+}
+
+#[test]
+fn a_caret_jump_breaks_the_burst() {
+    let (mut b, clock) = manual_text("ab");
+    clock.set(0);
+    b.set_caret(0);
+    b.edit_typed(0..0, "X"); // "Xab"
+    clock.set(50); // well inside the window
+    b.set_caret(3); // …but the caret jumped to the end
+    b.edit_typed(3..3, "Y"); // "XabY"
+    assert_eq!(b.to_string(), "XabY");
+    assert!(b.undo());
+    assert_eq!(b.to_string(), "Xab", "only the second letter came back off");
+}
+
+#[test]
+fn a_delete_run_is_one_undo_and_does_not_join_the_typing() {
+    let (mut b, clock) = manual();
+    clock.set(0);
+    b.edit_typed(0..0, "abc");
+    clock.set(50);
+    b.delete_backward();
+    clock.set(100);
+    b.delete_backward();
+    assert_eq!(b.to_string(), "a");
+    assert!(b.undo());
+    assert_eq!(b.to_string(), "abc", "both deletes undo together");
+    assert!(b.undo());
+    assert_eq!(b.to_string(), "", "the typing is a separate group");
+}
+
+#[test]
+fn forward_deletes_coalesce_too() {
+    let (mut b, clock) = manual_text("abcd");
+    clock.set(0);
+    b.set_caret(1);
+    b.delete_forward();
+    clock.set(60);
+    b.delete_forward();
+    assert_eq!(b.to_string(), "ad");
+    assert!(b.undo());
+    assert_eq!(b.to_string(), "abcd");
+}
+
+#[test]
+fn enter_closes_the_group_on_both_sides() {
+    let (mut b, clock) = manual();
+    clock.set(0);
+    b.edit_typed(0..0, "one");
+    clock.set(40);
+    b.insert_newline();
+    clock.set(80);
+    b.edit_typed(4..4, "two");
+    assert_eq!(b.to_string(), "one\ntwo");
+    assert!(b.undo());
+    assert_eq!(b.to_string(), "one\n", "the second line goes first");
+    assert!(b.undo());
+    assert_eq!(b.to_string(), "one", "then the newline");
+    assert!(b.undo());
+    assert_eq!(b.to_string(), "", "then the first line");
+}
+
+#[test]
+fn typing_over_a_selection_starts_its_own_group() {
+    let (mut b, clock) = manual_text("abc");
+    clock.set(0);
+    b.set_caret(3);
+    b.edit_typed(3..3, "d"); // "abcd"
+    clock.set(40);
+    b.set_selection(Selection::new(0, 4));
+    b.edit_typed(0..4, "Z"); // replace the lot
+    assert_eq!(b.to_string(), "Z");
+    assert!(b.undo());
+    assert_eq!(b.to_string(), "abcd", "the replace undoes alone");
+}
+
+#[test]
+fn a_programmatic_edit_stays_a_separate_group() {
+    // `edit` (completion accept, ghost accept, sync rewrite) never joins a burst.
+    let (mut b, clock) = manual();
+    clock.set(0);
+    b.edit_typed(0..0, "ab");
+    clock.set(40);
+    b.edit(2..2, "cd");
+    clock.set(80);
+    b.edit_typed(4..4, "ef");
+    assert_eq!(b.to_string(), "abcdef");
+    assert!(b.undo());
+    assert_eq!(b.to_string(), "abcd");
+    assert!(b.undo());
+    assert_eq!(b.to_string(), "ab");
 }

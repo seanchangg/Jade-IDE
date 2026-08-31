@@ -101,6 +101,8 @@ Registered as Monaco commands (`app.ts:609-656`, `editor-manager.ts:106-131`):
 | ⌘P | Quick Open |
 | ⌘S | Save active file |
 | ⌘W | Close active tab |
+| ⌘⇧E | Explain the selection (§4.14) |
+| ⌘⇧M | Visualize the selection (§4.15) |
 | ⌥→/⌥← (+⇧) | Punctuation-aware word nav / select |
 
 Contextual: Quick Open (Esc/↑/↓/Enter, `app.ts:963-983`); inline rename/create and
@@ -251,6 +253,47 @@ Ghost text via Monaco inlineSuggest (Tab accept / Esc dismiss),
 appearing ≥2 times, length ≥3, case-insensitive prefix match, ranked by frequency
 (sortText `10000-count`), shown with detail `×{count}`. Runs alongside LSP
 completion.
+
+### 4.14 Explain (⌘⇧E) `[IDENTITY — Rust-era feature, no Electron ancestor]`
+Select code, press ⌘⇧E: a card anchored to the selection streams a prose
+explanation. Context: the selection, clangd hover declarations for its
+identifiers (≤12, `SYMBOL_BUDGET`-bounded), a declaration-only file outline,
+±30 surrounding lines (`explain.rs`). Providers: Anthropic (streaming Messages
+API, `Lane::Explain`) with fallback to the managed llama-server instruct
+preset. Card: `beautiful` design system, measured-height slide placement
+(`clamp_card`), stale marking on edits, pop-out window, Esc closes. The bind
+lives in BOTH `editor_key` and the root `on_key_down`.
+
+### 4.15 Visualize (⌘⇧M) `[IDENTITY — Rust-era feature, no Electron ancestor]`
+Select code, press ⌘⇧M: the model writes a Manim Community scene as one
+schema-validated JSON response (`suitable`, `reason`, `title`, `script`,
+`duration_s`); Jade renders it to an mp4 and plays it in the card with
+transport controls (▶/⏸, zero-tolerance scrub, times, replay) and a pop-out.
+Independent of Explain: own lane, own card; both can be open at once.
+
+Gating, in order, so an unnecessary visualizer never runs on inappropriate
+code: (1) `visualize::precheck` locally rejects data languages (json/toml/
+markdown/text) and selections with no executable code — free, no request;
+(2) the prompt + required `suitable` schema field make the model decline
+fragments with no data movement or control flow to show (the card ends as
+"Skipped" with the reason); (3) `manim::validate_scene_script` rejects any
+script that is not exactly one `class JadeScene(Scene)` with only
+`from manim import *` (a speed bump, not a boundary).
+
+Security: `ai_prefs.visualize_enabled` defaults to false — first ⌘⇧M shows a
+one-time consent card (Enter accepts, Esc declines). The render runs under
+`sandbox-exec`: no network, writes only inside the per-request work dir,
+`/Users` reads denied except the venv and work dir (probed by
+`jade-build/tests/manim_sandbox.rs`). 180s wall cap; pid killed from
+`on_app_quit` and the signal handler. Manim lives in a private venv at
+`~/.local/share/jade/manim-venv` — never the user's Python. Renders cache in
+`<workspace>/.jade/manim/<hash>/`, pruned to 20. `StopReason::MaxTokens` is a
+failure (a truncated script cannot run); `ChatModel::Local` is refused.
+Playback: AVPlayer + AVPlayerItemVideoOutput decoding 420f IOSurface-backed
+CVPixelBuffers into `gpui::surface()`, pumped once per
+`request_animation_frame` only while playing and on-screen
+(`ensure_video_frame`); wrong-format frames degrade to a banner instead of
+tripping GPUI's format assert.
 
 ---
 

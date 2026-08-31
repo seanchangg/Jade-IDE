@@ -1,5 +1,5 @@
 //! Typing helpers: bracket auto-close, type-over, auto-surround, quote rules,
-//! Enter auto-indent, tab-as-spaces, and the grapheme-aware deletes.
+//! Enter auto-indent, the hard-tab Tab key, and the grapheme-aware deletes.
 
 use jade_buffer::{Buffer, Selection};
 
@@ -132,27 +132,38 @@ fn enter_splits_line_and_indents() {
 }
 
 #[test]
-fn tab_inserts_spaces_to_next_tab_stop() {
+fn tab_inserts_a_hard_tab() {
     let mut b = Buffer::from_text("");
     b.insert_tab();
-    assert_eq!(b.to_string(), "    "); // col 0 → 4 spaces
+    assert_eq!(b.to_string(), "\t");
+    assert_eq!(b.selection().caret(), 1);
 }
 
 #[test]
-fn tab_aligns_to_tab_stop_from_mid_column() {
+fn tab_inserts_one_char_from_mid_column() {
     let mut b = Buffer::from_text("ab");
-    b.set_caret(2); // col 2 → 2 spaces to next stop
+    b.set_caret(2);
     b.insert_tab();
-    assert_eq!(b.to_string(), "ab  ");
-    assert_eq!(b.selection().caret(), 4);
+    assert_eq!(b.to_string(), "ab\t");
+    assert_eq!(b.selection().caret(), 3);
 }
 
 #[test]
-fn tab_from_col_one() {
-    let mut b = Buffer::from_text("a");
-    b.set_caret(1); // col 1 → 3 spaces
+fn tab_replaces_a_selection() {
+    let mut b = Buffer::from_text("abcd");
+    b.set_selection(Selection::new(1, 3));
     b.insert_tab();
-    assert_eq!(b.to_string(), "a   ");
+    assert_eq!(b.to_string(), "a\td");
+    assert_eq!(b.selection().caret(), 2);
+}
+
+#[test]
+fn backspace_removes_a_whole_indent_step() {
+    let mut b = Buffer::from_text("");
+    b.insert_tab();
+    b.insert_tab();
+    b.delete_backward();
+    assert_eq!(b.to_string(), "\t"); // one press, one indent step
 }
 
 #[test]
@@ -226,4 +237,103 @@ fn insert_newline_then_delete_backward_roundtrips() {
     assert_eq!(b.to_string(), "a\nb");
     b.delete_backward();
     assert_eq!(b.to_string(), "ab");
+}
+
+// ── Block indent / outdent (Tab and ⇧Tab over a selection) ──────────────────
+
+/// Select from row 0 to row 1, so both rows shift.
+fn select_rows(b: &mut Buffer, from: usize, to: usize) {
+    b.set_selection(Selection::new(from, to));
+}
+
+#[test]
+fn tab_over_a_multi_row_selection_indents_each_line() {
+    let mut b = Buffer::from_text("a\nb\nc");
+    select_rows(&mut b, 0, 3); // "a\nb"
+    assert!(b.selection_spans_rows());
+    b.indent_lines();
+    assert_eq!(b.to_string(), "\ta\n\tb\nc"); // row 2 is outside the selection
+}
+
+#[test]
+fn indent_keeps_the_selection_on_the_same_text() {
+    let mut b = Buffer::from_text("a\nb");
+    select_rows(&mut b, 0, 3);
+    b.indent_lines();
+    let sel = b.selection();
+    assert_eq!(&b.to_string()[sel.start()..sel.end()], "a\n\tb");
+}
+
+#[test]
+fn indent_skips_an_empty_line() {
+    let mut b = Buffer::from_text("a\n\nb");
+    select_rows(&mut b, 0, 4);
+    b.indent_lines();
+    assert_eq!(b.to_string(), "\ta\n\n\tb"); // no trailing whitespace on row 1
+}
+
+#[test]
+fn a_selection_ending_at_column_zero_leaves_that_row_alone() {
+    let mut b = Buffer::from_text("a\nb\nc");
+    select_rows(&mut b, 0, 2); // "a\n" — the caret sits at the start of row 1
+    b.indent_lines();
+    assert_eq!(b.to_string(), "\ta\nb\nc");
+}
+
+#[test]
+fn outdent_removes_a_hard_tab() {
+    let mut b = Buffer::from_text("\ta\n\tb");
+    select_rows(&mut b, 0, 5);
+    b.outdent_lines();
+    assert_eq!(b.to_string(), "a\nb");
+}
+
+#[test]
+fn outdent_removes_up_to_four_spaces() {
+    let mut b = Buffer::from_text("      a\n  b\nc");
+    select_rows(&mut b, 0, 12);
+    b.outdent_lines();
+    assert_eq!(b.to_string(), "  a\nb\nc"); // 6→2 spaces, 2→0, and c is untouched
+}
+
+#[test]
+fn outdent_works_with_no_selection() {
+    let mut b = Buffer::from_text("\t\tx");
+    b.set_caret(3); // caret after the two tabs, no selection
+    b.outdent_lines();
+    assert_eq!(b.to_string(), "\tx");
+    assert_eq!(b.selection().caret(), 2); // the caret rode along with the text
+}
+
+#[test]
+fn outdent_clamps_a_caret_that_sits_inside_the_removed_run() {
+    let mut b = Buffer::from_text("    x");
+    b.set_caret(2); // inside the four spaces
+    b.outdent_lines();
+    assert_eq!(b.to_string(), "x");
+    assert_eq!(b.selection().caret(), 0);
+}
+
+#[test]
+fn outdent_on_a_line_with_no_indent_changes_nothing() {
+    let mut b = Buffer::from_text("x\ny");
+    select_rows(&mut b, 0, 3);
+    b.outdent_lines();
+    assert_eq!(b.to_string(), "x\ny");
+}
+
+#[test]
+fn indent_then_outdent_round_trips() {
+    let mut b = Buffer::from_text("a\n  b\n\nc");
+    select_rows(&mut b, 0, 8); // the whole buffer
+    b.indent_lines();
+    b.outdent_lines();
+    assert_eq!(b.to_string(), "a\n  b\n\nc");
+}
+
+#[test]
+fn a_single_row_selection_does_not_span_rows() {
+    let mut b = Buffer::from_text("abc");
+    select_rows(&mut b, 0, 2);
+    assert!(!b.selection_spans_rows()); // Tab inserts one tab over it instead
 }

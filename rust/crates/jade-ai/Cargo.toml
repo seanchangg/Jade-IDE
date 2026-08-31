@@ -16,7 +16,13 @@ serde_json = { workspace = true }
 libc = "0.2"
 # rustls keeps us off OpenSSL; all managed traffic is plain HTTP to 127.0.0.1,
 # but JADE_FIM_ENDPOINT may point at any (possibly https) host — see TS :52.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# `stream` gives `Response::bytes_stream()`, which the chat layer needs to
+# read SSE incrementally — without it a streaming response can only be awaited
+# whole, which defeats the point.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+# `StreamExt::next` over that byte stream. Default features pull in an executor
+# and the `async-await` proc macros we do not use.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

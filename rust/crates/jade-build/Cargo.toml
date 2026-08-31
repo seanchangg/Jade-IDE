@@ -11,6 +11,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 regex = "1"
 jade-telemetry = { path = "../jade-telemetry" }
+# SIGKILL of the sandboxed manim render by pid (manim.rs) — the same teardown
+# jade-ai uses for the managed llama-server, for the same GPUI-quit reason.
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

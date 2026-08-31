@@ -38,7 +38,9 @@
 //! 1 UTF-16 unit), `🎉` (4-byte UTF-8, 2 UTF-16 units), and mixed content.
 //!
 //! # What the editor element calls
-//! * **Per keystroke:** one of [`Buffer::type_char`], [`Buffer::insert_newline`],
+//! * **Per keystroke:** one of [`Buffer::type_char`], [`Buffer::insert_newline`]
+//!   (or [`Buffer::insert_newline_auto`] with the tab's [`IndentLang`], plus
+//!   [`Buffer::auto_reindent_line`] after a typed character),
 //!   [`Buffer::insert_tab`], [`Buffer::delete_backward`],
 //!   [`Buffer::delete_forward`], [`Buffer::delete_word_back`], a movement op
 //!   (`move_left`/`move_word_right`/… with an `extend` flag), or
@@ -51,6 +53,7 @@
 
 mod buffer;
 mod edit;
+mod indent;
 mod movement;
 mod point;
 mod selection;
@@ -60,6 +63,7 @@ pub use buffer::Buffer;
 pub use edit::{
     Clock, EditRecord, LspChange, ManualClock, ManualClockHandle, SystemClock, COALESCE_MS,
 };
+pub use indent::IndentLang;
 pub use point::{LspPosition, Point};
 pub use selection::{CursorSet, Selection};
 pub use typing::{PAIRS, TAB_WIDTH};

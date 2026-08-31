@@ -4,6 +4,7 @@ members = [
     "crates/jade-telemetry",
     "crates/jade-buffer",
     "crates/jade-build",
+    "crates/jade-hw",
     "crates/jade-debug",
     "crates/jade-lsp",
     "crates/jade-ai",

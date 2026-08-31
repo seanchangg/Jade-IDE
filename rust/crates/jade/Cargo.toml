@@ -7,11 +7,13 @@ description = "Jade — memory-aware C++/Metal IDE with live GPU training visual
 
 [dependencies]
 # Zed's GPU-accelerated UI framework, used as a library — Jade borrows the
-# engine, not the editor shell. Pinned by rev once the spike stabilizes.
-gpui = { git = "https://github.com/zed-industries/zed" }
+# engine, not the editor shell. Pinned by rev: the video card builds on
+# `surface()`/`SurfaceSource`, which carries no stability guarantee on `main`
+# (§4.15 risk 6). Bump deliberately, with the video card re-tested.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "56ab1c48257094573707ab1548bdd3b8dec6d8d8" }
 # font-kit is off by default and without it gpui_macos has no font provider —
 # no text renders at all (bites every standalone GPUI consumer).
-gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "56ab1c48257094573707ab1548bdd3b8dec6d8d8", features = ["font-kit"] }
 jade-telemetry = { path = "../jade-telemetry" }
 jade-build = { path = "../jade-build" }
 jade-debug = { path = "../jade-debug" }
@@ -43,6 +45,13 @@ serde_json = { workspace = true }
 # jade-dark palette (§4.2).
 tree-sitter = "0.25"
 tree-sitter-cpp = "0.23"
+# Verilog grammar for hardware mode (§B9): plain-Verilog highlighting in the
+# same query architecture as the C++ one. Preferred over the huge
+# tree-sitter-systemverilog grammar. Verify duplicates with `cargo tree -d`.
+tree-sitter-verilog = "1.0.3"
+# Hardware mode (FPGA board simulation): Verilator compile + persistent sim
+# child + the DK-DEV-10M50-A board model.
+jade-hw = { path = "../jade-hw" }
 # Regex-driven static analysis for the editor decoration ports (§4.5 memory
 # size annotations, §4.8 execution flow). Mirrors the TS regex/brace-count
 # approach (no AST); already present transitively in the lockfile.
@@ -50,6 +59,9 @@ regex = "1"
 # Error context for the bundled-icon AssetSource (assets.rs); gpui's AssetSource
 # trait speaks anyhow::Result, so we surface a missing asset with .context().
 anyhow = "1"
+# Concurrent language-server hovers when building an Explain prompt: the
+# lookups are independent, so they are joined rather than awaited in turn.
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 # Tensor heatmap previews are baked into a gpui RenderImage once per NEW frame
 # and drawn as one textured quad (the TS putImageData→drawImage architecture) —
 # painting one quad per cell per repaint was the training-view lag. Versions
@@ -73,9 +85,29 @@ core-foundation-sys = "0.8"
 # (core-video's CVMetalTextureCache takes a metal::Device).
 metal = "0.33"
 core-video = { version = "0.5.2", features = ["metal"] }
+# Visualize playback (video/): AVPlayer + AVPlayerItemVideoOutput decoding the
+# rendered mp4 straight into 420f CVPixelBuffers for gpui's `surface()`.
+# `default-features = false` matters: objc2-av-foundation has 172 features and
+# a naive `all` adds minutes to a clean build. The objc2 generation (0.6.x via
+# gpui) unifies — verify with `cargo tree -d` that no new duplicates appear.
+objc2 = { version = "0.6", default-features = false, features = ["std"] }
+objc2-av-foundation = { version = "0.3", default-features = false, features = [
+  "AVAsset", "AVPlayer", "AVPlayerItem", "AVPlayerItemOutput",
+  "objc2-core-media", "objc2-core-video" ] }
+objc2-core-media = { version = "0.3", default-features = false, features = ["CMBase", "CMTime"] }
+objc2-core-video = { version = "0.3", default-features = false, features = [
+  "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer" ] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFBase", "CFString", "CFDictionary", "CFNumber"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSURL", "NSString", "NSDictionary", "NSValue", "NSObject", "NSEnumerator"] }
+
+# Playback tests run on the real main thread and pump the run loop
+# themselves — AVPlayer never leaves `Unknown` on a libtest worker thread.
+[[test]]
+name = "video_playback"
+harness = false
 
 [dev-dependencies]
 # test-support turns on gpui's TestAppContext/VisualTestContext so interaction
 # tests can drive real clicks/keystrokes through the full window dispatch path
 # (hitboxes, focus, IME) headlessly — the same harness Zed's own tests use.
-gpui = { git = "https://github.com/zed-industries/zed", features = ["test-support"] }
+gpui = { git = "https://github.com/zed-industries/zed", rev = "56ab1c48257094573707ab1548bdd3b8dec6d8d8", features = ["test-support"] }

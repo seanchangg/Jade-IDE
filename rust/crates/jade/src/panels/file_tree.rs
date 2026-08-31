@@ -164,6 +164,7 @@ fn kind_glyph(kind: FileKind, theme: &Theme) -> (&'static str, u32) {
     match kind {
         FileKind::Source => ("file-code", theme.accent),
         FileKind::Header => ("code", theme.blue_gray),
+        FileKind::Hdl => ("cpu", theme.accent),
         FileKind::Shader => ("cpu", theme.amber),
         FileKind::Script => ("file-code", theme.periwinkle),
         FileKind::Shell => ("file-terminal", theme.periwinkle),

@@ -11,7 +11,7 @@ use std::ops::Range;
 use ropey::Rope;
 
 use crate::edit::{
-    Clock, EditOp, EditRecord, LspChange, SystemClock, UndoGroup, UndoStack, COALESCE_MS,
+    Clock, EditKind, EditOp, EditRecord, LspChange, SystemClock, UndoGroup, UndoStack, COALESCE_MS,
 };
 use crate::point::{LspPosition, Point};
 use crate::selection::{CursorSet, Selection};
@@ -113,6 +113,26 @@ impl Buffer {
                 Cow::Owned(s.strip_suffix('\n').map(str::to_string).unwrap_or(s))
             }
         }
+    }
+
+    /// The text of the byte range `range`.
+    ///
+    /// Exists so a caller that wants one fragment does not pay for the whole
+    /// buffer: the obvious `buffer.to_string()[range]` copies every byte in the
+    /// file to read a few of them, which on a 20k-line source file is megabytes
+    /// per call. Ropey slices the rope instead.
+    ///
+    /// The range is clamped to the buffer and snapped outward to char
+    /// boundaries, so a stale offset returns text rather than panicking.
+    pub fn text_range(&self, range: std::ops::Range<usize>) -> String {
+        let len = self.rope.len_bytes();
+        let start = range.start.min(len);
+        let end = range.end.clamp(start, len);
+        // A byte range that splits a multi-byte character would panic in
+        // ropey; widen to the enclosing characters instead.
+        let start_char = self.rope.byte_to_char(start);
+        let end_char = self.rope.byte_to_char(end);
+        self.rope.slice(start_char..end_char).to_string()
     }
 
     /// Char length of line `row`, excluding a trailing `\n`.
@@ -330,9 +350,25 @@ impl Buffer {
         self.cursors.set_from_selections(&final_selections);
         self.version += 1;
 
-        // Record / coalesce.
+        // Where this edit leaves the carets, for the next edit's adjacency test.
+        // A live selection anchors nothing: the edit after it replaces text, so
+        // it starts its own group.
+        let carets: Vec<usize> = if final_selections.iter().all(|s| s.is_empty()) {
+            let mut c: Vec<usize> = final_selections.iter().map(|s| s.head).collect();
+            c.sort_unstable();
+            c
+        } else {
+            Vec::new()
+        };
+
+        // Record / coalesce. A keystroke joins the group before it only when it
+        // continues that group: the same kind of edit, at the caret the last one
+        // left, inside the time window, with no boundary between them.
         let now = self.clock.now_ms();
+        let kind = EditKind::of(&plans);
         let can_coalesce = coalesce
+            && self.undo.last_kind == Some(kind)
+            && kind.continues(&plans, &self.undo.last_carets)
             && !self.undo.boundary
             && !self.undo.done.is_empty()
             && self
@@ -354,8 +390,13 @@ impl Buffer {
                 time: now,
             });
         }
-        self.undo.boundary = false;
+        // A standalone edit (`coalesce == false`: paste, a completion accept, a
+        // block indent) closes its group on both sides, so the typing after it
+        // cannot merge back into it either.
+        self.undo.boundary = !coalesce;
         self.undo.last_time = Some(now);
+        self.undo.last_kind = Some(kind);
+        self.undo.last_carets = carets;
 
         EditRecord {
             changes,
@@ -381,6 +422,7 @@ impl Buffer {
         self.version += 1;
         self.undo.boundary = true;
         self.undo.last_time = None;
+        self.undo.last_carets.clear();
         true
     }
 
@@ -398,6 +440,7 @@ impl Buffer {
         self.version += 1;
         self.undo.boundary = true;
         self.undo.last_time = None;
+        self.undo.last_carets.clear();
         true
     }
 
@@ -416,6 +459,23 @@ impl Buffer {
             }],
             vec![Selection::at(caret)],
             false,
+        )
+    }
+
+    /// Replace `range` with `new_text` on behalf of the keyboard: the same edit
+    /// as [`Buffer::edit`], except it joins the typing burst around it. The
+    /// platform text-input path uses this, so one undo takes back a word rather
+    /// than one letter.
+    pub fn edit_typed(&mut self, range: Range<usize>, new_text: &str) -> EditRecord {
+        let caret = range.start + new_text.len();
+        self.transact(
+            vec![PlannedEdit {
+                start: range.start,
+                end: range.end,
+                text: new_text.to_string(),
+            }],
+            vec![Selection::at(caret)],
+            true,
         )
     }
 

@@ -19,7 +19,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use jade_ai::{AiModelId, AiState, AiStatus, InfillRequest, InlineCompletionBackend};
+use jade_ai::{
+    AiModelId, AiState, AiStatus, ChatBackend, ChatDelta, ChatError, InfillRequest,
+    InlineCompletionBackend, Lane, LocalStatus,
+};
 use jade_build::{
     parse_alloc_free, parse_heap_summary, parse_scalar, parse_timing, AsmResult, AtosSymbolicator,
     BuildEngine, BuildResult, CompileRequest, MemoryEvent, RunConfig, RunEvent, RunResult,
@@ -28,12 +31,12 @@ use jade_build::{
 use jade_buffer::{Point, Selection};
 use jade_debug::{DebugEvent, LldbDriver, LocalVariable};
 use jade_lsp::{
-    active_signature_hint, CompletionItem, DidChange, HoverContents, LspClient, LspEvent, LspHandle,
-    SignatureHint, TextDocumentSyncKind,
+    active_signature_hint, CompletionItem, Diagnostic, DiagnosticSeverity, DidChange,
+    HoverContents, LspClient, LspEvent, LspHandle, SignatureHint, TextDocumentSyncKind,
 };
 use jade_sysmon::{SystemMonitor, SystemStats};
 use jade_telemetry::{Event, Kind, TelemetryServer};
-use jade_term::{GridSnapshot, TermEvent, TermId, TermManager};
+use jade_term::{TermEvent, TermId, TermManager};
 use gpui::{
     div, prelude::*, px, rgb, Bounds, BoxShadow, ClipboardItem, Context,
     EntityInputHandler, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent, PathPromptOptions,
@@ -62,11 +65,18 @@ use crate::memory_bar::{project, Level, MemoryBarState};
 use crate::output::push_output;
 use crate::panels::runtime_panel::{self, RunRecord};
 use crate::panels::metric_popout::{MetricPopout, MetricSection};
+use crate::panels::terminal_panel::TermSession;
 use crate::panels::{
     asm_view, code_view, debug_panel, file_tree, structure_panel, telemetry_sidebar,
     terminal_panel, training_view,
 };
 use crate::ai_prefs::AiPrefs;
+use crate::explain::{ExplainCard, Selected};
+
+/// How long the whole symbol lookup may take before the card gives up on it.
+/// Short: the explanation is better with declarations, but not worth a visible
+/// pause, and clangd answers a warm hover in single-digit milliseconds.
+const SYMBOL_BUDGET: Duration = Duration::from_millis(600);
 use crate::prefs::TelemetryPrefs;
 use crate::quick_open::{self, FileEntry, KeyAction, Match, QuickOpenState};
 use crate::registry::{key_of, TelemetryRegistry, DEFAULT_MAX_DIM};
@@ -77,6 +87,44 @@ use crate::training::{TensorFrame, TrainingData};
 use crate::wg3d::WeightGrid3D;
 use crate::workspace_tree::FileTree;
 
+/// Which of the three action-bar diagnostic pills the popup is listing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagKind {
+    Error,
+    Warning,
+    /// Info and hint, folded together the way [`editor_view::diagnostic_counts`]
+    /// folds them.
+    Info,
+}
+
+impl DiagKind {
+    /// True when `severity` belongs in this pill.
+    pub fn matches(self, severity: Option<DiagnosticSeverity>) -> bool {
+        match self {
+            DiagKind::Error => severity == Some(DiagnosticSeverity::ERROR),
+            DiagKind::Warning => severity == Some(DiagnosticSeverity::WARNING),
+            DiagKind::Info => !matches!(
+                severity,
+                Some(DiagnosticSeverity::ERROR) | Some(DiagnosticSeverity::WARNING)
+            ),
+        }
+    }
+
+    /// Popup heading, singular when there is exactly one.
+    pub fn heading(self, n: usize) -> String {
+        let word = match self {
+            DiagKind::Error => "error",
+            DiagKind::Warning => "warning",
+            DiagKind::Info => "note",
+        };
+        if n == 1 {
+            format!("1 {word}")
+        } else {
+            format!("{n} {word}s")
+        }
+    }
+}
+
 /// Which view the bottom panel shows. The TERMINAL view is a live shell; the
 /// OUTPUT view is the plain `[jade]`/build/run scrollback fallback (see
 /// `terminal_panel` for why status lines can't be injected into the shell grid).
@@ -84,6 +132,18 @@ use crate::workspace_tree::FileTree;
 pub enum BottomView {
     Terminal,
     Output,
+    /// The RTL schematic of the hardware design (hardware mode only).
+    Schematic,
+}
+
+/// Which side of the IDE is active (chosen on the welcome screen and
+/// persisted per workspace): the C++ software IDE or the FPGA hardware mode
+/// with the live board simulation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AppMode {
+    #[default]
+    Software,
+    Hardware,
 }
 
 /// What the pre-run panel's Run button launches when confirmed.
@@ -223,6 +283,23 @@ pub enum AppEvent {
     },
     /// A go-to-definition target resolved from a ⌘-click (E2): open + reveal.
     Definition { path: PathBuf, line: usize },
+    /// One streamed delta of an Explain response (§4.14). Stale generations
+    /// are dropped — an aborted task can still have deltas queued behind it.
+    Explain {
+        generation: u64,
+        delta: ChatDelta,
+    },
+    /// One streamed delta of a Visualize response (§4.15). Independent of
+    /// Explain: its own lane, its own generation counter.
+    Visualize {
+        generation: u64,
+        delta: ChatDelta,
+    },
+    /// Progress from the sandboxed Manim render a Visualize card started.
+    VisualizeRender {
+        generation: u64,
+        ev: jade_build::manim::RenderEvent,
+    },
     /// An AI ghost-text (`/infill`) response for request `generation` (§4.11).
     /// Carries the raw model `content` (`None` on any failure/abort) plus the
     /// `(prefix, suffix, line_suffix, anchor, max_lines)` the request was made
@@ -243,6 +320,8 @@ pub enum AppEvent {
     /// Lazily-fetched children of an expandable debug variable (§5.8): the lldb
     /// expression `path` the fetch was keyed on plus the resolved `children`.
     VarChildren { path: String, children: Vec<LocalVariable> },
+    /// A hardware-mode engine event (compile progress, LED frames, rates).
+    Hw(jade_hw::HwEvent),
 }
 
 /// Spawns (or re-spawns) the debounced fs-watch on a root, returning an opaque
@@ -259,6 +338,11 @@ pub struct AppDeps {
     pub server: Arc<TelemetryServer>,
     pub engine: Arc<BuildEngine>,
     pub ai: Arc<InlineCompletionBackend>,
+    /// Streaming chat backend for the Explain / Visualize selection features
+    /// (§4.14, §4.15). Separate from `ai`: that one is a 4-second
+    /// fill-in-the-middle client against a local server, this one is a
+    /// long-lived stream against a different provider.
+    pub chat: Arc<ChatBackend>,
     pub sysmon: Arc<SystemMonitor>,
     /// Headless terminal engine (bottom TERMINAL strip, §5.2). Shared behind an
     /// `Arc`; its events are forwarded onto [`AppEvent::Term`] in `main.rs`.
@@ -283,6 +367,15 @@ pub struct AppDeps {
     /// checkbox/bundle change, and an unset override let the headless suites
     /// write into the developer's actual config.
     pub prefs_path: Option<PathBuf>,
+    /// Initial app mode (from `--hardware` or the persisted `ui.mode`).
+    pub mode: AppMode,
+    /// Test seam: when set, hardware commands go to this channel and no real
+    /// engine session is spawned. `None` in the GUI — the app spawns
+    /// `jade_hw::start_session` when hardware mode starts.
+    pub hw_tx: Option<UnboundedSender<jade_hw::HwCommand>>,
+    /// Re-spawnable watch on `.v/.qsf/.sdc` sources for the hardware rebuild
+    /// loop (a no-op closure in tests).
+    pub hw_watch: FsWatchSpawn,
 }
 
 /// Recorded stats from the last completed run, shown in the status area.
@@ -421,7 +514,7 @@ pub struct JadeApp {
     app_tx: UnboundedSender<AppEvent>,
     repo_root: PathBuf,
     /// Root the file tree scans + the cwd new terminals spawn in.
-    workspace_root: PathBuf,
+    pub(crate) workspace_root: PathBuf,
     /// Whether a workspace is open (inventory §2). While false the welcome
     /// overlay covers the editor area and the tree is empty; `open_project` flips
     /// it true.
@@ -437,13 +530,13 @@ pub struct JadeApp {
     // ── Terminal panel (§5.2) ─────────────────────────────────────────────────
     /// Shared terminal engine (also held in `AppDeps` for the event forwarder).
     pub term: Arc<TermManager>,
-    /// The single visible terminal instance, created on first show.
-    pub term_id: Option<TermId>,
-    /// Latest grid snapshot (refreshed on `Damaged`; rendered by the panel).
-    pub term_snapshot: Option<GridSnapshot>,
-    /// Set once the child exits — renders the dim `[exited <code>]` line.
-    pub term_exited: bool,
-    pub term_exit_code: Option<i32>,
+    /// Every open terminal, oldest first. The tab strip in the panel header
+    /// navigates them; each keeps its own snapshot, scrollback offset, and
+    /// selection (see [`TermSession`]).
+    pub terms: Vec<TermSession>,
+    /// Index of the terminal the panel renders. Always valid while `terms` is
+    /// not empty — every writer goes through [`JadeApp::select_terminal_index`].
+    pub term_index: usize,
     /// True if PTY allocation failed — stop retrying, show a message.
     term_failed: bool,
     /// Last cols/rows applied by the resize canvas (packed `cols<<16 | rows`),
@@ -453,14 +546,13 @@ pub struct JadeApp {
     pub term_focus: Option<FocusHandle>,
     /// Which view the bottom panel shows (TERMINAL vs OUTPUT scrollback).
     pub bottom_view: BottomView,
-    /// Rows scrolled up into terminal scrollback (0 = pinned to the live
-    /// bottom). Scroll-wheel-up increases it; typing / new snapshots pin back.
-    pub term_scroll_back: usize,
-    /// Mouse selection over the terminal grid, in logical (row, col) cells of
-    /// the combined `scrollback ++ viewport` buffer. ⌘C copies it as text.
-    pub term_sel: Option<crate::panels::terminal_panel::TermSelection>,
-    /// True while the left button is down extending `term_sel`.
-    pub term_sel_dragging: bool,
+    /// Which action-bar diagnostic pill is open, listing the active tab's
+    /// diagnostics of that severity. `None` = no popup.
+    pub diag_popup: Option<DiagKind>,
+    /// Bottom-left corner of the diagnostic pill row in window px
+    /// (`x.to_bits()<<32 | y.to_bits()`), recorded by a canvas each paint so the
+    /// popup can hang under the pills (same trick as `term_origin`).
+    pub diag_anchor: Arc<std::sync::atomic::AtomicU64>,
     /// Terminal body origin in window px (`x.to_bits()<<32 | y.to_bits()`),
     /// written by the resize canvas each paint so mouse listeners can map
     /// window coordinates to grid cells (same trick as `editor_text_left`).
@@ -511,6 +603,12 @@ pub struct JadeApp {
     /// Visible editor row count (viewport height / line height), captured each
     /// frame, so `scroll_caret_into_view` does minimal follow-scroll.
     pub editor_rows: Arc<AtomicU32>,
+    /// The editor container's box in px (f32 bits), captured each frame by the
+    /// same canvas underlay. A floating card clamps itself to this
+    /// ([`crate::panels::explain_card::clamp_card`]); layout is only known at
+    /// paint time, so there is nowhere earlier to read it.
+    pub editor_w: Arc<AtomicU32>,
+    pub editor_h: Arc<AtomicU32>,
     /// Monotonic clock origin for the decoration debounces + IME timing.
     epoch: Instant,
     /// True while the decoration-recompute wake task is running (avoids dupes).
@@ -560,6 +658,52 @@ pub struct JadeApp {
     /// Global (cross-workspace) AI prefs — the model tier + multi-line mode —
     /// mirrored here so a menu change can rewrite `~/.config/jade/ai.json`.
     pub ai_prefs: AiPrefs,
+
+    // ── Explain card (§4.14) ─────────────────────────────────────────────────
+    /// The streaming chat backend, shared with the Visualize feature.
+    pub chat: Arc<ChatBackend>,
+    /// The live Explain card, if one is open. `None` is the resting state.
+    pub explain: Option<ExplainCard>,
+    /// Monotonic Explain-request generation. Bumped on every trigger and on
+    /// close, so deltas already queued by an aborted task are dropped rather
+    /// than landing in the next card.
+    explain_gen: u64,
+    /// The Explain pop-out window, while one is open.
+    pub explain_popout: Option<gpui::WindowHandle<crate::panels::explain_popout::ExplainPopout>>,
+    /// The Explain card's painted height in px (f32 bits), captured each frame
+    /// by an underlay in the card itself. The card slides up as it fills, and
+    /// layout is only known at paint time, so the position uses the previous
+    /// frame's height.
+    pub explain_card_h: Arc<AtomicU32>,
+    /// Set when a status change may have unblocked a parked Explain card.
+    /// `apply_app_event` is `Context`-free, so the follow-up runs from
+    /// [`JadeApp::after_events`] once per drained batch.
+    explain_resume_pending: bool,
+
+    // ── Visualize card (§4.15) ───────────────────────────────────────────────
+    /// The live Visualize card, if one is open. Independent of `explain`:
+    /// both can be open at once, and neither cancels the other.
+    pub visualize: Option<crate::visualize::VisualizeCard>,
+    /// Monotonic Visualize-request generation (same contract as `explain_gen`).
+    visualize_gen: u64,
+    /// The Visualize pop-out window, while one is open.
+    pub visualize_popout:
+        Option<gpui::WindowHandle<crate::panels::visualize_popout::VisualizePopout>>,
+    /// The card's painted height (f32 bits), same trick as `explain_card_h`.
+    pub visualize_card_h: Arc<AtomicU32>,
+    /// The mp4 player, once a render is Ready. A platform object, so it lives
+    /// beside the pure card state rather than in it.
+    pub visualize_player: Option<crate::video::Player>,
+    /// The in-flight Manim render, for stop-on-close.
+    visualize_render: Option<jade_build::manim::RenderHandle>,
+    /// The scrub bar's painted left edge and width in window px (f32 bits),
+    /// captured by a canvas underlay so a click maps to a fraction.
+    pub visualize_scrub_bounds: [Arc<AtomicU32>; 2],
+    /// True while the scrub thumb is being dragged.
+    pub visualize_scrubbing: bool,
+    /// True while the Visualize card's animation ticker runs (see
+    /// `explain_ticking`).
+    visualize_ticking: bool,
     /// The current ghost suggestion, if any.
     pub ghost: Option<GhostState>,
     /// Monotonic ghost-request generation (supersede stale `/infill` responses).
@@ -637,6 +781,10 @@ pub struct JadeApp {
     /// True while a toast-sweeper task is in flight, so `render` spawns at most
     /// one (mirrors `blink_task_running`).
     toast_sweeping: bool,
+    /// True while the Explain card's animation ticker is running. Guarded like
+    /// the toast sweeper: it exits once no card is working, and `render`
+    /// re-spawns it on the next request.
+    explain_ticking: bool,
 
     // ── Runtime panel state (§5.4) ────────────────────────────────────────────
     /// Whether the RUNTIME panel is shown (toggled by the Runtime chip).
@@ -741,6 +889,53 @@ pub struct JadeApp {
     pub sys_stats: SystemStats,
     pub ai_status: AiStatus,
 
+    // ── Hardware mode (FPGA board simulation) ─────────────────────────────────
+    /// Which side of the IDE is active. Hardware mode swaps the runtime
+    /// sidebar for the board panel and gates the C++ surfaces off.
+    pub mode: AppMode,
+    /// Mode picked on the welcome screen, consumed by the next `open_project`.
+    pub pending_mode: Option<AppMode>,
+    /// Board render state while hardware mode is active.
+    pub hw: Option<crate::hw::HwState>,
+    /// The live engine session (owns the sim + compile children).
+    hw_engine: Option<jade_hw::HwEngine>,
+    /// Test seam from [`AppDeps::hw_tx`]: commands go here instead of a real
+    /// session.
+    hw_test_tx: Option<UnboundedSender<jade_hw::HwCommand>>,
+    /// Re-spawn hook for the hardware source watch.
+    hw_watch: FsWatchSpawn,
+    /// Keep-alive guard for the live hardware source watch.
+    hw_watcher: Option<Box<dyn Send>>,
+    /// Focus handle for the board panel (scopes the plain-key bindings).
+    pub hw_focus: Option<FocusHandle>,
+    /// Whether the board drawer is shown (the `tgl-board` toggle).
+    pub board_visible: bool,
+    /// Board drawer width in px (left-edge drag to resize).
+    pub board_width: f32,
+    /// While dragging the board's resize handle: `(mouse_x_at_start,
+    /// width_at_start)`.
+    pub board_resize: Option<(f32, f32)>,
+
+    /// Markdown preview override (⌘⇧D / the `tgl-md` toggle). The preview
+    /// opens by itself on a `.md` tab; `false` keeps it hidden.
+    pub md_visible: bool,
+    /// Markdown preview width in px (left-edge drag to resize).
+    pub md_width: f32,
+    /// While dragging the preview's resize handle: `(mouse_x_at_start,
+    /// width_at_start)`.
+    pub md_resize: Option<(f32, f32)>,
+    /// Preview-edit mode: the block under the caret shows its raw source in
+    /// the preview. A preview click enters it; Escape leaves it.
+    pub md_edit: bool,
+    /// The raw block's x origin, captured at paint (click → column mapping).
+    pub md_raw_x: Arc<AtomicU32>,
+    /// Scroll state of the preview's block list (`md-scroll`), so the caret
+    /// sync can call `scroll_to_item`.
+    pub md_scroll: gpui::ScrollHandle,
+    /// Last `(path, caret row)` the preview scrolled to, so the sync fires
+    /// once per caret move, not every frame.
+    md_synced: Option<(PathBuf, usize)>,
+
     // Demo/telemetry counters (also drive the stdout log the spike printed).
     pub scalars_seen: u64,
     pub timings_seen: u64,
@@ -772,6 +967,7 @@ impl JadeApp {
                         for event in batch {
                             app.apply_app_event(event);
                         }
+                        app.after_events(cx);
                         cx.notify();
                     })
                     .is_err()
@@ -788,7 +984,11 @@ impl JadeApp {
     /// Headless constructor (smoke hook / tests): assemble state, no pump. The
     /// caller drives `app_rx` itself and calls [`apply_app_event`](Self::apply_app_event).
     pub fn assemble(deps: AppDeps) -> Self {
+        // Chat requests are started from the GPUI thread, which is not inside a
+        // tokio runtime — hand the backend the app's runtime explicitly.
+        deps.chat.set_runtime(deps.runtime.clone());
         let opened = deps.workspace_opened;
+        let init_mode = deps.mode;
         // Scan the workspace root for the file tree (§5.1) and seed the editor —
         // but only when a workspace is open; otherwise the welcome overlay covers
         // the editor and the tree must NOT scan the fallback repo root (§2).
@@ -857,6 +1057,13 @@ impl JadeApp {
             .map_err(|e| eprintln!("[jade] run store unavailable: {e}"))
             .ok();
 
+        // Visualize render cache (§4.15): keep the newest 20 per workspace.
+        // One directory scan at startup; a missing cache dir is a no-op.
+        jade_build::manim::prune_cache(
+            &jade_build::manim::cache_root(&deps.workspace_root),
+            jade_build::manim::CACHE_KEEP,
+        );
+
         let mut app = Self {
             server: deps.server,
             registry: TelemetryRegistry::new(),
@@ -902,17 +1109,14 @@ impl JadeApp {
             driver: None,
 
             term: deps.term,
-            term_id: None,
-            term_snapshot: None,
-            term_exited: false,
-            term_exit_code: None,
+            terms: Vec::new(),
+            term_index: 0,
             term_failed: false,
             term_last_size: Arc::new(AtomicU32::new(0)),
             term_focus: None,
             bottom_view: BottomView::Terminal,
-            term_scroll_back: 0,
-            term_sel: None,
-            term_sel_dragging: false,
+            diag_popup: None,
+            diag_anchor: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             term_origin: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             bottom_height: 220.,
             bottom_resize: None,
@@ -927,6 +1131,8 @@ impl JadeApp {
             // focus the editor so the caret + keyboard are live from frame one.
             pending_editor_focus: editor_has_tab,
             editor_text_left: Arc::new(AtomicU32::new(0)),
+            editor_w: Arc::new(AtomicU32::new(0)),
+            editor_h: Arc::new(AtomicU32::new(0)),
             editor_char_w: Arc::new(AtomicU32::new(
                 crate::panels::code_view::CHAR_W.to_bits(),
             )),
@@ -934,6 +1140,7 @@ impl JadeApp {
             caret_blink_show: true,
             caret_last_active: 0,
             blink_task_running: false,
+            explain_ticking: false,
             epoch: Instant::now(),
             decoration_wake_running: false,
 
@@ -953,6 +1160,21 @@ impl JadeApp {
             ai_completion_enabled: ui.ai_completion_enabled.unwrap_or(true),
             ai_multiline: ai_prefs.multiline,
             ai_model: ai_prefs.model,
+            chat: deps.chat,
+            explain: None,
+            explain_gen: 0,
+            explain_popout: None,
+            explain_card_h: Arc::new(AtomicU32::new(0)),
+            explain_resume_pending: false,
+            visualize: None,
+            visualize_gen: 0,
+            visualize_popout: None,
+            visualize_card_h: Arc::new(AtomicU32::new(0)),
+            visualize_player: None,
+            visualize_render: None,
+            visualize_scrub_bounds: [Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0))],
+            visualize_scrubbing: false,
+            visualize_ticking: false,
             ai_menu_open: false,
             ai_prefs,
             ghost: None,
@@ -1045,6 +1267,30 @@ impl JadeApp {
                 endpoint: None,
             },
 
+            mode: AppMode::Software,
+            pending_mode: None,
+            hw: None,
+            hw_engine: None,
+            hw_test_tx: deps.hw_tx,
+            hw_watch: deps.hw_watch,
+            hw_watcher: None,
+            hw_focus: None,
+            board_visible: true,
+            board_width: 440.0,
+            board_resize: None,
+
+            md_visible: ui.markdown_visible.unwrap_or(true),
+            md_width: ui
+                .markdown_width
+                .map(|w| w as f32)
+                .unwrap_or(crate::panels::md_view::DEFAULT_W)
+                .clamp(crate::panels::md_view::MIN_W, crate::panels::md_view::MAX_W),
+            md_resize: None,
+            md_edit: false,
+            md_raw_x: Arc::new(AtomicU32::new(0)),
+            md_scroll: gpui::ScrollHandle::new(),
+            md_synced: None,
+
             scalars_seen: 0,
             timings_seen: 0,
             tensors_seen: 0,
@@ -1056,6 +1302,29 @@ impl JadeApp {
         // "on" but the server Disabled — ghost text stayed dead until the
         // sparkle menu happened to be opened.
         app.ensure_ai_started();
+        // Hardware mode at launch (`--hardware` or the persisted `ui.mode`):
+        // start the board session before any LSP work, so the C++ surfaces
+        // stay gated off from frame one.
+        if opened && init_mode == AppMode::Hardware {
+            app.start_hw_mode();
+        }
+        // Start clangd for the tab seeded from `--file`/`--project`.
+        //
+        // That tab is opened with a bare `editor.open` above, which skips
+        // `after_open_active` and so skips `ensure_lsp`. The result was that a
+        // session launched straight onto a C++ file had no language server at
+        // all — no hover, no diagnostics, no symbol declarations in an Explain
+        // prompt — until the user happened to open a second file through the
+        // tree. Nothing reported it, because a failed initialize only writes to
+        // the OUTPUT panel.
+        //
+        // Safe in the headless suites: `ensure_lsp` spawns onto the runtime,
+        // and `test_deps` builds one that is never driven, so no clangd is
+        // launched during tests.
+        if let Some(path) = app.editor.active_path() {
+            app.ensure_lsp();
+            app.lsp_did_open(&path);
+        }
         app.refresh_stored_runs();
         app.declare_loaded_timer_groups();
         app.seed_registry_from_prefs();
@@ -1090,6 +1359,33 @@ impl JadeApp {
                 // one more keystroke that may never come.
                 let was_ready = self.ai_status.state == AiState::Ready;
                 self.ai_status = status;
+                // Keep the chat backend's view of the local server in step
+                // with the one this backend supervises, so Explain can fall
+                // back to it without a second discovery path.
+                match self.ai_status.state {
+                    AiState::Ready => {
+                        // A dedicated chat endpoint wins: it exists so the
+                        // small completion model can keep serving ghost text
+                        // while chat talks to an instruct model elsewhere.
+                        let endpoint = jade_ai::ChatBackend::endpoint_override()
+                            .or_else(|| self.ai_status.endpoint.clone());
+                        match endpoint {
+                            // The router serves both models; which one answers
+                            // is chosen per request by its `model` field.
+                            Some(endpoint) => self
+                                .chat
+                                .set_local_status(LocalStatus::Ready { endpoint }),
+                            None => self.chat.set_local_status(LocalStatus::Off),
+                        }
+                    }
+                    AiState::Starting => self.chat.set_local_status(LocalStatus::Starting),
+                    AiState::Disabled | AiState::Error => {
+                        self.chat.set_local_status(LocalStatus::Off)
+                    }
+                }
+                // `apply_app_event` has no `Context`; the pump runs the
+                // follow-up once per batch (see `after_events`).
+                self.explain_resume_pending = true;
                 if !was_ready && self.ai_status.state == AiState::Ready {
                     self.schedule_ghost();
                 }
@@ -1134,6 +1430,11 @@ impl JadeApp {
                 self.open_file(path);
                 self.reveal_line(line);
             }
+            AppEvent::Explain { generation, delta } => self.on_explain(generation, delta),
+            AppEvent::Visualize { generation, delta } => self.on_visualize(generation, delta),
+            AppEvent::VisualizeRender { generation, ev } => {
+                self.on_visualize_render(generation, ev)
+            }
             AppEvent::Ghost {
                 generation,
                 content,
@@ -1147,40 +1448,130 @@ impl JadeApp {
             AppEvent::VarChildren { path, children } => {
                 self.debug.set_children(path, children);
             }
+            AppEvent::Hw(ev) => self.on_hw_event(ev),
         }
     }
 
-    /// Follow the `jade-term` contract: on `Damaged` re-snapshot the current
-    /// instance; on `Exited` record the code for the dim `[exited …]` line.
+    // ── Hardware-mode engine plumbing (the private-field side of `hw.rs`) ────
+
+    /// The command channel to the hardware session: the test seam when
+    /// injected, else the live engine's.
+    pub(crate) fn hw_command_tx(&self) -> Option<&UnboundedSender<jade_hw::HwCommand>> {
+        self.hw_test_tx
+            .as_ref()
+            .or_else(|| self.hw_engine.as_ref().map(|e| &e.commands))
+    }
+
+    /// Spawn the real engine session and the event forwarder, unless a test
+    /// channel is injected or a session already runs.
+    pub(crate) fn hw_connect_engine(&mut self) {
+        if self.hw_test_tx.is_some() || self.hw_engine.is_some() {
+            return;
+        }
+        let (ev_tx, mut ev_rx) =
+            tokio::sync::mpsc::unbounded_channel::<jade_hw::HwEvent>();
+        let tx = self.app_tx.clone();
+        self.runtime.spawn(async move {
+            while let Some(ev) = ev_rx.recv().await {
+                if tx.send(AppEvent::Hw(ev)).is_err() {
+                    break;
+                }
+            }
+        });
+        // `start_session` spawns onto the ambient runtime; enter ours.
+        let _guard = self.runtime.enter();
+        self.hw_engine = Some(jade_hw::start_session(self.workspace_root.clone(), ev_tx));
+    }
+
+    /// End the live session (graceful QUIT to the sim, kill the compile).
+    pub(crate) fn hw_stop_engine(&mut self) {
+        if let Some(engine) = self.hw_engine.take() {
+            engine.stop();
+        }
+    }
+
+    /// (Re)start the `.v/.qsf/.sdc` source watch on the workspace root.
+    pub(crate) fn hw_start_watch(&mut self) {
+        self.hw_watcher = None;
+        self.hw_watcher = (self.hw_watch.clone())(&self.workspace_root);
+    }
+
+    pub(crate) fn hw_drop_watch(&mut self) {
+        self.hw_watcher = None;
+    }
+
+    /// Follow the `jade-term` contract: on `Damaged` re-snapshot the instance;
+    /// on `Exited` record the code for the dim `[exited …]` line.
+    ///
+    /// Only the visible terminal is snapshotted. A background terminal just
+    /// takes an activity mark: the engine keeps one `Damaged` queued until we
+    /// snapshot it, so a chatty background shell costs one flag per switch
+    /// instead of a full grid clone per write. [`select_terminal_index`] picks
+    /// the content up when the user switches to it.
+    ///
+    /// [`select_terminal_index`]: Self::select_terminal_index
     fn on_term_event(&mut self, ev: TermEvent) {
         match ev {
             TermEvent::Damaged { id } => {
-                if self.term_id == Some(id) {
-                    let old_sb = self.term_snapshot.as_ref().map(|s| s.scrollback.len());
-                    self.term_snapshot = self.term.snapshot(id);
-                    // Keep a scrolled-up view anchored to its content: as lines
-                    // spill into scrollback, grow the offset by the same amount
-                    // so what the user is reading stays in place (clamped in the
-                    // renderer). At the live bottom (offset 0) we stay pinned.
-                    if self.term_scroll_back > 0 {
-                        if let (Some(old), Some(new)) =
-                            (old_sb, self.term_snapshot.as_ref().map(|s| s.scrollback.len()))
-                        {
-                            let grown = new.saturating_sub(old);
-                            self.term_scroll_back =
-                                (self.term_scroll_back + grown).min(new);
-                        }
+                if self.terms.get(self.term_index).map(|s| s.id) != Some(id) {
+                    if let Some(session) = self.terms.iter_mut().find(|s| s.id == id) {
+                        session.activity = true;
+                    }
+                    return;
+                }
+                let old_sb = self.terms[self.term_index]
+                    .snapshot
+                    .as_ref()
+                    .map(|s| s.scrollback.len());
+                let snapshot = self.term.snapshot(id);
+                let session = &mut self.terms[self.term_index];
+                session.snapshot = snapshot;
+                // Keep a scrolled-up view anchored to its content: as lines
+                // spill into scrollback, grow the offset by the same amount
+                // so what the user is reading stays in place (clamped in the
+                // renderer). At the live bottom (offset 0) we stay pinned.
+                if session.scroll_back > 0 {
+                    if let (Some(old), Some(new)) =
+                        (old_sb, session.snapshot.as_ref().map(|s| s.scrollback.len()))
+                    {
+                        let grown = new.saturating_sub(old);
+                        session.scroll_back = (session.scroll_back + grown).min(new);
                     }
                 }
             }
             TermEvent::Exited { id, code } => {
-                if self.term_id == Some(id) {
-                    self.term_exited = true;
-                    self.term_exit_code = code;
-                    // Capture the final grid so the last output stays visible.
-                    self.term_snapshot = self.term.snapshot(id);
+                let active = self.terms.get(self.term_index).map(|s| s.id) == Some(id);
+                // Capture the final grid so the last output stays visible.
+                let snapshot = if active { self.term.snapshot(id) } else { None };
+                if let Some(session) = self.terms.iter_mut().find(|s| s.id == id) {
+                    session.exited = true;
+                    session.exit_code = code;
+                    if snapshot.is_some() {
+                        session.snapshot = snapshot;
+                    }
+                    session.activity = !active;
                 }
             }
+        }
+    }
+
+    /// The terminal the bottom panel renders, or `None` before the first one
+    /// opens.
+    pub fn active_term(&self) -> Option<&TermSession> {
+        self.terms.get(self.term_index)
+    }
+
+    /// [`active_term`](Self::active_term), for the panel's input listeners.
+    pub fn active_term_mut(&mut self) -> Option<&mut TermSession> {
+        self.terms.get_mut(self.term_index)
+    }
+
+    /// Jump the visible terminal back to its live bottom and drop its
+    /// selection — what every terminal does when you type into it.
+    pub fn pin_terminal_to_bottom(&mut self) {
+        if let Some(session) = self.active_term_mut() {
+            session.scroll_back = 0;
+            session.sel = None;
         }
     }
 
@@ -1195,21 +1586,32 @@ impl JadeApp {
         )
     }
 
-    /// Create the single terminal instance on first show (cwd = the selected
-    /// directory, see [`Self::terminal_cwd`]).
-    /// Degrades gracefully if the PTY can't be allocated (§5.2).
+    /// Open the first terminal when the strip first shows one (cwd = the
+    /// selected directory, see [`Self::terminal_cwd`]). Does nothing once a
+    /// terminal is open, so closing every tab and re-opening the strip starts a
+    /// fresh shell.
     fn ensure_terminal(&mut self) {
-        if self.term_id.is_some() || self.term_failed {
+        if !self.terms.is_empty() || self.term_failed {
             return;
         }
+        self.spawn_terminal();
+    }
+
+    /// Spawn one more shell in [`Self::terminal_cwd`] and make its tab active.
+    /// Degrades gracefully if the PTY can't be allocated (§5.2).
+    fn spawn_terminal(&mut self) {
         let cwd = self.terminal_cwd();
         match self.term.create(&cwd) {
             Ok(id) => {
-                self.term_id = Some(id);
-                self.term_exited = false;
-                self.term_exit_code = None;
-                self.term_last_size.store(0, std::sync::atomic::Ordering::Relaxed);
-                self.term_snapshot = self.term.snapshot(id);
+                let used: Vec<usize> = self.terms.iter().map(|s| s.color).collect();
+                let color = terminal_panel::next_color(&used, self.theme.series.len());
+                let mut session = TermSession::new(id, term_title(&cwd), color);
+                session.snapshot = self.term.snapshot(id);
+                self.terms.push(session);
+                self.term_index = self.terms.len() - 1;
+                // The shell starts at 80x24; clearing the applied size makes the
+                // panel's resize canvas fit it on the next paint.
+                self.term_last_size.store(0, Ordering::Relaxed);
             }
             Err(e) => {
                 self.term_failed = true;
@@ -1218,23 +1620,80 @@ impl JadeApp {
         }
     }
 
-    /// New-terminal button: replace the single visible instance with a fresh
-    /// shell (the panel shows one terminal at a time; §5.2's multi-instance list
-    /// is deferred).
+    /// New-terminal button (+) / ⌘T: open one more shell and show it. The
+    /// terminals that are already open stay alive in the tab strip (§5.2's
+    /// multi-instance list).
     pub fn action_new_terminal(&mut self) {
-        if let Some(old) = self.term_id.take() {
-            self.term.destroy(old);
-        }
-        self.term_snapshot = None;
-        self.term_exited = false;
-        self.term_exit_code = None;
         self.term_failed = false;
-        self.term_scroll_back = 0;
-        self.term_last_size.store(0, std::sync::atomic::Ordering::Relaxed);
         self.bottom_view = BottomView::Terminal;
         self.output_visible = true;
         self.bottom_closing = false;
-        self.ensure_terminal();
+        self.spawn_terminal();
+    }
+
+    /// Show the terminal at `index` in the tab strip. Out-of-range indexes are
+    /// ignored, so every caller can pass a raw number.
+    pub fn select_terminal_index(&mut self, index: usize) {
+        if index >= self.terms.len() {
+            return;
+        }
+        self.term_index = index;
+        // Each terminal keeps the size it last had, so make the resize canvas
+        // fit this one to the panel again.
+        self.term_last_size.store(0, Ordering::Relaxed);
+        // Pick up whatever the shell printed while it was in the background
+        // (`on_term_event` does not snapshot background terminals).
+        let id = self.terms[index].id;
+        let snapshot = self.term.snapshot(id);
+        let session = &mut self.terms[index];
+        session.activity = false;
+        session.sel_dragging = false;
+        if snapshot.is_some() {
+            session.snapshot = snapshot;
+        }
+    }
+
+    /// Show the terminal `id`. Ignores an id that is no longer open: a tab's ×
+    /// removes it before the tab's own click listener runs.
+    pub fn select_terminal(&mut self, id: TermId) {
+        if let Some(i) = self.terms.iter().position(|s| s.id == id) {
+            self.select_terminal_index(i);
+        }
+    }
+
+    /// ⌘1…⌘9: show the `nth` terminal, counting from 1. As on macOS, 9 means
+    /// the last tab however many are open.
+    pub fn select_terminal_at(&mut self, nth: usize) {
+        if let Some(i) = terminal_panel::nth_index(nth, self.terms.len()) {
+            self.select_terminal_index(i);
+        }
+    }
+
+    /// ⌘⌥← / ⌘⌥→: move `delta` tabs along the strip, wrapping at both ends.
+    pub fn cycle_terminal(&mut self, delta: i32) {
+        if let Some(i) = terminal_panel::wrap_index(self.term_index, self.terms.len(), delta) {
+            self.select_terminal_index(i);
+        }
+    }
+
+    /// Close one terminal (tab ×, or ⌘W with the terminal focused): kill its
+    /// shell, drop its tab, and show the tab that takes its place. Closing the
+    /// last one hides the bottom strip; showing the TERMINAL view again starts a
+    /// fresh shell (see [`Self::ensure_terminal`]).
+    pub fn action_close_terminal(&mut self, id: TermId, cx: &mut Context<Self>) {
+        let Some(i) = self.terms.iter().position(|s| s.id == id) else {
+            return;
+        };
+        self.terms.remove(i);
+        self.term.destroy(id);
+        if self.terms.is_empty() {
+            self.term_index = 0;
+            if self.output_visible && !self.bottom_closing {
+                self.action_toggle_output(cx);
+            }
+            return;
+        }
+        self.select_terminal_index(i.min(self.terms.len() - 1));
     }
 
     /// Toggle the RUNTIME panel (Runtime chip, §5.4).
@@ -1295,9 +1754,15 @@ impl JadeApp {
         self.bottom_view = view;
         self.output_visible = true;
         self.bottom_closing = false;
+        // The schematic earns room: opening its tab grows the strip once so
+        // a small design fits without scrolling. The user's own resizes
+        // afterwards stand.
+        if view == BottomView::Schematic && self.bottom_height < 300.0 {
+            self.bottom_height = 300.0;
+        }
     }
 
-    fn status_line(&mut self, s: &str) {
+    pub(crate) fn status_line(&mut self, s: &str) {
         push_output(&mut self.output, s);
     }
 
@@ -1908,6 +2373,9 @@ impl JadeApp {
     /// Build the active file (deliverable §3). Sanitizers off (malloc interposer
     /// is used instead, app.ts:1030); instrumentation off (no flow view yet).
     pub fn action_build(&mut self) {
+        if self.mode == AppMode::Hardware {
+            return; // hardware mode builds on save, not on this action
+        }
         self.start_build(Vec::new(), false, false);
     }
 
@@ -1958,6 +2426,9 @@ impl JadeApp {
     /// Run button / ⌘R: opens the pre-run tracking panel (pick timers/buffers
     /// first); the panel's Run confirms into [`launch_run`](Self::launch_run).
     pub fn action_run(&mut self) {
+        if self.mode == AppMode::Hardware {
+            return; // the board panel's Run/Pause owns this surface
+        }
         if self.last_build.is_none() {
             self.status_line("[jade] Build first");
             return;
@@ -2047,6 +2518,9 @@ impl JadeApp {
     /// Debug button: opens the pre-run tracking panel first (same flow as Run);
     /// confirming lands in [`launch_debug`](Self::launch_debug).
     pub fn action_debug(&mut self) {
+        if self.mode == AppMode::Hardware {
+            return; // no LLDB surface in hardware mode
+        }
         if self.active_file.is_none() {
             self.status_line("[jade] No active file — pass --file or --project");
             return;
@@ -2311,12 +2785,26 @@ impl JadeApp {
 
     /// Open a file in the editor (deliverable §3): reads + highlights it once
     /// (deduped by path), makes it the active tab, and points `active_file` at it
-    /// so the Build/Run target follows the front tab.
+    /// so the Build/Run target follows the front tab. Interactive opens go
+    /// through the single preview ("temp") tab: a new open replaces the
+    /// unedited preview tab, and the first edit makes the tab permanent.
     pub fn open_file(&mut self, path: PathBuf) {
         // Remember the outgoing tab's page position before we switch/open, then
         // restore the destination tab's own remembered position.
         self.stash_scroll();
-        match self.editor.open(&path) {
+        // The open below can replace the preview tab. Send that tab's
+        // `didClose` first, the same as `close_tab`.
+        if self.editor.index_of(&path).is_none() {
+            if let Some(i) = self.editor.preview_index() {
+                let tab = &self.editor.tabs[i];
+                if tab.lsp_opened {
+                    if let Some(lsp) = &self.lsp {
+                        let _ = lsp.did_close(&tab.path);
+                    }
+                }
+            }
+        }
+        match self.editor.open_preview(&path) {
             Ok(_) => {
                 self.active_file = self.editor.active_path();
                 self.after_open_active(&path);
@@ -2342,6 +2830,14 @@ impl JadeApp {
     /// The picker returns a oneshot receiver handled on the GPUI side (via
     /// `cx.spawn`, NOT tokio) so the resulting state update runs on the UI thread.
     /// Kept thin — all the real work is in the unit-testable `open_project`.
+    /// Welcome-screen mode pick (§B2): remember the choice for the next
+    /// `open_project`, then show the folder picker. Must not scan any tree —
+    /// no workspace is open yet.
+    pub fn choose_mode(&mut self, mode: AppMode, cx: &mut Context<Self>) {
+        self.pending_mode = Some(mode);
+        self.prompt_open_project(cx);
+    }
+
     pub fn prompt_open_project(&mut self, cx: &mut Context<Self>) {
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: false,
@@ -2430,6 +2926,32 @@ impl JadeApp {
         // (e.g. the previous folder had it off) — same launch rule as assemble.
         self.ensure_ai_started();
         self.output_visible = ui.terminal_visible.unwrap_or(true);
+        self.md_visible = ui.markdown_visible.unwrap_or(true);
+        if let Some(w) = ui.markdown_width {
+            let w = (w as f32).clamp(
+                crate::panels::md_view::MIN_W,
+                crate::panels::md_view::MAX_W,
+            );
+            self.md_width = w;
+        }
+        self.md_edit = false;
+
+        // Mode precedence (§B2): the welcome-screen choice, else the folder's
+        // persisted `ui.mode`, else software. A mode change tears the old
+        // side down before the new one starts.
+        let target_mode = self.pending_mode.take().unwrap_or({
+            if ui.mode.as_deref() == Some("hardware") {
+                AppMode::Hardware
+            } else {
+                AppMode::Software
+            }
+        });
+        if self.mode == AppMode::Hardware {
+            self.stop_hw_mode();
+        }
+        if target_mode == AppMode::Hardware {
+            self.start_hw_mode();
+        }
 
         // Prefer the in-memory editor if we visited this project earlier this
         // session (keeps unsaved edits); otherwise build a fresh one from the
@@ -2461,7 +2983,11 @@ impl JadeApp {
                 }
             }
             if self.editor.active.is_none() {
-                if let Some(first) = first_source_file(&dir) {
+                let first = match self.mode {
+                    AppMode::Hardware => crate::hw::first_hw_file(&dir),
+                    AppMode::Software => first_source_file(&dir),
+                };
+                if let Some(first) = first {
                     let _ = self.editor.open(&first);
                 }
             }
@@ -3498,6 +4024,14 @@ impl JadeApp {
 /// note on `panels::code_view::CHAR_W`.
 use crate::panels::code_view::LINE_H;
 
+/// Label a terminal tab with the base name of the directory its shell started
+/// in, else the whole path (a root directory has no base name).
+fn term_title(cwd: &Path) -> String {
+    cwd.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| cwd.display().to_string())
+}
+
 /// Resolve the cwd for a new terminal (§5.2). A selected directory wins; a
 /// selected file contributes its parent directory. The active file's directory
 /// is the next choice, and `root` is the last one. A path that no longer exists
@@ -3624,7 +4158,8 @@ impl JadeApp {
         // the ghost, Esc dismisses it. Only when no chord modifiers are held.
         if self.ghost.is_some() && !m.platform && !m.control && !m.alt {
             match key {
-                "tab" => {
+                // ⇧Tab is the outdent key, so only a plain Tab accepts.
+                "tab" if !shift => {
                     self.ghost_accept(cx);
                     return true;
                 }
@@ -3660,7 +4195,12 @@ impl JadeApp {
                     self.completion_move(1);
                     return true;
                 }
-                "enter" | "tab" => {
+                "enter" => {
+                    self.completion_accept(cx);
+                    return true;
+                }
+                // ⇧Tab outdents instead, so it must not accept the item.
+                "tab" if !shift => {
                     self.completion_accept(cx);
                     return true;
                 }
@@ -3679,11 +4219,25 @@ impl JadeApp {
             self.signature = None;
             return true;
         }
+        // Markdown preview-edit mode: Escape returns the panel to the
+        // rendered view. After the popup gates, so those close first.
+        if self.md_edit && key == "escape" && !m.platform && !m.control && !m.alt {
+            self.md_edit = false;
+            return true;
+        }
 
         // ⌘ chords.
         if m.platform && !m.control && !m.alt {
             match key {
                 "s" => self.editor_save(),
+                // ⌘⇧E explains the selection (§4.14). ⌘E is the execution-flow
+                // toggle, so only the shifted chord is claimed here.
+                "e" if shift => self.explain_trigger(cx),
+                // ⌘⇧M visualizes the selection (§4.15). ⌘⇧V is avoided on
+                // purpose: the paste arm below has no shift guard.
+                "m" if shift => self.visualize_trigger(cx),
+                // ⌘⇧D toggles the Markdown preview panel.
+                "d" if shift => self.toggle_md_preview(cx),
                 "w" => {
                     if let Some(i) = self.editor.active {
                         self.close_tab(i);
@@ -3773,17 +4327,52 @@ impl JadeApp {
                 let r = self.with_edit(|b| b.delete_forward());
                 self.after_edit(r, cx);
             }
+            // Enter answers the Visualize consent card, so the whole flow is
+            // keyboard-only: ⌘⇧M, Enter, watch. Ordered BEFORE the newline
+            // arm. Gated on visibility too: a consent card parked behind
+            // another tab must not swallow Enter or record consent from a
+            // buffer the user cannot see.
+            "enter"
+                if self
+                    .visualize
+                    .as_ref()
+                    .map(|c| c.awaiting_consent())
+                    .unwrap_or(false)
+                    && self.visualize_visible() =>
+            {
+                self.visualize_consent_accept(cx)
+            }
             "enter" => {
-                let r = self.with_edit(|b| b.insert_newline());
+                let lang = self.active_indent_lang();
+                let r = self.with_edit(|b| b.insert_newline_auto(lang));
                 self.after_edit(r, cx);
             }
+            // ⇧Tab removes one indent step from every line the cursors touch.
+            "tab" if shift => {
+                let r = self.with_edit(|b| b.outdent_lines());
+                self.after_edit(r, cx);
+            }
+            // Tab over a selection that spans rows indents the whole block. In
+            // every other case it inserts one hard tab.
             "tab" => {
-                let r = self.with_edit(|b| b.insert_tab());
+                let r = self.with_edit(|b| {
+                    if b.selection_spans_rows() {
+                        b.indent_lines()
+                    } else {
+                        b.insert_tab()
+                    }
+                });
                 self.after_edit(r, cx);
             }
             "escape" if self.completion.is_some() || self.hover.is_some() => {
                 self.dismiss_popups()
             }
+            // Ordered AFTER the popup gate on purpose: a first Esc clears a
+            // completion popup, and only a second one closes the card.
+            // Esc closes the newest selection card first: Visualize, then
+            // Explain. Both may be open at once; two presses close both.
+            "escape" if self.visualize.is_some() => self.close_visualize(cx),
+            "escape" if self.explain.is_some() => self.close_explain(cx),
             _ => return false, // escape-with-nothing / character key → IME
         }
         true
@@ -3897,6 +4486,14 @@ impl JadeApp {
     }
 
     /// Run a text-changing buffer op on the active tab, returning its record.
+    /// The auto-indent dialect of the active tab, from its file extension.
+    fn active_indent_lang(&self) -> jade_buffer::IndentLang {
+        self.editor
+            .active_tab()
+            .map(|t| crate::highlight::indent_lang_for(&t.path))
+            .unwrap_or_default()
+    }
+
     fn with_edit(
         &mut self,
         f: impl FnOnce(&mut jade_buffer::Buffer) -> jade_buffer::EditRecord,
@@ -3939,6 +4536,8 @@ impl JadeApp {
         // XP credit for newline-completing edits (§4.10), then (re)request ghost
         // text at the new caret (§4.11). Both hang off this single choke point.
         self.credit_xp(&record, now);
+        self.explain_note_edit(&record);
+        self.visualize_note_edit(&record);
         self.scroll_caret_into_view();
         self.schedule_ghost();
         self.ensure_decoration_wake(cx);
@@ -3991,6 +4590,22 @@ impl JadeApp {
     /// further right you've scrolled). The code text is painted shifted by this,
     /// so click→column mapping must subtract it and popups must add it to stay
     /// aligned with the on-screen glyphs.
+    /// Visible editor rows, as captured last paint. At least 1 so callers can
+    /// divide by it before the first frame.
+    pub fn editor_rows(&self) -> usize {
+        (self.editor_rows.load(Ordering::Relaxed) as usize).max(1)
+    }
+
+    /// The editor container's box in px. Before the first paint this is
+    /// (0, 0); `clamp_card` degrades to a pinned card rather than dividing by
+    /// zero, so no separate "not laid out yet" branch is needed.
+    pub fn editor_size(&self) -> (f32, f32) {
+        (
+            f32::from_bits(self.editor_w.load(Ordering::Relaxed)),
+            f32::from_bits(self.editor_h.load(Ordering::Relaxed)),
+        )
+    }
+
     pub fn editor_h_scroll(&self) -> f32 {
         f32::from(self.code_scroll.0.borrow().base_handle.offset().x)
     }
@@ -4415,6 +5030,11 @@ impl JadeApp {
                 }
                 self.lsp_did_save(&path);
                 self.status_line(&format!("[jade] Saved {}", path.display()));
+                // Hardware mode: a saved HDL source rebuilds the simulation
+                // (§B10); the fs watcher's follow-up burst is deduped.
+                if self.mode == AppMode::Hardware && crate::hw::is_hdl(&path) {
+                    self.hw_recompile();
+                }
             }
             Err(e) => self.status_line(&format!("[jade] Save failed: {e}")),
         }
@@ -4459,13 +5079,36 @@ impl JadeApp {
     }
 
     /// The selected text of the active buffer, if any.
-    fn selected_text(&self) -> Option<String> {
+    pub(crate) fn selected_text(&self) -> Option<String> {
         let tab = self.editor.active_tab()?;
         let sel = tab.buffer.selection();
         if sel.is_empty() {
             return None;
         }
-        Some(tab.buffer.to_string()[sel.range()].to_string())
+        // `to_string()[range]` copies the whole file to read a fragment of it.
+        Some(tab.buffer.text_range(sel.range()))
+    }
+
+    /// The primary selection as text plus the byte range and the 0-based rows
+    /// it spans — what the Explain and Visualize features need to build a
+    /// request and to anchor a card. `None` when nothing is selected.
+    pub(crate) fn selection_context(&self) -> Option<(String, Range<usize>, usize, usize)> {
+        let tab = self.editor.active_tab()?;
+        let sel = tab.buffer.selection();
+        if sel.is_empty() {
+            return None;
+        }
+        let range = sel.range();
+        let start_row = tab.buffer.offset_to_point(range.start).row;
+        // A selection ending exactly at a line start visually covers the
+        // previous line, not the empty one after it — an off-by-one here puts
+        // the card a row too low and cites a line the user did not select.
+        let end_off = range.end;
+        let mut end_row = tab.buffer.offset_to_point(end_off).row;
+        if end_row > start_row && tab.buffer.offset_to_point(end_off).col == 0 {
+            end_row -= 1;
+        }
+        Some((tab.buffer.text_range(range.clone()), range, start_row, end_row))
     }
 
     fn editor_copy(&mut self, cx: &mut Context<Self>) {
@@ -5239,6 +5882,11 @@ impl JadeApp {
 
     /// Kick off `clangd` initialize once per workspace (spawned on the runtime).
     fn ensure_lsp(&mut self) {
+        // Hardware mode has no clangd surface (belt and braces on top of
+        // `lsp_eligible` rejecting `.v` files).
+        if self.mode == AppMode::Hardware {
+            return;
+        }
         if self.lsp_init_started {
             return;
         }
@@ -5353,6 +6001,49 @@ impl JadeApp {
         }
     }
 
+    /// Open the diagnostic pill `kind`, or close it if it was already the open
+    /// one. Clicking a pill with a zero count still opens it — the popup then
+    /// says so, which is the answer the user clicked for.
+    ///
+    /// `was_open` is the pill's state **as the frame was painted**, not as it is
+    /// now. The open popup lays a full-window backdrop over the action bar, and
+    /// the backdrop's close listener runs before the pill's own; reading
+    /// `self.diag_popup` here would see that close and re-open the popup the
+    /// user just clicked shut.
+    pub fn set_diag_popup(&mut self, kind: DiagKind, was_open: bool) {
+        self.diag_popup = if was_open { None } else { Some(kind) };
+    }
+
+    /// Close the diagnostic popup (backdrop click, Escape, or a jump).
+    pub fn close_diag_popup(&mut self) {
+        self.diag_popup = None;
+    }
+
+    /// The active tab's diagnostics of one severity, in source order. Returns
+    /// indexes into the tab's own list so the caller can read the message and
+    /// the range without cloning them.
+    pub fn diag_list(&self, kind: DiagKind) -> Vec<usize> {
+        self.editor
+            .active_tab()
+            .map(|t| diag_indexes(&t.diagnostics, kind))
+            .unwrap_or_default()
+    }
+
+    /// Jump the editor to a diagnostic: put the caret on the first character it
+    /// flags, then center that line. Unfolds anything hiding it (`flow_goto`).
+    pub fn goto_diagnostic(&mut self, line: u32, character: u32) {
+        let row = line as usize;
+        // LSP counts `character` in UTF-16 code units; the buffer converts.
+        self.buf_move(
+            move |b, _| {
+                let offset = b.lsp_to_offset(jade_buffer::LspPosition::new(row, character as usize));
+                b.set_caret(offset);
+            },
+            false,
+        );
+        self.flow_goto(row + 1);
+    }
+
     /// Aggregate diagnostic counts across the active tab (action-bar badges).
     pub fn active_diag_counts(&self) -> (usize, usize, usize) {
         self.editor
@@ -5362,6 +6053,45 @@ impl JadeApp {
     }
 
     // ── ASM viewer (§6) ───────────────────────────────────────────────────────
+
+    /// True when the right slot shows the Markdown preview: the active tab is
+    /// a `.md` file and the preview is not hidden. The preview opens by
+    /// itself on a Markdown tab and replaces the mode's side panel (runtime
+    /// sidebar / board) while that tab is in front.
+    pub fn md_panel_active(&self) -> bool {
+        self.md_visible
+            && self
+                .editor
+                .active_tab()
+                .is_some_and(|t| crate::panels::md_view::is_markdown(&t.path))
+    }
+
+    /// Toggle the Markdown preview panel (⌘⇧D / the `tgl-md` toggle). Hiding
+    /// the panel also leaves preview-edit mode.
+    pub fn toggle_md_preview(&mut self, cx: &mut Context<Self>) {
+        self.md_visible = !self.md_visible;
+        if !self.md_visible {
+            self.md_edit = false;
+        }
+        self.schedule_ui_save(cx);
+    }
+
+    /// A preview click: move the caret to `(row, col)`, enter preview-edit
+    /// mode, and pull keyboard focus back to the editor. Keystrokes then run
+    /// through the normal editor path, so both views edit the same buffer.
+    pub fn md_preview_click(&mut self, row: usize, col: usize, cx: &mut Context<Self>) {
+        if let Some(tab) = self.editor.active_tab_mut() {
+            let row = row.min(tab.line_count().saturating_sub(1));
+            let col = col.min(tab.line(row).chars().count());
+            let off = tab.buffer.point_to_offset(Point::new(row, col));
+            tab.buffer.set_caret(off);
+        }
+        self.md_edit = true;
+        self.pending_editor_focus = true;
+        // The reverse view sync: the code view follows the preview click.
+        self.scroll_caret_into_view();
+        cx.notify();
+    }
 
     /// Toggle the right-half ASM overlay (ASM chip / ⌘⇧A). Opening kicks off a
     /// `generate_asm` for the active file (saving first, app.ts:399); closing just
@@ -5695,6 +6425,21 @@ impl JadeApp {
             benchmarks: self.benchmarks.clone(),
             ai_completion_enabled: Some(self.ai_completion_enabled),
             timer_groups: self.timer_groups.defs().to_vec(),
+            mode: Some(
+                match self.mode {
+                    AppMode::Software => "software",
+                    AppMode::Hardware => "hardware",
+                }
+                .to_string(),
+            ),
+            dip_switches: self
+                .hw
+                .as_ref()
+                .map(|h| h.dip.to_vec())
+                .unwrap_or_default(),
+            board_width: (self.mode == AppMode::Hardware).then_some(self.board_width as f64),
+            markdown_visible: Some(self.md_visible),
+            markdown_width: Some(self.md_width as f64),
         }
     }
 
@@ -5771,6 +6516,920 @@ fn path_from_uri(uri: &lsp_types::Uri) -> PathBuf {
 }
 
 // ── IME / text input (E2) ─────────────────────────────────────────────────────
+
+// ── Explain card (§4.14) ─────────────────────────────────────────────────────
+impl JadeApp {
+    /// ⌘⇧E. Explain the current selection.
+    ///
+    /// Idempotent for the selection already on screen: re-triggering scrolls
+    /// the existing card into view rather than issuing a second request, so
+    /// holding the chord does not spend money. A different selection
+    /// supersedes.
+    pub fn explain_trigger(&mut self, cx: &mut Context<Self>) {
+        let Some((text, range, start_row, end_row)) = self.selection_context() else {
+            self.push_toast(ToastKind::Error, "Select some code to explain.");
+            return;
+        };
+        let Some(path) = self.editor.active_tab().map(|t| t.path.clone()) else {
+            return;
+        };
+
+        // Same selection, same file, card already up: nothing to do.
+        if let Some(c) = &self.explain {
+            if c.path == path && c.sel_range == range {
+                self.reveal_line(c.start_row);
+                return;
+            }
+        }
+
+        if text.len() > crate::explain::HARD_SELECTION_LIMIT {
+            self.push_toast(
+                ToastKind::Error,
+                "That selection is too large to explain. Select a smaller fragment.",
+            );
+            return;
+        }
+
+        self.start_explain(path, text, range, start_row, end_row, cx);
+    }
+
+    /// Re-issue the current card's request, keeping its anchor.
+    pub fn explain_retry(&mut self, cx: &mut Context<Self>) {
+        let Some(c) = &self.explain else { return };
+        let (path, start_row, end_row, range) =
+            (c.path.clone(), c.start_row, c.end_row, c.sel_range.clone());
+        // Re-read the buffer rather than caching the text: the fragment may
+        // have been edited since, and explaining the old bytes would be a lie.
+        // From the tab that OWNS the card, not the active one — the card
+        // survives tab switches, and `after_events` can retry it while a
+        // different file is in front.
+        let Some(tab) = self.tab_by_path(&path) else { return };
+        let text = tab.buffer.text_range(range.clone());
+        self.start_explain(path, text, range, start_row, end_row, cx);
+    }
+
+    /// The open tab holding `path`, wherever it is in the strip. The Explain
+    /// and Visualize cards outlive tab switches, so every re-read of their
+    /// fragment must go through this rather than `active_tab`.
+    fn tab_by_path(&self, path: &Path) -> Option<&crate::editor_view::OpenTab> {
+        self.editor.tabs.iter().find(|t| t.path == *path)
+    }
+
+    /// Look up the declarations of the identifiers the selection uses.
+    ///
+    /// Synchronous by design: the whole point is to have them in the FIRST
+    /// prompt, and clangd answers a hover in single-digit milliseconds off a
+    /// warm index. The whole batch is bounded by [`SYMBOL_BUDGET`] so a cold or
+    /// wedged server delays the card by that much and no more, and returns
+    /// whatever arrived — fewer declarations is a degradation, not a failure.
+    ///
+    /// Returns empty when clangd is not up, which is the normal state for a
+    /// language it does not serve.
+    fn explain_symbols(
+        &self,
+        path: &Path,
+        text: &str,
+        start_row: usize,
+        sel_start: usize,
+    ) -> Vec<crate::explain::SymbolDoc> {
+        let Some(lsp) = self.lsp.clone() else {
+            return Vec::new();
+        };
+        // The tab that owns the fragment — a retry can run while another tab
+        // is in front, and positions against the wrong buffer resolve the
+        // wrong symbols.
+        let Some(tab) = self.tab_by_path(path) else {
+            return Vec::new();
+        };
+        let path = tab.path.clone();
+        // A selection that starts mid-line yields fragment-relative columns
+        // on its first line; shift them to buffer columns before asking.
+        let start_col = tab.buffer.offset_to_point(sel_start).col;
+        let candidates = crate::explain::absolutize_columns(
+            crate::explain::identifier_candidates(text, start_row),
+            start_row,
+            start_col,
+        );
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+        // Convert to the UTF-16 positions clangd speaks while the buffer is
+        // still borrowed; the async block must not hold it.
+        let positions: Vec<(String, jade_lsp::Position)> = candidates
+            .into_iter()
+            .map(|c| {
+                let byte = tab.buffer.point_to_offset(Point::new(c.row, c.col));
+                let p = tab.buffer.offset_to_lsp(byte);
+                (
+                    c.name,
+                    jade_lsp::Position::new(p.line as u32, p.character as u32),
+                )
+            })
+            .collect();
+
+        self.runtime.block_on(async move {
+            let lookups = positions.into_iter().map(|(name, pos)| {
+                let lsp = lsp.clone();
+                let path = path.clone();
+                async move {
+                    let text = match lsp.hover(&path, pos).await {
+                        Ok(Some(h)) => crate::explain::condense_hover(&flatten_hover(&h)),
+                        _ => String::new(),
+                    };
+                    (name, text)
+                }
+            });
+            // All at once: they are independent, and clangd handles concurrent
+            // hovers on one warm index without contention.
+            let all = futures_util::future::join_all(lookups);
+            match tokio::time::timeout(SYMBOL_BUDGET, all).await {
+                Ok(rows) => rows
+                    .into_iter()
+                    .filter(|(_, d)| !d.trim().is_empty())
+                    .map(|(name, detail)| crate::explain::SymbolDoc { name, detail })
+                    .collect(),
+                // A slow server must not hold the card: go without.
+                Err(_) => Vec::new(),
+            }
+        })
+    }
+
+    /// Make sure SOME model can serve chat, starting the local server if that
+    /// is the only option left.
+    ///
+    /// Returns the error to seed the card with when nothing can serve yet.
+    /// Deliberately NOT gated on `ai_completion_enabled`: that switch governs
+    /// ghost text, and a user who never wants inline completion may still want
+    /// to ask what a function does.
+    fn ensure_chat_model(&mut self) -> Option<ChatError> {
+        match self.chat.effective_provider() {
+            Ok(_) => None,
+            Err(ChatError::NoCredential) => {
+                // No key and no server: bring the managed one up rather than
+                // telling the user to go and configure something.
+                let ai = self.ai.clone();
+                self.runtime.spawn(async move {
+                    ai.start().await;
+                });
+                Some(ChatError::LocalStarting)
+            }
+            Err(e) => Some(e),
+        }
+    }
+
+    /// Work that a drained event batch may have unblocked, run once per batch
+    /// from the pump. Kept separate from `apply_app_event` because that one is
+    /// `Context`-free by design, so the headless smoke paths and the tests can
+    /// drive it without a window.
+    pub fn after_events(&mut self, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.explain_resume_pending) {
+            return;
+        }
+        // Re-issue a card parked on "the local model is starting" now that it
+        // is up. Without this the user must notice the status change and press
+        // Retry themselves, having already asked once.
+        let parked = self
+            .explain
+            .as_ref()
+            .map(|c| c.failure() == Some(&ChatError::LocalStarting))
+            .unwrap_or(false);
+        if parked && self.chat.effective_provider().is_ok() {
+            self.explain_retry(cx);
+        }
+        // The Visualize card parks the same way and resumes the same way.
+        let parked = self
+            .visualize
+            .as_ref()
+            .map(|c| {
+                matches!(
+                    c.failure(),
+                    Some(crate::visualize::VisualizeError::Chat(ChatError::LocalStarting))
+                )
+            })
+            .unwrap_or(false);
+        if parked && self.chat.effective_provider().is_ok() {
+            self.visualize_retry(cx);
+        }
+    }
+
+    /// Issue an Explain request and install a fresh card for it.
+    fn start_explain(
+        &mut self,
+        path: PathBuf,
+        text: String,
+        range: Range<usize>,
+        start_row: usize,
+        end_row: usize,
+        cx: &mut Context<Self>,
+    ) {
+        self.explain_gen += 1;
+        let generation = self.explain_gen;
+        // Forget the last card's height: a new one starts short, and reusing
+        // the old value would place it as though it were already full.
+        self.explain_card_h.store(0, Ordering::Relaxed);
+
+        // Read the context lines up front: the request builder is pure and
+        // must not hold a borrow on the buffer across the spawn. Always from
+        // the tab that OWNS `path` — a retry can run with another tab active.
+        let lines: Vec<String> = self
+            .tab_by_path(&path)
+            .map(|t| {
+                let lo = start_row.saturating_sub(crate::explain::CONTEXT_LINES);
+                // `line_count` is a count, not a last index — `line()` past the
+                // final row panics inside ropey.
+                let last = t.buffer.line_count().saturating_sub(1);
+                let hi = (end_row + crate::explain::CONTEXT_LINES).min(last);
+                (lo..=hi).map(|r| t.buffer.line(r).to_string()).collect()
+            })
+            .unwrap_or_default();
+        let lo = start_row.saturating_sub(crate::explain::CONTEXT_LINES);
+        let line = move |row: usize| lines.get(row.checked_sub(lo)?).cloned();
+
+        let language = crate::explain::language_name(&path);
+        // Resolve the fragment's identifiers against the language server. The
+        // reason a fragment is shaped the way it is usually lives in a
+        // declaration it refers to, and a line window only catches that when
+        // the declaration happens to be nearby.
+        let symbols = self.explain_symbols(&path, &text, start_row, range.start);
+        // The file's declarations, without any bodies. A line window shows what
+        // is physically near the selection; the outline shows what the file is
+        // actually made of, for a fraction of the tokens.
+        let skeleton = if crate::explain::has_skeleton(language) {
+            self.tab_by_path(&path)
+                .map(|t| {
+                    crate::explain::file_skeleton(&t.buffer.to_string(), start_row..=end_row)
+                })
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let sel = Selected {
+            path: &path,
+            language,
+            start_row,
+            end_row,
+            text: &text,
+            line: &line,
+            symbols: &symbols,
+            skeleton: &skeleton,
+        };
+        let req = crate::explain::explain_request(&sel);
+        let mut card = ExplainCard::new(generation, &sel, range).started_at(self.now_ms());
+
+        // Nothing can serve yet: park the card with the reason rather than
+        // sending a request that is certain to fail.
+        if let Some(blocked) = self.ensure_chat_model() {
+            card.apply(ChatDelta::Failed(blocked));
+            self.explain = Some(card);
+            cx.notify();
+            return;
+        }
+        self.explain = Some(card);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        self.chat.start(Lane::Explain, req, tx);
+
+        // Forward deltas onto the unified pump so the existing batch
+        // coalescing collapses a burst of tokens into one repaint.
+        let app_tx = self.app_tx.clone();
+        self.runtime.spawn(async move {
+            while let Some(delta) = rx.recv().await {
+                if app_tx
+                    .send(AppEvent::Explain { generation, delta })
+                    .is_err()
+                {
+                    break; // the app is gone
+                }
+            }
+        });
+        cx.notify();
+    }
+
+    /// Apply one streamed delta, dropping anything from a superseded request.
+    fn on_explain(&mut self, generation: u64, delta: ChatDelta) {
+        if generation != self.explain_gen {
+            return;
+        }
+        let Some(card) = &mut self.explain else { return };
+        if card.generation != generation {
+            return;
+        }
+        let terminal = matches!(delta, ChatDelta::Done { .. } | ChatDelta::Failed(_));
+        let now = self.epoch.elapsed().as_millis() as u64;
+        card.apply_at(delta, now);
+        if terminal {
+            self.chat.finished(Lane::Explain, generation);
+        }
+    }
+
+    /// Close the card and cancel everything it owns.
+    pub fn close_explain(&mut self, cx: &mut Context<Self>) {
+        // Bump first: any delta already queued on the pump is now stale.
+        self.explain_gen += 1;
+        self.chat.cancel(Lane::Explain);
+        if let Some(h) = self.explain_popout.take() {
+            let _ = h.update(cx, |_, window, _| window.remove_window());
+        }
+        self.explain = None;
+    }
+
+    /// True while an Explain card has animation to run: a request in flight, or
+    /// prose still resolving word by word.
+    pub fn explain_working(&self) -> bool {
+        let Some(c) = &self.explain else { return false };
+        if c.in_flight() {
+            return true;
+        }
+        // A card that never produced text — failed, or done empty — has no
+        // prose tail to animate. Without this gate `stream_elapsed` stays 0
+        // forever and the ticker would spin at 30fps for as long as the
+        // failure banner is open.
+        if c.first_text_ms.is_none() {
+            return false;
+        }
+        // After the last delta the tail of the prose is still resolving.
+        c.stream_elapsed(self.now_ms())
+            < crate::beautiful::stream::STREAM_IN_MS + crate::beautiful::stream::WORD_MS
+    }
+
+    /// The card's height as last painted, or `None` before the first frame.
+    pub fn explain_card_height(&self) -> Option<f32> {
+        let h = f32::from_bits(self.explain_card_h.load(Ordering::Relaxed));
+        (h > 1.0).then_some(h)
+    }
+
+    /// True when an Explain card is open for the active tab. The card is
+    /// hidden — not destroyed — while another tab is in front, so an in-flight
+    /// request survives a glance at another file.
+    pub fn explain_visible(&self) -> bool {
+        let Some(c) = &self.explain else { return false };
+        self.editor
+            .active_tab()
+            .map(|t| t.path == c.path)
+            .unwrap_or(false)
+    }
+
+    /// Open (or re-focus) the Explain card's own window.
+    ///
+    /// Deferred for the same reason as [`Self::open_metric_popout`]:
+    /// `open_window` draws the new window synchronously, and its root view
+    /// reads THIS entity — which is still leased to the click listener we were
+    /// called from. `App::defer` runs after the lease returns.
+    pub fn open_explain_popout(&mut self, cx: &mut Context<Self>) {
+        if let Some(handle) = self.explain_popout {
+            if handle
+                .update(cx, |_, window, _| window.activate_window())
+                .is_ok()
+            {
+                return;
+            }
+        }
+        let Some(generation) = self.explain.as_ref().map(|c| c.generation) else {
+            return;
+        };
+        let entity = cx.entity();
+        cx.defer(move |cx| {
+            let bounds = Bounds::centered(None, gpui::size(px(720.), px(520.)), cx);
+            let opened = cx.open_window(
+                gpui::WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
+                    titlebar: Some(gpui::TitlebarOptions {
+                        title: Some("Jade — Explanation".into()),
+                        appears_transparent: false,
+                        traffic_light_position: None,
+                    }),
+                    window_min_size: Some(gpui::size(px(360.), px(240.))),
+                    window_background: gpui::WindowBackgroundAppearance::Opaque,
+                    ..Default::default()
+                },
+                {
+                    let entity = entity.clone();
+                    move |_, cx| {
+                        cx.new(|cx| {
+                            crate::panels::explain_popout::ExplainPopout::new(
+                                entity, generation, cx,
+                            )
+                        })
+                    }
+                },
+            );
+            if let Ok(handle) = opened {
+                entity.update(cx, |app, _| {
+                    app.explain_popout = Some(handle);
+                    if let Some(c) = &mut app.explain {
+                        c.popped_out = true;
+                    }
+                });
+            }
+        });
+    }
+
+    /// Feed one edit to the Explain card so it can go stale, or follow the
+    /// code down the file. Reads the LSP-shaped changes the buffer already
+    /// produces, so no second edit representation is needed.
+    fn explain_note_edit(&mut self, record: &jade_buffer::EditRecord) {
+        let Some(c) = &mut self.explain else { return };
+        for ch in &record.changes {
+            let first = ch.start.line;
+            let last = ch.end.line;
+            let removed = last.saturating_sub(first);
+            let added = ch.new_text.matches('\n').count();
+            c.note_edit_rows(first, last, removed, added);
+        }
+    }
+}
+
+// ── Visualize card (§4.15) ───────────────────────────────────────────────────
+impl JadeApp {
+    /// ⌘⇧M. Visualize the current selection.
+    ///
+    /// Idempotent for the selection already on screen, like ⌘⇧E. Gated twice
+    /// before any money is spent: [`crate::visualize::precheck`] refuses data
+    /// files and comment-only fragments locally, and the model's own
+    /// `suitable` verdict refuses fragments with nothing to animate.
+    pub fn visualize_trigger(&mut self, cx: &mut Context<Self>) {
+        // The local tier cannot write a runnable scene; say so instead of
+        // rendering its output into a confusing failure.
+        if !self.chat.model().can_write_scenes() {
+            self.push_toast(
+                ToastKind::Error,
+                "Visualize needs a Claude model. The local model cannot write scenes.",
+            );
+            return;
+        }
+        let Some((text, range, start_row, end_row)) = self.selection_context() else {
+            self.push_toast(ToastKind::Error, "Select some code to visualize.");
+            return;
+        };
+        let Some(path) = self.editor.active_tab().map(|t| t.path.clone()) else {
+            return;
+        };
+
+        // Same selection, same file, card already up: reveal, do not respend.
+        if let Some(c) = &self.visualize {
+            if c.path == path && c.sel_range == range {
+                self.reveal_line(c.start_row);
+                return;
+            }
+        }
+
+        if text.len() > crate::explain::HARD_SELECTION_LIMIT {
+            self.push_toast(
+                ToastKind::Error,
+                "That selection is too large to visualize. Select a smaller fragment.",
+            );
+            return;
+        }
+
+        // Gate 1, free and local: nothing to animate → no card, no request.
+        let language = crate::explain::language_name(&path);
+        if let Err(reject) = crate::visualize::precheck(language, &text) {
+            self.push_toast(ToastKind::Error, reject.message());
+            return;
+        }
+
+        // First use: consent before a single byte of generated Python runs.
+        if !self.ai_prefs.visualize_enabled {
+            self.close_visualize(cx);
+            self.visualize_gen += 1;
+            let f = |_: usize| None;
+            let sel = crate::explain::Selected {
+                path: &path,
+                language,
+                start_row,
+                end_row,
+                text: &text,
+                line: &f,
+                symbols: &[],
+                skeleton: "",
+            };
+            let mut card =
+                crate::visualize::VisualizeCard::new(self.visualize_gen, &sel, range)
+                    .started_at(self.now_ms());
+            card.phase = crate::visualize::VisualizePhase::Consent;
+            self.visualize = Some(card);
+            cx.notify();
+            return;
+        }
+
+        self.start_visualize(path, text, range, start_row, end_row, cx);
+    }
+
+    /// The consent card's accept button: record the choice, then run the
+    /// request the card was opened for.
+    pub fn visualize_consent_accept(&mut self, cx: &mut Context<Self>) {
+        self.ai_prefs.visualize_enabled = true;
+        self.ai_prefs.save();
+        let Some(c) = &self.visualize else { return };
+        if !c.awaiting_consent() {
+            return;
+        }
+        let (path, start_row, end_row, range) =
+            (c.path.clone(), c.start_row, c.end_row, c.sel_range.clone());
+        // The tab that owns the card, not the active one.
+        let Some(tab) = self.tab_by_path(&path) else { return };
+        let text = tab.buffer.text_range(range.clone());
+        self.start_visualize(path, text, range, start_row, end_row, cx);
+    }
+
+    /// Re-issue the current card's request, keeping its anchor. Re-reads the
+    /// buffer, exactly like `explain_retry`.
+    pub fn visualize_retry(&mut self, cx: &mut Context<Self>) {
+        let Some(c) = &self.visualize else { return };
+        let (path, start_row, end_row, range) =
+            (c.path.clone(), c.start_row, c.end_row, c.sel_range.clone());
+        // The tab that owns the card, not the active one — `after_events`
+        // retries a parked card while any tab may be in front.
+        let Some(tab) = self.tab_by_path(&path) else { return };
+        let text = tab.buffer.text_range(range.clone());
+        self.start_visualize(path, text, range, start_row, end_row, cx);
+    }
+
+    /// Issue a Visualize request and install a fresh card for it. Mirrors
+    /// [`Self::start_explain`]; the context assembly is shared code.
+    fn start_visualize(
+        &mut self,
+        path: PathBuf,
+        text: String,
+        range: Range<usize>,
+        start_row: usize,
+        end_row: usize,
+        cx: &mut Context<Self>,
+    ) {
+        // Tear down whatever the previous card owned (player, render).
+        self.stop_visualize_work();
+        self.visualize_gen += 1;
+        let generation = self.visualize_gen;
+        self.visualize_card_h.store(0, Ordering::Relaxed);
+
+        // Explain happily falls back to the local FIM-tuned model when no key
+        // is present; a scene that model writes will not run, so the request
+        // would only burn time and end in a validation failure. Unless the
+        // user explicitly pointed chat at their own instruct server
+        // (JADE_CHAT_ENDPOINT), Visualize needs the Anthropic credential —
+        // and says so up front, as a setup step.
+        if jade_ai::ChatBackend::endpoint_override().is_none()
+            && self.chat.credential().0.is_none()
+        {
+            let f = |_: usize| None;
+            let sel = Selected {
+                path: &path,
+                language: crate::explain::language_name(&path),
+                start_row,
+                end_row,
+                text: &text,
+                line: &f,
+                symbols: &[],
+                skeleton: "",
+            };
+            let mut card = crate::visualize::VisualizeCard::new(generation, &sel, range)
+                .started_at(self.now_ms());
+            card.apply_chat(ChatDelta::Failed(ChatError::NoCredential));
+            self.visualize = Some(card);
+            cx.notify();
+            return;
+        }
+
+        // Context comes from the tab that OWNS `path`, exactly as in
+        // `start_explain` — a retry can run while another tab is in front.
+        let lines: Vec<String> = self
+            .tab_by_path(&path)
+            .map(|t| {
+                let lo = start_row.saturating_sub(crate::explain::CONTEXT_LINES);
+                let last = t.buffer.line_count().saturating_sub(1);
+                let hi = (end_row + crate::explain::CONTEXT_LINES).min(last);
+                (lo..=hi).map(|r| t.buffer.line(r).to_string()).collect()
+            })
+            .unwrap_or_default();
+        let lo = start_row.saturating_sub(crate::explain::CONTEXT_LINES);
+        let line = move |row: usize| lines.get(row.checked_sub(lo)?).cloned();
+
+        let language = crate::explain::language_name(&path);
+        let symbols = self.explain_symbols(&path, &text, start_row, range.start);
+        let skeleton = if crate::explain::has_skeleton(language) {
+            self.tab_by_path(&path)
+                .map(|t| crate::explain::file_skeleton(&t.buffer.to_string(), start_row..=end_row))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let sel = Selected {
+            path: &path,
+            language,
+            start_row,
+            end_row,
+            text: &text,
+            line: &line,
+            symbols: &symbols,
+            skeleton: &skeleton,
+        };
+        let req = crate::visualize::visualize_request(&sel);
+        let mut card = crate::visualize::VisualizeCard::new(generation, &sel, range)
+            .started_at(self.now_ms());
+
+        if let Some(blocked) = self.ensure_chat_model() {
+            card.apply_chat(ChatDelta::Failed(blocked));
+            self.visualize = Some(card);
+            cx.notify();
+            return;
+        }
+        self.visualize = Some(card);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        self.chat.start(Lane::Visualize, req, tx);
+        let app_tx = self.app_tx.clone();
+        self.runtime.spawn(async move {
+            while let Some(delta) = rx.recv().await {
+                if app_tx
+                    .send(AppEvent::Visualize { generation, delta })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        cx.notify();
+    }
+
+    /// Apply one streamed chat delta; when the script clears the gate, start
+    /// the sandboxed render.
+    fn on_visualize(&mut self, generation: u64, delta: ChatDelta) {
+        if generation != self.visualize_gen {
+            return;
+        }
+        let Some(card) = &mut self.visualize else { return };
+        if card.generation != generation {
+            return;
+        }
+        let terminal = matches!(delta, ChatDelta::Done { .. } | ChatDelta::Failed(_));
+        card.apply_chat(delta);
+        if terminal {
+            self.chat.finished(Lane::Visualize, generation);
+        }
+        // The reducer moved to Rendering: the script exists and passed the
+        // gate, so hand it to jade-build.
+        if matches!(
+            self.visualize.as_ref().map(|c| &c.phase),
+            Some(crate::visualize::VisualizePhase::Rendering)
+        ) && self.visualize_render.is_none()
+        {
+            self.spawn_visualize_render(generation);
+        }
+    }
+
+    /// Spawn the sandboxed Manim render for the card's validated script.
+    fn spawn_visualize_render(&mut self, generation: u64) {
+        let Some(script) = self
+            .visualize
+            .as_ref()
+            .and_then(|c| c.plan.as_ref())
+            .map(|p| p.script.clone())
+        else {
+            return;
+        };
+        let venv = jade_build::venv::venv_dir();
+        let cache = jade_build::manim::cache_root(&self.workspace_root);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let app_tx = self.app_tx.clone();
+        // The render task lives on the runtime; enter it so `tokio::spawn`
+        // inside `render` has a reactor.
+        let _guard = self.runtime.enter();
+        let handle = jade_build::manim::render(venv, cache, script, tx);
+        self.visualize_render = Some(handle);
+        self.runtime.spawn(async move {
+            while let Some(ev) = rx.recv().await {
+                if app_tx
+                    .send(AppEvent::VisualizeRender { generation, ev })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+    }
+
+    /// Apply one render event; on Done, open the player paused on frame one.
+    fn on_visualize_render(&mut self, generation: u64, ev: jade_build::manim::RenderEvent) {
+        if generation != self.visualize_gen {
+            return;
+        }
+        let Some(card) = &mut self.visualize else { return };
+        if card.generation != generation {
+            return;
+        }
+        let was_terminal = card.terminal();
+        card.apply_render(ev);
+        if card.terminal() && !was_terminal {
+            self.visualize_render = None;
+        }
+        if matches!(card.phase, crate::visualize::VisualizePhase::Ready) {
+            if let Some(video) = self.visualize.as_ref().and_then(|c| c.video.clone()) {
+                match crate::video::Player::open(&video) {
+                    Ok(mut p) => {
+                        // Start playing at once — the user asked to SEE this.
+                        p.play();
+                        self.visualize_player = Some(p);
+                    }
+                    Err(e) => {
+                        if let Some(c) = &mut self.visualize {
+                            c.phase = crate::visualize::VisualizePhase::Failed(
+                                crate::visualize::VisualizeError::Render(format!(
+                                    "the video could not be opened: {e}"
+                                )),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Stop everything a card owns without touching the card itself.
+    fn stop_visualize_work(&mut self) {
+        self.chat.cancel(Lane::Visualize);
+        if let Some(mut h) = self.visualize_render.take() {
+            h.stop();
+        }
+        self.visualize_player = None;
+        self.visualize_scrubbing = false;
+    }
+
+    /// Close the card and cancel everything it owns.
+    pub fn close_visualize(&mut self, cx: &mut Context<Self>) {
+        self.visualize_gen += 1;
+        self.stop_visualize_work();
+        if let Some(h) = self.visualize_popout.take() {
+            let _ = h.update(cx, |_, window, _| window.remove_window());
+        }
+        self.visualize = None;
+    }
+
+    /// True while the card has request/render animation to run (the ticker's
+    /// gate; playback repaints come from `request_animation_frame` instead).
+    pub fn visualize_working(&self) -> bool {
+        self.visualize.as_ref().map(|c| c.in_flight()).unwrap_or(false)
+    }
+
+    pub fn visualize_card_height(&self) -> Option<f32> {
+        let h = f32::from_bits(self.visualize_card_h.load(Ordering::Relaxed));
+        (h > 1.0).then_some(h)
+    }
+
+    /// True when a Visualize card is open for the active tab (hidden, not
+    /// destroyed, while another tab is in front — same as Explain).
+    pub fn visualize_visible(&self) -> bool {
+        let Some(c) = &self.visualize else { return false };
+        self.editor
+            .active_tab()
+            .map(|t| t.path == c.path)
+            .unwrap_or(false)
+    }
+
+    /// The transport state for the card footer, when a player exists.
+    pub fn visualize_transport(&self) -> Option<crate::video::Transport> {
+        self.visualize_player.as_ref().map(|p| p.transport())
+    }
+
+    /// ▶/⏸ button.
+    pub fn visualize_toggle_play(&mut self) {
+        if let Some(p) = &mut self.visualize_player {
+            p.toggle();
+        }
+    }
+
+    /// Seek to `fraction` of the clip (scrub click/drag).
+    pub fn visualize_seek_fraction(&mut self, fraction: f32) {
+        if let Some(p) = &mut self.visualize_player {
+            let d = p.transport().duration;
+            if d > 0.0 {
+                p.seek((fraction.clamp(0.0, 1.0) as f64) * d);
+            }
+        }
+    }
+
+    /// Notice pop-out windows the user closed with the window controls.
+    ///
+    /// gpui offers no close callback on a `WindowHandle`, so each frame
+    /// checks the stored handles against the live window list. A closed
+    /// pop-out hands the card its body back (`popped_out = false`) — without
+    /// this the inline card says "Showing in a separate window" forever, and
+    /// the Visualize pump keeps decoding for a window that no longer exists.
+    pub fn reconcile_popouts(&mut self, cx: &mut Context<Self>) {
+        let live = cx.windows();
+        if let Some(h) = self.explain_popout {
+            let any: gpui::AnyWindowHandle = h.into();
+            if !live.contains(&any) {
+                self.explain_popout = None;
+                if let Some(c) = &mut self.explain {
+                    c.popped_out = false;
+                }
+            }
+        }
+        if let Some(h) = self.visualize_popout {
+            let any: gpui::AnyWindowHandle = h.into();
+            if !live.contains(&any) {
+                self.visualize_popout = None;
+                if let Some(c) = &mut self.visualize {
+                    c.popped_out = false;
+                }
+            }
+        }
+    }
+
+    /// The pre-render frame pump (§4.15 risk 1). One
+    /// `hasNewPixelBufferForItemTime:` poll per animation frame, vsync-paced
+    /// by `request_animation_frame`, and NOT requested at all when the card
+    /// is closed, off-tab, or paused — that idleness is what keeps a playing
+    /// clip from taxing the editor when it is not on screen.
+    pub fn ensure_video_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let popped_out = self
+            .visualize
+            .as_ref()
+            .map(|c| c.popped_out)
+            .unwrap_or(false);
+        // Off-screen AND not popped out: nobody can see a frame, so none is
+        // decoded. The pop-out keeps the pump alive across tab switches.
+        if !self.visualize_visible() && !popped_out {
+            return;
+        }
+        let Some(player) = &mut self.visualize_player else { return };
+        let t = player.transport();
+        if !t.playing {
+            return;
+        }
+        player.pump();
+        window.request_animation_frame();
+        // The pop-out window repaints through its observation of this entity,
+        // not through this window's animation frame.
+        if popped_out {
+            cx.notify();
+        }
+    }
+
+    /// Open (or re-focus) the Visualize card's own window. Same deferred
+    /// pattern as [`Self::open_explain_popout`], for the same lease reason.
+    pub fn open_visualize_popout(&mut self, cx: &mut Context<Self>) {
+        if let Some(handle) = self.visualize_popout {
+            if handle
+                .update(cx, |_, window, _| window.activate_window())
+                .is_ok()
+            {
+                return;
+            }
+        }
+        let Some(generation) = self.visualize.as_ref().map(|c| c.generation) else {
+            return;
+        };
+        let entity = cx.entity();
+        cx.defer(move |cx| {
+            let bounds = Bounds::centered(None, gpui::size(px(760.), px(520.)), cx);
+            let opened = cx.open_window(
+                gpui::WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
+                    titlebar: Some(gpui::TitlebarOptions {
+                        title: Some("Jade — Visualization".into()),
+                        appears_transparent: false,
+                        traffic_light_position: None,
+                    }),
+                    window_min_size: Some(gpui::size(px(400.), px(280.))),
+                    window_background: gpui::WindowBackgroundAppearance::Opaque,
+                    ..Default::default()
+                },
+                {
+                    let entity = entity.clone();
+                    move |_, cx| {
+                        cx.new(|cx| {
+                            crate::panels::visualize_popout::VisualizePopout::new(
+                                entity, generation, cx,
+                            )
+                        })
+                    }
+                },
+            );
+            if let Ok(handle) = opened {
+                entity.update(cx, |app, _| {
+                    app.visualize_popout = Some(handle);
+                    if let Some(c) = &mut app.visualize {
+                        c.popped_out = true;
+                    }
+                });
+            }
+        });
+    }
+
+    /// Feed one edit to the Visualize card (stale marking / anchor shift).
+    fn visualize_note_edit(&mut self, record: &jade_buffer::EditRecord) {
+        let Some(c) = &mut self.visualize else { return };
+        for ch in &record.changes {
+            let first = ch.start.line;
+            let last = ch.end.line;
+            let removed = last.saturating_sub(first);
+            let added = ch.new_text.matches('\n').count();
+            c.note_edit_rows(first, last, removed, added);
+        }
+    }
+}
+
 impl EntityInputHandler for JadeApp {
     fn text_for_range(
         &mut self,
@@ -5843,10 +7502,26 @@ impl EntityInputHandler for JadeApp {
                 .or_else(|| tab.marked.clone())
                 .unwrap_or_else(|| tab.buffer.selection().range());
             tab.marked = None;
-            tab.buffer.edit(range, text)
+            // `edit_typed`, not `edit`: this is the keyboard, so the character
+            // joins the typing burst and undo takes back a word at a time.
+            tab.buffer.edit_typed(range, text)
         });
         if let Some(record) = record {
             self.after_edit(record, cx);
+        }
+        // Electric re-indent: a line that now holds only a closer (`}`, `end`,
+        // `endmodule` …) re-aligns to its matching opener. The check is cheap,
+        // so gate only on the character class.
+        if text
+            .chars()
+            .last()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '}')
+        {
+            let lang = self.active_indent_lang();
+            let r = self.with_edit(|b| b.auto_reindent_line(lang));
+            if !r.is_noop() {
+                self.after_edit(r, cx);
+            }
         }
         if text.is_empty() {
             self.dismiss_popups();
@@ -5873,7 +7548,7 @@ impl EntityInputHandler for JadeApp {
                 .or_else(|| tab.marked.clone())
                 .unwrap_or_else(|| tab.buffer.selection().range());
             let start = range.start;
-            let rec = tab.buffer.edit(range, new_text);
+            let rec = tab.buffer.edit_typed(range, new_text);
             tab.marked = if new_text.is_empty() {
                 None
             } else {
@@ -5949,15 +7624,35 @@ fn meta_dims(meta: Option<&Map<String, Value>>) -> (Option<u32>, Option<u32>) {
 
 impl Render for JadeApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // §4.15 risk 1: a playing clip repaints this whole tree per frame.
+        // `JADE_RENDER_TRACE=1` prints the element-build time so a stutter can
+        // be measured against the 16ms budget instead of argued about.
+        let trace_started = std::env::var_os("JADE_RENDER_TRACE")
+            .map(|_| std::time::Instant::now());
         let theme = self.theme.clone();
 
         // Re-bake tensor-preview textures whose newest frame advanced (a step
         // compare per enabled buffer; the bake itself runs once per NEW frame,
         // never per repaint — see `ensure_preview_images`).
         self.ensure_preview_images(window, cx);
+        // A pop-out the user closed hands its card the body back, BEFORE the
+        // pump decides whether anyone is watching.
+        self.reconcile_popouts(cx);
+        // Visualize playback: one frame pump per animation frame while a clip
+        // plays on screen; requests nothing when idle (§4.15 risk 1).
+        self.ensure_video_frame(window, cx);
+
+        // Hardware mode: the schematic follows the selected editor tab. This
+        // compares the path and sends nothing while it holds still.
+        if self.mode == AppMode::Hardware {
+            self.sync_schematic_target();
+        }
 
         // Create the terminal (and its focus handle) on first show of the strip.
-        if self.output_visible && self.bottom_view == BottomView::Terminal {
+        // Skipped while the strip slides shut: closing the last terminal starts
+        // that slide, and `output_visible` stays true until it ends, so without
+        // the guard the close would spawn a replacement shell at once.
+        if self.output_visible && !self.bottom_closing && self.bottom_view == BottomView::Terminal {
             self.ensure_terminal();
         }
         let term_handle = self
@@ -5969,6 +7664,11 @@ impl Render for JadeApp {
         // keyboard + IME input (created lazily like the terminal's).
         if self.editor_focus.is_none() {
             self.editor_focus = Some(cx.focus_handle());
+        }
+        // The board panel's focus handle (hardware mode): scopes the plain
+        // keys (1-4, q-t, space, `.`) to the board.
+        if self.mode == AppMode::Hardware && self.hw_focus.is_none() {
+            self.hw_focus = Some(cx.focus_handle());
         }
         // 530ms caret-blink driver (GUI only — headless assemble never renders).
         // Toggles the phase while the editor owns focus; caret_activity() holds
@@ -5990,6 +7690,62 @@ impl Render for JadeApp {
                     });
                     if alive.is_err() {
                         break; // window closed
+                    }
+                }
+            })
+            .detach();
+        }
+
+        // Explain-card animation ticker (GUI only). The card repaints on every
+        // streamed delta, but while it is waiting for the first token nothing
+        // arrives — so the pixel loader and the shimmer would sit frozen, which
+        // reads as a hang rather than as work in progress. ~30fps is enough for
+        // both, and both are cheap: a 3x3 grid and a handful of text runs.
+        // Exits as soon as no card is working, so an idle editor stays idle.
+        if !self.explain_ticking && self.explain_working() {
+            self.explain_ticking = true;
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(33))
+                        .await;
+                    let alive = this.update(cx, |app, cx| {
+                        if !app.explain_working() {
+                            app.explain_ticking = false;
+                            return false;
+                        }
+                        cx.notify();
+                        true
+                    });
+                    if !matches!(alive, Ok(true)) {
+                        break; // settled, or the window closed
+                    }
+                }
+            })
+            .detach();
+        }
+
+        // Visualize-card ticker, same contract as the Explain one above: it
+        // animates the loader/shimmer while a request or render is in flight,
+        // and exits the moment the card settles. Playback does NOT run
+        // through this — `ensure_video_frame` paces itself off vsync.
+        if !self.visualize_ticking && self.visualize_working() {
+            self.visualize_ticking = true;
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(33))
+                        .await;
+                    let alive = this.update(cx, |app, cx| {
+                        if !app.visualize_working() {
+                            app.visualize_ticking = false;
+                            return false;
+                        }
+                        cx.notify();
+                        true
+                    });
+                    if !matches!(alive, Ok(true)) {
+                        break;
                     }
                 }
             })
@@ -6030,6 +7786,17 @@ impl Render for JadeApp {
                 }
             })
             .detach();
+        }
+
+        // Welcome screen: keep the (empty) editor handle focused so the mode
+        // keys (1/2/s/h) bubble to the root key handler — with no focus at
+        // all, key events have no dispatch path.
+        if !self.workspace_opened {
+            if let Some(h) = &self.editor_focus {
+                if !h.is_focused(window) {
+                    h.focus(window, cx);
+                }
+            }
         }
 
         // A file was just opened: hand the editor keyboard focus (open sites have
@@ -6081,6 +7848,26 @@ impl Render for JadeApp {
             }
         }
 
+        // Preview ↔ editor view sync, editor → preview direction: when the
+        // caret row moves, scroll the preview so the caret's block is on
+        // screen. (The preview → editor direction lives in
+        // `md_preview_click`.) Guarded by `md_synced` so it fires once per
+        // caret move, not on every animation frame.
+        if self.md_panel_active() {
+            if let Some(tab) = self.editor.active_tab() {
+                let key = (tab.path.clone(), tab.caret_point().row);
+                if self.md_synced.as_ref() != Some(&key) {
+                    let blocks = crate::panels::md_view::parse_blocks(&tab.buffer.to_string());
+                    self.md_scroll.scroll_to_item(crate::panels::md_view::child_index_for_row(
+                        &blocks,
+                        key.1,
+                        self.md_edit,
+                    ));
+                    self.md_synced = Some(key);
+                }
+            }
+        }
+
         let mut root = div()
             .flex()
             .flex_col()
@@ -6088,6 +7875,7 @@ impl Render for JadeApp {
             .bg(rgb(theme.bg))
             .text_color(rgb(theme.text))
             .font_family(crate::fonts::mono_family()) // bundled JetBrains Mono, else Menlo
+            .font_features(crate::fonts::code_features()) // no `<=` ligatures
             .text_sm()
             // Global ⌘P: toggle Quick Open (§5.7). Root-level so it fires whether
             // or not a child (terminal, overlay) holds focus — key events bubble
@@ -6098,6 +7886,22 @@ impl Render for JadeApp {
                 let ks = &ev.keystroke;
                 let m = ks.modifiers;
                 match ks.key.as_str() {
+                    // Welcome screen (§B2): pick a mode from the keyboard.
+                    "1" | "s" if !app.workspace_opened && !m.platform => {
+                        app.choose_mode(AppMode::Software, cx);
+                    }
+                    "2" | "h" if !app.workspace_opened && !m.platform => {
+                        app.choose_mode(AppMode::Hardware, cx);
+                    }
+                    // Hardware mode: ⌘R runs/pauses the simulation, F6 steps.
+                    "r" if m.platform && app.mode == AppMode::Hardware => {
+                        app.hw_toggle_run();
+                        cx.notify();
+                    }
+                    "f6" if app.mode == AppMode::Hardware => {
+                        app.hw_step();
+                        cx.notify();
+                    }
                     // ⌘Q. The menu item alone does NOT give you this: gpui builds
                     // the macOS menu itself and takes each item's key equivalent
                     // from a keymap binding, so with no keymap the Quit item
@@ -6124,20 +7928,46 @@ impl Render for JadeApp {
                         app.toggle_asm(cx);
                         cx.notify();
                     }
+                    // ⌘⇧E explains the selection (§4.14). Handled here as well
+                    // as in the editor path for the same reason ⌘⇧A is: an
+                    // unfocused editor still bubbles the keystroke to the root.
+                    "e" if m.platform && m.shift => {
+                        app.explain_trigger(cx);
+                        cx.notify();
+                    }
+                    // ⌘⇧M visualizes the selection (§4.15), bound in both
+                    // paths exactly as ⌘⇧E is.
+                    "m" if m.platform && m.shift => {
+                        app.visualize_trigger(cx);
+                        cx.notify();
+                    }
+                    // ⌘⇧D toggles the Markdown preview, bound in both paths
+                    // for the same reason ⌘⇧A is.
+                    "d" if m.platform && m.shift => {
+                        app.toggle_md_preview(cx);
+                        cx.notify();
+                    }
+                    // Escape closes the diagnostic popup. Guarded, so an
+                    // Escape meant for anything else still falls through.
+                    "escape" if app.diag_popup.is_some() => {
+                        app.close_diag_popup();
+                        cx.notify();
+                    }
                     // Debug stepping (§3): F5 continue, F10 over, F11 into, ⇧F11 out.
-                    "f5" => {
+                    // Software mode only — hardware has no LLDB surface.
+                    "f5" if app.mode == AppMode::Software => {
                         app.debug_continue();
                         cx.notify();
                     }
-                    "f10" => {
+                    "f10" if app.mode == AppMode::Software => {
                         app.debug_step_over();
                         cx.notify();
                     }
-                    "f11" if m.shift => {
+                    "f11" if m.shift && app.mode == AppMode::Software => {
                         app.debug_step_out();
                         cx.notify();
                     }
-                    "f11" => {
+                    "f11" if app.mode == AppMode::Software => {
                         app.debug_step_into();
                         cx.notify();
                     }
@@ -6148,6 +7978,54 @@ impl Render for JadeApp {
             // the pointer at the root so an upward drag past the panel edge (over
             // the editor) still resizes. Dragging up grows the panel.
             .on_mouse_move(cx.listener(|app: &mut JadeApp, ev: &gpui::MouseMoveEvent, window, cx| {
+                // Visualize scrub drag: tracked at the root so the drag keeps
+                // seeking when the pointer leaves the bar (same reason the
+                // bottom-panel resize lives here).
+                if app.visualize_scrubbing {
+                    if ev.pressed_button != Some(MouseButton::Left) {
+                        app.visualize_scrubbing = false;
+                    } else {
+                        let x0 = f32::from_bits(
+                            app.visualize_scrub_bounds[0].load(Ordering::Relaxed),
+                        );
+                        let w = f32::from_bits(
+                            app.visualize_scrub_bounds[1].load(Ordering::Relaxed),
+                        );
+                        if w > 1.0 {
+                            let frac = (f32::from(ev.position.x) - x0) / w;
+                            app.visualize_seek_fraction(frac);
+                            cx.notify();
+                        }
+                        return;
+                    }
+                }
+                // Markdown-preview resize drag: left-edge handle, dragging
+                // left grows the panel (same shape as the board drawer).
+                if let Some((start_x, start_w)) = app.md_resize {
+                    if ev.pressed_button != Some(MouseButton::Left) {
+                        app.md_resize = None;
+                    } else {
+                        let dx = start_x - f32::from(ev.position.x);
+                        app.md_width = (start_w + dx).clamp(
+                            crate::panels::md_view::MIN_W,
+                            crate::panels::md_view::MAX_W,
+                        );
+                        cx.notify();
+                        return;
+                    }
+                }
+                // Board-drawer resize drag (hardware mode): left-edge handle,
+                // dragging left grows the drawer.
+                if let Some((start_x, start_w)) = app.board_resize {
+                    if ev.pressed_button != Some(MouseButton::Left) {
+                        app.board_resize = None;
+                    } else {
+                        let dx = start_x - f32::from(ev.position.x);
+                        app.board_width = (start_w + dx).clamp(340., 640.);
+                        cx.notify();
+                        return;
+                    }
+                }
                 let Some((start_y, start_h)) = app.bottom_resize else { return };
                 if ev.pressed_button != Some(MouseButton::Left) {
                     app.bottom_resize = None;
@@ -6162,6 +8040,23 @@ impl Render for JadeApp {
                 MouseButton::Left,
                 cx.listener(|app: &mut JadeApp, _ev: &gpui::MouseUpEvent, _w, cx| {
                     if app.bottom_resize.take().is_some() {
+                        cx.notify();
+                    }
+                    if app.board_resize.take().is_some() {
+                        app.schedule_ui_save(cx); // boardWidth (§B8)
+                        cx.notify();
+                    }
+                    if app.md_resize.take().is_some() {
+                        app.schedule_ui_save(cx); // markdownWidth
+                        cx.notify();
+                    }
+                    // Mouse-up anywhere releases held board buttons, so a
+                    // drag off a button cannot leave it stuck down.
+                    if app.hw.as_ref().is_some_and(|h| h.pb.iter().any(|p| *p)) {
+                        app.hw_release_all_pb();
+                        cx.notify();
+                    }
+                    if std::mem::take(&mut app.visualize_scrubbing) {
                         cx.notify();
                     }
                 }),
@@ -6182,7 +8077,16 @@ impl Render for JadeApp {
                     .p(px(6.))
                     .child(left_panel(self, cx, &theme))
                     .child(center_content(self, cx, &theme))
-                    .child(runtime_sidebar(self, cx, &theme, bench_handle)),
+                    // Right slot: a Markdown tab shows the preview (both
+                    // modes); else hardware shows the board and software the
+                    // runtime sidebar.
+                    .child(if self.md_panel_active() {
+                        crate::panels::md_view::panel(self, cx, &theme)
+                    } else if self.mode == AppMode::Hardware {
+                        crate::panels::board_view::panel(self, cx, &theme)
+                    } else {
+                        runtime_sidebar(self, cx, &theme, bench_handle)
+                    }),
             );
 
         // Debug panel docks above the terminal, hiding it while a session is
@@ -6199,7 +8103,7 @@ impl Render for JadeApp {
                 div()
                     .flex_none()
                     .overflow_hidden()
-                    .child(bottom_panel(self, cx, &theme, term_handle))
+                    .child(bottom_panel(self, cx, &theme, term_handle, f32::from(window.viewport_size().width)))
                     .with_animation(
                         ("bottom-slide", self.bottom_anim_gen),
                         Animation::new(std::time::Duration::from_millis(SIDEBAR_SLIDE_MS))
@@ -6211,13 +8115,15 @@ impl Render for JadeApp {
                     ),
             );
         }
-        let mut root = root
-            .child(memory_bar(self, &theme))
-            .child(status_strip(self, &theme));
+        // The memory bar is a C++ telemetry surface — software mode only.
+        if self.mode == AppMode::Software {
+            root = root.child(memory_bar(self, &theme));
+        }
+        let mut root = root.child(status_strip(self, &theme));
 
         // §7.2 open/close hook: while visible, overlay the full-window 3D grid
         // on top of everything and hand it keyboard focus (for Esc).
-        if self.wg3d.visible {
+        if self.wg3d.visible && self.mode == AppMode::Software {
             let focus = crate::wg3d::render::ensure_focus(self, cx);
             // Don't steal focus back from the toolbar's dim editor (below).
             if !focus.is_focused(window) && self.dim_edit.is_none() {
@@ -6269,10 +8175,23 @@ impl Render for JadeApp {
             root = root.child(ai_menu(self, cx, &theme));
         }
 
+        // Diagnostic popup: the error / warning / note list for the active tab,
+        // hanging under the action-bar pill that opened it.
+        if let Some(kind) = self.diag_popup {
+            root = root.child(diag_popup_panel(self, kind, cx, &theme));
+        }
+
         // Build toasts: a bottom-right stack floating over everything. Each
         // self-expires (the sweeper above), fading out over its last ~600ms.
         if !self.toasts.is_empty() {
             root = root.child(toast_overlay(self, &theme));
+        }
+        if let Some(t0) = trace_started {
+            let us = t0.elapsed().as_micros();
+            // Element build only — layout and paint land after this returns —
+            // but it is the part this entity controls, and the part a video
+            // pump multiplies.
+            eprintln!("[jade] render build {us}us");
         }
         root
     }
@@ -6347,7 +8266,149 @@ fn project_tabs(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> gpui
         .into_any_element()
 }
 
-fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl IntoElement {
+fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> gpui::AnyElement {
+    if app.mode == AppMode::Hardware {
+        return hardware_action_bar(app, cx, theme);
+    }
+    software_action_bar(app, cx, theme)
+}
+
+/// The action-bar frame both modes share: elevated strip, hairline under it,
+/// traffic-light clearance, window-drag region.
+fn action_bar_frame(theme: &Theme) -> gpui::Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .h(px(44.))
+        .pl(px(80.)) // clear the traffic lights (hiddenInset title bar)
+        .pr(scale::SPACE_3)
+        .bg(theme.kumo.elevated)
+        .border_b_1()
+        .border_color(theme.kumo.hairline)
+        .window_control_area(WindowControlArea::Drag)
+}
+
+/// The always-visible diagnostic pills, shared by both mode bars.
+fn diag_badges_row(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> gpui::Div {
+    let (errs, warns, infos) = app.active_diag_counts();
+    let open = app.diag_popup;
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .text_xs()
+        .child(diag_pill(
+            "pill-err", "circle-x", errs, BadgeVariant::Error, DiagKind::Error,
+            open == Some(DiagKind::Error), theme, cx,
+        ))
+        .child(diag_pill(
+            "pill-warn", "triangle-alert", warns, BadgeVariant::Warning, DiagKind::Warning,
+            open == Some(DiagKind::Warning), theme, cx,
+        ))
+        .child(diag_pill(
+            "pill-info", "info", infos, BadgeVariant::Secondary, DiagKind::Info,
+            open == Some(DiagKind::Info), theme, cx,
+        ))
+        // Record the row's bottom-left in window px so the popup hangs under
+        // the pills wherever the action bar puts them.
+        .child(anchor_canvas(app.diag_anchor.clone()))
+}
+
+/// The hardware-mode action bar (§B6): board/terminal/files toggles + the
+/// diagnostic pills on the left; the simulation transport (Run/Pause, Step,
+/// slow motion), "Flash board", theme, and open-folder on the right.
+fn hardware_action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> gpui::AnyElement {
+    let hw = app.hw.as_ref();
+    let running = hw.map(|h| h.run_state == jade_hw::HwRunState::Running).unwrap_or(false);
+    let compiling = hw.map(|h| h.compiling).unwrap_or(false);
+    let flashing = hw.map(|h| h.flashing).unwrap_or(false);
+    let slow_mo = hw.map(|h| h.slow_mo).unwrap_or(false);
+
+    let terminal_active = app.output_visible && app.bottom_view == BottomView::Terminal;
+    let toggles = div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .child(icon_btn("tgl-files", "panel-left", theme, !app.sidebar_collapsed, cx, |a, _| {
+            a.toggle_sidebar()
+        }))
+        .child(icon_btn("tgl-terminal", "terminal", theme, terminal_active, cx, |a, cx| {
+            if a.output_visible && a.bottom_view == BottomView::Terminal {
+                a.action_toggle_output(cx);
+            } else {
+                a.set_bottom_view(BottomView::Terminal);
+            }
+            a.schedule_ui_save(cx);
+        }))
+        .child(icon_btn("tgl-board", "cpu", theme, app.board_visible, cx, |a, _| {
+            a.board_visible = !a.board_visible;
+        }));
+
+    let run_label = if running { "Pause" } else { "Run" }.to_string();
+    let right_group = div()
+        .flex()
+        .items_center()
+        .gap(scale::SPACE_2)
+        .child(pill_btn(
+            "hw-run",
+            if running { "pause" } else { "play" },
+            run_label,
+            ButtonVariant::Primary,
+            theme,
+            false,
+            cx,
+            |a, _| a.hw_toggle_run(),
+        ))
+        // Step is meaningful only while paused.
+        .child(flat_btn("hw-step", "skip-forward", "Step", theme.muted, theme, false, running, cx, |a, _| {
+            a.hw_step()
+        }))
+        .child(flat_btn("hw-slowmo", "timer", "Slow", theme.muted, theme, slow_mo, false, cx, |a, _| {
+            a.hw_toggle_slowmo()
+        }))
+        .child(pill_btn(
+            "hw-flash",
+            "zap",
+            if flashing { "Flashing…" } else { "Flash board" }.to_string(),
+            ButtonVariant::Secondary,
+            theme,
+            compiling || flashing,
+            cx,
+            |a, _| a.hw_flash(),
+        ))
+        .child(icon_btn(
+            "btn-theme",
+            if theme.is_light { "sun" } else { "moon" },
+            theme,
+            false,
+            cx,
+            |a, _| a.action_theme(),
+        ))
+        .child(icon_btn("btn-open-folder", "folder-open", theme, false, cx, |a, cx| {
+            a.prompt_open_project(cx)
+        }));
+
+    action_bar_frame(theme)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(scale::SPACE_3)
+                .child(toggles)
+                .child(separator_v(&theme.kumo, 16.))
+                .child(diag_badges_row(app, cx, theme)),
+        )
+        .child(right_group)
+        .into_any_element()
+}
+
+fn software_action_bar(
+    app: &JadeApp,
+    cx: &mut Context<JadeApp>,
+    theme: &Theme,
+) -> gpui::AnyElement {
     let can_run = app.can_run();
     let build_label = if app.building { "Building…" } else { "Build" }.to_string();
     let run_label = if app.running { "Running…" } else { "Run" }.to_string();
@@ -6376,18 +8437,15 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
         }))
         .child(icon_btn("tgl-runtime", "gauge", theme, app.runtime_visible, cx, |a, cx| {
             a.action_toggle_runtime(cx)
+        }))
+        .child(icon_btn("tgl-md", "file-text", theme, app.md_visible, cx, |a, cx| {
+            a.toggle_md_preview(cx) // markdownVisible
         }));
 
     // Diagnostic pills (always visible, zero included — screenshot center-left).
-    let (errs, warns, infos) = app.active_diag_counts();
-    let diag_badges = div()
-        .flex()
-        .items_center()
-        .gap_2()
-        .text_xs()
-        .child(diag_pill("circle-x", errs, BadgeVariant::Error, theme))
-        .child(diag_pill("triangle-alert", warns, BadgeVariant::Warning, theme))
-        .child(diag_pill("info", infos, BadgeVariant::Secondary, theme));
+    // Each one opens the popup listing that severity, and every row in it jumps
+    // the editor to its line (see `diag_popup_panel`).
+    let diag_badges = diag_badges_row(app, cx, theme);
 
     let right_group = div()
         .flex()
@@ -6458,20 +8516,7 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
 
     // The bar rides on the elevated layer with a single Kumo hairline under it
     // and no other chrome, so the controls are the only marks on the strip.
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .justify_between()
-        .h(px(44.))
-        .pl(px(80.)) // clear the traffic lights (hiddenInset title bar)
-        .pr(scale::SPACE_3)
-        .bg(theme.kumo.elevated)
-        .border_b_1()
-        .border_color(theme.kumo.hairline)
-        // Window-drag region: empty parts of the bar drag the window; the
-        // buttons' own click hitboxes take priority (`no-drag` equivalent).
-        .window_control_area(WindowControlArea::Drag)
+    action_bar_frame(theme)
         .child(
             div()
                 .flex()
@@ -6485,6 +8530,7 @@ fn action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl I
                 .child(diag_badges),
         )
         .child(right_group)
+        .into_any_element()
 }
 
 /// Build-result **toast stack**: a bottom-right column of self-expiring cards
@@ -6787,7 +8833,8 @@ fn flat_btn(
         .icon(icon)
         .ink(ink)
         .disabled(disabled)
-        .render(&theme.kumo);
+        .render(&theme.kumo)
+        .debug_selector(|| id.to_string());
     if disabled {
         el
     } else {
@@ -6817,7 +8864,8 @@ fn pill_btn(
         .size(KumoSize::Sm)
         .icon(icon)
         .disabled(busy)
-        .render(&theme.kumo);
+        .render(&theme.kumo)
+        .debug_selector(|| id.to_string());
     if busy {
         el
     } else {
@@ -6830,13 +8878,56 @@ fn pill_btn(
 
 /// One always-visible diagnostic count — a Kumo Badge on the matching status
 /// tint. The counts show even at zero, so the bar does not reflow as
-/// diagnostics arrive.
-fn diag_pill(icon: &'static str, count: usize, variant: BadgeVariant, theme: &Theme) -> impl IntoElement {
-    Badge::new(format!("{count}"))
-        .variant(variant)
-        .icon(icon)
-        .tabular(true)
-        .render(&theme.kumo)
+/// diagnostics arrive. Clicking one opens [`diag_popup_panel`] for that
+/// severity; the open pill keeps a ring so you can see which list you are in.
+#[allow(clippy::too_many_arguments)]
+fn diag_pill(
+    id: &'static str,
+    icon: &'static str,
+    count: usize,
+    variant: BadgeVariant,
+    kind: DiagKind,
+    open: bool,
+    theme: &Theme,
+    cx: &mut Context<JadeApp>,
+) -> impl IntoElement {
+    let mut el = div()
+        .id(id)
+        .debug_selector(|| id.to_string())
+        .cursor_pointer()
+        .rounded(scale::RADIUS_MD)
+        .child(
+            Badge::new(format!("{count}"))
+                .variant(variant)
+                .icon(icon)
+                .tabular(true)
+                .render(&theme.kumo),
+        )
+        .on_click(cx.listener(move |a: &mut JadeApp, _ev, _w, cx| {
+            cx.stop_propagation();
+            a.set_diag_popup(kind, open);
+            cx.notify();
+        }));
+    if open {
+        el = el.border_1().border_color(theme.kumo.focus);
+    }
+    el
+}
+
+/// A zero-size underlay that records its own bounds origin in window px
+/// (`x.to_bits()<<32 | y.to_bits()`), for overlays that must hang off an element
+/// the layout places. Same packing as `term_origin`.
+fn anchor_canvas(slot: Arc<std::sync::atomic::AtomicU64>) -> impl IntoElement {
+    gpui::canvas(
+        move |_, _, _| {},
+        move |bounds: gpui::Bounds<Pixels>, _, _window, _| {
+            let x = f32::from(bounds.origin.x).to_bits() as u64;
+            let y = f32::from(bounds.origin.y + bounds.size.height).to_bits() as u64;
+            slot.store((x << 32) | y, std::sync::atomic::Ordering::Relaxed);
+        },
+    )
+    .w_0()
+    .h_full()
 }
 
 /// Left panel: the file-tree card (deliverable §2, floating-card look §2). When
@@ -6901,13 +8992,19 @@ fn left_panel_inner(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> 
     }
 
     // FILES | STRUCTURE tab switcher over the tree or the symbol outline (§5.5).
-    let body = match app.sidebar_tab {
-        SidebarTab::Files => file_tree::render(app, cx).into_any_element(),
-        SidebarTab::Structure => structure_panel::render(app, cx).into_any_element(),
+    // Hardware mode forces the Files tree — the structure outline is a C++
+    // surface, so the switcher does not render at all.
+    let body = if app.mode == AppMode::Hardware {
+        file_tree::render(app, cx).into_any_element()
+    } else {
+        match app.sidebar_tab {
+            SidebarTab::Files => file_tree::render(app, cx).into_any_element(),
+            SidebarTab::Structure => structure_panel::render(app, cx).into_any_element(),
+        }
     };
     // A Kumo Card on the elevated layer — the same shell every floating region
     // in the window now wears.
-    Card::new(&theme.kumo)
+    let mut card = Card::new(&theme.kumo)
         .flex()
         .flex_col()
         .flex_none()
@@ -6915,9 +9012,11 @@ fn left_panel_inner(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> 
         .w(px(260.))
         .h_full()
         .p(scale::SPACE_2_5)
-        .bg(theme.kumo.elevated)
-        .child(structure_panel::tab_switcher(app, cx, theme))
-        .child(
+        .bg(theme.kumo.elevated);
+    if app.mode == AppMode::Software {
+        card = card.child(structure_panel::tab_switcher(app, cx, theme));
+    }
+    card.child(
             // The tree/outline scrolls inside the card (min_h(0) so the flex
             // child can shrink instead of growing the card past the row).
             div()
@@ -6945,24 +9044,30 @@ fn center_content(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> im
 
     // No workspace: the card hosts the welcome overlay instead of the editor.
     if !app.workspace_opened {
-        return base.child(welcome_overlay(cx, theme));
+        return base.child(welcome_overlay(app, cx, theme));
     }
 
     let mut center = base
         .child(code_view::tab_strip(app, cx, theme))
         .child(code_view::render(app, cx));
     // §6 ASM viewer: right-half overlay over the editor when toggled on.
-    if app.asm_visible {
+    // Software mode only — there is no clang ASM for Verilog.
+    if app.asm_visible && app.mode == AppMode::Software {
         center = center.child(asm_view::overlay(app, cx));
     }
     center
 }
 
-/// Welcome overlay shown when no workspace is open (inventory §2, `app.ts:54-81`):
-/// centered "Jade" title, "Open a folder to get started", an Open Folder button
-/// (outline + folder-open icon), and a shortcut-hint row. Mirrors the Electron
-/// `#welcome-overlay` styling in GPUI theme colors.
-fn welcome_overlay(cx: &mut Context<JadeApp>, theme: &Theme) -> impl IntoElement {
+/// Welcome overlay shown when no workspace is open (inventory §2, rewritten
+/// for hardware mode §B2): centered "Jade" title over two mode cards —
+/// Software (the C++ IDE) and Hardware (Verilog + the live board). Each card
+/// carries its own primary "Open Folder" button; keys 1/s and 2/h pick a mode
+/// from the keyboard (see the root `on_key_down`).
+fn welcome_overlay(
+    app: &JadeApp,
+    cx: &mut Context<JadeApp>,
+    theme: &Theme,
+) -> gpui::AnyElement {
     let t = &theme.kumo;
     let hint = |s: &str| {
         KumoText::new(s.to_string())
@@ -6970,40 +9075,96 @@ fn welcome_overlay(cx: &mut Context<JadeApp>, theme: &Theme) -> impl IntoElement
             .size(KumoSize::Xs)
             .render(t)
     };
-    div()
-        .flex_1()
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(
-            div()
+    let mode_card = |id: &'static str,
+                     btn_id: &'static str,
+                     icon: &'static str,
+                     title: &'static str,
+                     blurb: &'static str,
+                     key_hint: &'static str,
+                     mode: AppMode,
+                     cx: &mut Context<JadeApp>| {
+        Card::new(t)
+            .id(id)
+            .flex()
+            .flex_col()
+            .items_start()
+            .gap(scale::SPACE_3)
+            .w(px(280.))
+            .p(scale::SPACE_4)
+            .bg(t.elevated)
+            .cursor_pointer()
+            .hover(|s| s.bg(t.tint))
+            .on_click(cx.listener(move |a: &mut JadeApp, _ev, _win, cx| {
+                a.choose_mode(mode, cx);
+            }))
+            .child(kumo::icon(icon, 22., t.brand))
+            .child(Heading::new(HeadingLevel::Two, title).render(t))
+            .child(
+                KumoText::new(blurb.to_string())
+                    .tone(TextTone::Secondary)
+                    .size(KumoSize::Sm)
+                    .render(t),
+            )
+            .child(
+                div().mt(scale::SPACE_2).child(
+                    Button::new(btn_id, "Open Folder")
+                        .variant(ButtonVariant::Primary)
+                        .size(KumoSize::Base)
+                        .icon("folder-open")
+                        .render(t)
+                        .on_click(cx.listener(move |a: &mut JadeApp, _ev, _win, cx| {
+                            cx.stop_propagation();
+                            a.choose_mode(mode, cx);
+                        })),
+                ),
+            )
+            .child(
+                KumoText::new(key_hint.to_string())
+                    .tone(TextTone::Secondary)
+                    .size(KumoSize::Xs)
+                    .render(t),
+            )
+    };
+    let inner = div()
                 .flex()
                 .flex_col()
                 .items_center()
                 // welcome-title — Kumo `heading1` (`text-3xl font-semibold`).
                 .child(Heading::new(HeadingLevel::One, "Jade").render(t))
-                // welcome-subtitle
                 .child(
                     div().mt(scale::SPACE_2).child(
-                        KumoText::new("Open a folder to get started")
+                        KumoText::new("Pick a side, then open a folder")
                             .tone(TextTone::Secondary)
                             .size(KumoSize::Base)
                             .render(t),
                     ),
                 )
-                // The one primary action on the screen, so it takes the brand
-                // fill — Kumo `variant="primary" size="lg"`.
                 .child(
-                    div().mt(scale::SPACE_6).child(
-                        Button::new("open-folder-btn", "Open Folder")
-                            .variant(ButtonVariant::Primary)
-                            .size(KumoSize::Lg)
-                            .icon("folder-open")
-                            .render(t)
-                            .on_click(cx.listener(|a: &mut JadeApp, _ev, _win, cx| {
-                                a.prompt_open_project(cx);
-                            })),
-                    ),
+                    div()
+                        .mt(scale::SPACE_6)
+                        .flex()
+                        .flex_row()
+                        .gap(scale::SPACE_4)
+                        .child(mode_card(
+                            "welcome-software",
+                            "open-folder-btn",
+                            "code",
+                            "Software",
+                            "C++ and Metal with live telemetry, memory, and GPU training views.",
+                            "Press 1 or S",
+                            AppMode::Software,
+                            cx,
+                        ))
+                        .child(mode_card(
+                            "welcome-hardware",
+                            "open-folder-hw-btn",
+                            "cpu",
+                            "Hardware",
+                            "Verilog for the MAX 10 board with a live 1:1 simulation on every save.",
+                            "Press 2 or H",
+                            AppMode::Hardware,
+                            cx,
+                        )),
                 )
                 // welcome-shortcuts hint row.
                 .child(
@@ -7013,10 +9174,16 @@ fn welcome_overlay(cx: &mut Context<JadeApp>, theme: &Theme) -> impl IntoElement
                         .gap(px(20.))
                         .child(hint("⌘B File tree"))
                         .child(hint("⌘` Terminal"))
-                        .child(hint("⌘E Flow arrows"))
+                        .child(hint("⌘O Open folder"))
                         .child(hint("⌘S Save")),
-                ),
-        )
+                );
+    let frame = div().flex_1().flex().items_center().justify_center();
+    // Keep keyboard dispatch alive on the welcome screen: the mode keys
+    // (1/2/s/h) need a focused node in the tree to bubble from.
+    match app.editor_focus.clone() {
+        Some(h) => frame.track_focus(&h).child(inner).into_any_element(),
+        None => frame.child(inner).into_any_element(),
+    }
 }
 
 /// Sidebar slide duration (open and close).
@@ -7039,6 +9206,7 @@ fn runtime_sidebar(
     }
     let card = Card::new(&theme.kumo)
         .id("runtime-sidebar")
+        .debug_selector(|| "runtime-sidebar".into())
         .flex()
         .flex_none()
         .flex_col()
@@ -7071,8 +9239,8 @@ fn runtime_sidebar(
         .into_any_element()
 }
 
-/// Bottom panel (§5.2): a header (view toggle · new-terminal · minimize) over the
-/// live TERMINAL grid or the OUTPUT scrollback fallback. `[jade]`/build/run
+/// Bottom panel (§5.2): a header (view toggle · terminal tabs · new-terminal ·
+/// minimize) over the live TERMINAL grid or the OUTPUT scrollback fallback. `[jade]`/build/run
 /// status lines land in OUTPUT (the terminal is a real shell we can't inject
 /// display text into — see `terminal_panel`).
 fn bottom_panel(
@@ -7080,10 +9248,18 @@ fn bottom_panel(
     cx: &mut Context<JadeApp>,
     theme: &Theme,
     term_handle: FocusHandle,
+    viewport_w: f32,
 ) -> impl IntoElement {
-    let is_term = app.bottom_view == BottomView::Terminal;
+    // The schematic view exists only in hardware mode; fall back to OUTPUT
+    // if the mode switched away while it was active.
+    let view = if app.mode != AppMode::Hardware && app.bottom_view == BottomView::Schematic {
+        BottomView::Output
+    } else {
+        app.bottom_view
+    };
+    let is_term = view == BottomView::Terminal;
 
-    // View-toggle tabs: TERMINAL | OUTPUT. A Kumo segmented Tabs at `size="sm"`
+    // View-toggle tabs: TERMINAL | OUTPUT (| SCHEMATIC in hardware mode). A Kumo segmented Tabs at `size="sm"`
     // — a raised pill riding in a recessed trough.
     let bar = TabBar::new(TabsAppearance::Segmented).size(KumoSize::Sm);
     let view_tab = |id: &'static str, label: &'static str, active: bool, view: BottomView| {
@@ -7094,6 +9270,77 @@ fn bottom_panel(
             }),
         )
     };
+
+    // The terminal bar: one colored segment per open shell, filling the header
+    // between the view toggle and the buttons. The segments split the width
+    // evenly, so opening or closing a terminal re-divides the bar. Click a
+    // segment to show that terminal, middle-click to close it.
+    //
+    // Color carries the whole thing — there are no labels. The active segment
+    // shows its hue at full strength; a background one is washed most of the
+    // way into the header, and comes back up when its shell writes.
+    let term_bar = (is_term && !app.terms.is_empty()).then(|| {
+        // The surface the segments sit on, which a background segment washes
+        // into (the header card paints `kumo.base`; `panel` is its u32 twin).
+        let track = theme.panel;
+        let mut bar = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .flex_1()
+            .h_full()
+            .mx(scale::SPACE_3)
+            .gap(px(2.));
+        for (i, session) in app.terms.iter().enumerate() {
+            let id = session.id;
+            let hue = theme.series[session.color % theme.series.len()];
+            // A dead shell drops its hue and greys out; the tab stays until the
+            // user closes it (`terminal_panel::TermSession`).
+            let fill = if session.exited {
+                terminal_panel::blend(track, theme.muted, 0.55)
+            } else if i == app.term_index {
+                hue
+            } else {
+                terminal_panel::blend(track, hue, if session.activity { 0.7 } else { 0.3 })
+            };
+            let group = gpui::SharedString::from(format!("term-seg-{i}"));
+            bar = bar.child(
+                div()
+                    .id(("term-seg", i))
+                    .group(group.clone())
+                    .flex()
+                    .flex_1()
+                    .h_full()
+                    .items_center()
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |a: &mut JadeApp, _ev, _w, cx| {
+                        a.select_terminal(id);
+                        cx.notify();
+                    }))
+                    // Middle-click closes, the way it closes a browser tab. The
+                    // bar has no room for a × at this size.
+                    .on_mouse_down(
+                        MouseButton::Middle,
+                        cx.listener(move |a: &mut JadeApp, _ev, _w, cx| {
+                            a.action_close_terminal(id, cx);
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .h(px(3.))
+                            .rounded_full()
+                            .bg(rgb(fill))
+                            // Hovering anywhere in the segment's hit area lights
+                            // its own 3px line, so the whole strip reads as
+                            // clickable without any chrome.
+                            .group_hover(group, move |st| st.bg(rgb(hue))),
+                    ),
+            );
+        }
+        bar
+    });
 
     let header = div()
         .flex()
@@ -7111,14 +9358,28 @@ fn bottom_panel(
                 .items_center()
                 .gap(scale::SPACE_2)
                 .child(kumo::icon("terminal", 13., theme.kumo.text_subtle))
-                .child(
-                    TabBar::new(TabsAppearance::Segmented)
+                .child({
+                    let mut tabs = TabBar::new(TabsAppearance::Segmented)
                         .size(KumoSize::Sm)
                         .push(view_tab("bv-terminal", "Terminal", is_term, BottomView::Terminal))
-                        .push(view_tab("bv-output", "Output", !is_term, BottomView::Output))
-                        .render(&theme.kumo),
-                ),
+                        .push(view_tab(
+                            "bv-output",
+                            "Output",
+                            view == BottomView::Output,
+                            BottomView::Output,
+                        ));
+                    if app.mode == AppMode::Hardware {
+                        tabs = tabs.push(view_tab(
+                            "bv-schematic",
+                            "Schematic",
+                            view == BottomView::Schematic,
+                            BottomView::Schematic,
+                        ));
+                    }
+                    tabs.render(&theme.kumo)
+                }),
         )
+        .children(term_bar)
         .child(
             div()
                 .flex()
@@ -7141,15 +9402,23 @@ fn bottom_panel(
                 )),
         );
 
-    let body = if is_term {
-        div()
+    let body = match view {
+        BottomView::Terminal => div()
             .flex()
             .flex_1()
             .w_full()
             .child(terminal_panel::render(app, term_handle, cx))
-            .into_any_element()
-    } else {
-        output_view(app, theme, cx).into_any_element()
+            .into_any_element(),
+        BottomView::Output => output_view(app, theme, cx).into_any_element(),
+        BottomView::Schematic => crate::panels::schematic_view::render(
+            app,
+            theme,
+            cx,
+            // The card fills the window minus the 6px gutters and its border;
+            // the header row takes 34px of the strip.
+            viewport_w - 14.0,
+            app.bottom_height - 36.0,
+        ),
     };
 
     // Thin top-edge grab handle: mouse-down anchors the resize drag (the root's
@@ -7253,6 +9522,167 @@ fn output_view(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> impl 
             });
         }))
         .child(list)
+}
+
+/// The diagnostic popup: the active tab's diagnostics of one severity, one row
+/// each, hanging under the pill that opened it. A row shows `line:col` and the
+/// message; clicking it puts the caret on the diagnostic and centers its line.
+///
+/// Anchored the same way the AI menu is — a full-window backdrop that closes on
+/// click, with the panel positioned over it — but at the x the pill row's canvas
+/// recorded, so it tracks the action bar instead of a hardcoded corner.
+fn diag_popup_panel(
+    app: &JadeApp,
+    kind: DiagKind,
+    cx: &mut Context<JadeApp>,
+    theme: &Theme,
+) -> gpui::AnyElement {
+    let packed = app.diag_anchor.load(std::sync::atomic::Ordering::Relaxed);
+    let (ax, ay) = (
+        f32::from_bits((packed >> 32) as u32),
+        f32::from_bits(packed as u32),
+    );
+    let indexes = app.diag_list(kind);
+    let tint = match kind {
+        DiagKind::Error => theme.red,
+        DiagKind::Warning => theme.amber,
+        DiagKind::Info => theme.periwinkle,
+    };
+
+    let mut list = div().flex().flex_col().gap(px(1.));
+    if app.editor.active_tab().is_none() {
+        list = list.child(
+            div()
+                .text_color(rgb(theme.muted))
+                .child("No file open — open one from the tree."),
+        );
+    } else if indexes.is_empty() {
+        list = list.child(
+            div()
+                .text_color(rgb(theme.muted))
+                .child(match kind {
+                    DiagKind::Error => "No errors in this file.",
+                    DiagKind::Warning => "No warnings in this file.",
+                    DiagKind::Info => "No notes in this file.",
+                }),
+        );
+    }
+    let diagnostics = app
+        .editor
+        .active_tab()
+        .map(|t| t.diagnostics.as_slice())
+        .unwrap_or(&[]);
+    let hover_bg = theme.border;
+    for (row, &i) in indexes.iter().enumerate() {
+        let d = &diagnostics[i];
+        let start = d.range.start;
+        // clangd counts from 0; the gutter the user reads counts from 1.
+        let place = format!("{}:{}", start.line + 1, start.character + 1);
+        // A clangd message can run to several lines; the row shows the first.
+        let message = d.message.lines().next().unwrap_or("").to_string();
+        let (line, character) = (start.line, start.character);
+        list = list.child(
+            div()
+                .id(("diag-row", row))
+                .debug_selector(move || format!("diag-row-{row}"))
+                .flex()
+                .flex_row()
+                .items_start()
+                .gap(scale::SPACE_2)
+                .px(scale::SPACE_1_5)
+                .py(px(3.))
+                .rounded(scale::RADIUS_SM)
+                .cursor_pointer()
+                .hover(move |st| st.bg(rgb(hover_bg)))
+                .on_click(cx.listener(move |a: &mut JadeApp, _ev, _w, cx| {
+                    cx.stop_propagation();
+                    a.goto_diagnostic(line, character);
+                    a.close_diag_popup();
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(52.))
+                        .text_color(rgb(tint))
+                        .child(place),
+                )
+                .child(div().flex_1().text_color(rgb(theme.text)).child(message)),
+        );
+    }
+
+    let panel = div()
+        .id("diag-popup")
+        .absolute()
+        .left(px(ax))
+        .top(px(ay + 6.))
+        .w(px(460.))
+        .max_h(px(320.))
+        .overflow_y_scroll()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .p_2()
+        .bg(rgb(theme.panel))
+        .border_1()
+        .border_color(rgb(theme.border))
+        .rounded_lg()
+        .shadow(card_shadow())
+        .text_xs()
+        // Swallow inside-clicks so a row does not also hit the backdrop.
+        .on_click(cx.listener(|_a: &mut JadeApp, _e, _w, cx| cx.stop_propagation()))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_color(rgb(tint))
+                        .child(kind.heading(indexes.len())),
+                )
+                .child(
+                    div()
+                        .text_color(rgb(theme.muted))
+                        .child("click a line to jump"),
+                ),
+        )
+        .child(list);
+
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+        .child(
+            div()
+                .id("diag-popup-backdrop")
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .on_click(cx.listener(|a: &mut JadeApp, _e, _w, cx| {
+                    a.close_diag_popup();
+                    cx.notify();
+                })),
+        )
+        .child(panel)
+        .into_any_element()
+}
+
+/// The indexes of the diagnostics matching `kind`, ordered by where they are in
+/// the file. clangd publishes in its own order, and the popup rows double as a
+/// jump list, so reading top to bottom must walk the file top to bottom.
+fn diag_indexes(diagnostics: &[Diagnostic], kind: DiagKind) -> Vec<usize> {
+    let mut out: Vec<usize> = (0..diagnostics.len())
+        .filter(|&i| kind.matches(diagnostics[i].severity))
+        .collect();
+    out.sort_by_key(|&i| {
+        let start = diagnostics[i].range.start;
+        (start.line, start.character)
+    });
+    out
 }
 
 /// Parse a `/abs/path:line:col:` diagnostic prefix from an output line (as
@@ -7417,6 +9847,42 @@ mod discovery_watchdog_tests {
 mod output_jump_tests {
     use super::parse_jump_target;
     use std::path::PathBuf;
+
+    #[test]
+    fn diag_list_filters_by_severity_and_reads_top_down() {
+        use super::{diag_indexes, DiagKind};
+        use jade_lsp::{Diagnostic, DiagnosticSeverity, Position, Range};
+        let mk = |sev, line, ch| Diagnostic {
+            severity: Some(sev),
+            range: Range::new(Position::new(line, ch), Position::new(line, ch + 1)),
+            ..Default::default()
+        };
+        // clangd publishes in its own order — here, bottom of the file first.
+        let ds = vec![
+            mk(DiagnosticSeverity::ERROR, 40, 2),
+            mk(DiagnosticSeverity::WARNING, 7, 0),
+            mk(DiagnosticSeverity::ERROR, 12, 9),
+            mk(DiagnosticSeverity::HINT, 3, 0),
+            mk(DiagnosticSeverity::ERROR, 12, 4),
+            mk(DiagnosticSeverity::INFORMATION, 30, 1),
+        ];
+        // Errors only, and read top-down; two on one line order by column.
+        assert_eq!(diag_indexes(&ds, DiagKind::Error), vec![4, 2, 0]);
+        assert_eq!(diag_indexes(&ds, DiagKind::Warning), vec![1]);
+        // Info folds in hints, the way the pill counts them.
+        assert_eq!(diag_indexes(&ds, DiagKind::Info), vec![3, 5]);
+        // A severity with nothing to show gives an empty list, not a panic.
+        assert!(diag_indexes(&[], DiagKind::Error).is_empty());
+    }
+
+    #[test]
+    fn diag_headings_read_naturally() {
+        use super::DiagKind;
+        assert_eq!(DiagKind::Error.heading(1), "1 error");
+        assert_eq!(DiagKind::Error.heading(3), "3 errors");
+        assert_eq!(DiagKind::Warning.heading(0), "0 warnings");
+        assert_eq!(DiagKind::Info.heading(1), "1 note");
+    }
 
     #[test]
     fn parses_clang_diagnostic_prefix() {

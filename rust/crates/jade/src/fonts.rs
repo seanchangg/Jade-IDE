@@ -36,6 +36,13 @@ pub fn mono_family() -> &'static str {
     }
 }
 
+/// Font features for every window root: `calt` off, so JetBrains Mono never
+/// merges `<=`, `->`, or `!=` into one ligature glyph. Code must show the
+/// characters the file holds.
+pub fn code_features() -> gpui::FontFeatures {
+    gpui::FontFeatures::disable_ligatures()
+}
+
 /// Load every `*.ttf`/`*.otf` shipped in the app bundle's `Resources/fonts/` dir
 /// and hand them to GPUI's text system. Call once, before the first window opens.
 /// Outside a bundle (dev builds) or with an empty fonts dir this is a no-op and

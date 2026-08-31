@@ -72,6 +72,9 @@ fn test_deps(workspace: PathBuf) -> (AppDeps, tokio::sync::mpsc::UnboundedReceiv
         server,
         engine,
         ai: Arc::new(InlineCompletionBackend::new()),
+        // No credential is resolved until a request is made, so a headless app
+        // can hold a chat backend without touching the keychain or the network.
+        chat: Arc::new(jade_ai::ChatBackend::new()),
         sysmon: Arc::new(SystemMonitor::new()), // constructed, not started
         term: Arc::new(TermManager::new()),
         runtime: runtime.handle().clone(),
@@ -87,8 +90,50 @@ fn test_deps(workspace: PathBuf) -> (AppDeps, tokio::sync::mpsc::UnboundedReceiv
         workspace_opened: true,
         fs_watch: Arc::new(|_root| None),
         demo: false,
+        mode: crate::app::AppMode::Software,
+        hw_tx: None,
+        hw_watch: Arc::new(|_root| None),
     };
     (deps, app_rx)
+}
+
+/// Same as [`test_deps`], but hardware mode with a test command channel: the
+/// app sends [`jade_hw::HwCommand`]s there instead of spawning an engine.
+fn test_deps_hw(
+    workspace: PathBuf,
+) -> (
+    AppDeps,
+    tokio::sync::mpsc::UnboundedReceiver<crate::app::AppEvent>,
+    tokio::sync::mpsc::UnboundedReceiver<jade_hw::HwCommand>,
+) {
+    let (mut deps, app_rx) = test_deps(workspace);
+    let (hw_tx, hw_rx) = tokio::sync::mpsc::unbounded_channel();
+    deps.mode = crate::app::AppMode::Hardware;
+    deps.hw_tx = Some(hw_tx);
+    (deps, app_rx, hw_rx)
+}
+
+/// A throwaway hardware workspace: one Verilog blink plus its `.qsf`.
+fn test_hw_workspace() -> (PathBuf, PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+        "jade-hwtest-{}-{}",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("t").replace("::", "-")
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("blink.v");
+    std::fs::write(
+        &file,
+        "module blink (\n    input  wire clk,\n    output wire [4:0] led\n);\n    reg [25:0] count = 0;\n    always @(posedge clk) count <= count + 1;\n    assign led = ~count[25:21];\nendmodule\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("blink.qsf"),
+        "set_global_assignment -name TOP_LEVEL_ENTITY blink\nset_global_assignment -name VERILOG_FILE blink.v\nset_location_assignment PIN_M9 -to clk\nset_location_assignment PIN_T20 -to led[0]\n",
+    )
+    .unwrap();
+    (dir, file)
 }
 
 #[gpui::test]
@@ -157,6 +202,87 @@ async fn click_focuses_sets_caret_and_arrows_navigate(cx: &mut TestAppContext) {
     app.update_in(cx, |app, _w, _cx| {
         let caret = app.editor.active_tab().unwrap().caret_point();
         assert_eq!((caret.row, caret.col), (2, 4), "caret after left left");
+    });
+}
+
+/// The action-bar diagnostic pills (§ error/warning/note counts): clicking one
+/// opens the list for that severity, and clicking a row jumps the editor to the
+/// line the diagnostic flags. This is the whole point of the pills — before
+/// this, a click did nothing at all.
+#[gpui::test]
+async fn diagnostic_pill_opens_a_list_and_a_row_jumps_to_the_line(cx: &mut TestAppContext) {
+    use crate::app::DiagKind;
+    use jade_lsp::{Diagnostic, DiagnosticSeverity, Position, Range};
+
+    let (dir, file) = test_workspace();
+    let (deps, app_rx) = test_deps(dir);
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _window, cx| {
+        app.open_file(file.clone());
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    // Stand in for clangd: publish one warning and two errors, out of order and
+    // with the errors on rows 3 and 1 of the fixture.
+    app.update_in(cx, |app, _window, cx| {
+        let mk = |sev, line, ch| Diagnostic {
+            severity: Some(sev),
+            range: Range::new(Position::new(line, ch), Position::new(line, ch + 3)),
+            message: format!("boom at {line}:{ch}"),
+            ..Default::default()
+        };
+        let tab = app.editor.active_tab_mut().expect("a tab is open");
+        tab.diagnostics = vec![
+            mk(DiagnosticSeverity::ERROR, 3, 11),
+            mk(DiagnosticSeverity::WARNING, 2, 4),
+            mk(DiagnosticSeverity::ERROR, 1, 8),
+        ];
+        assert_eq!(app.active_diag_counts(), (2, 1, 0), "pill counts");
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    // Click the error pill.
+    let pill = cx
+        .debug_bounds("pill-err")
+        .expect("the error pill was painted");
+    cx.simulate_click(pill.center(), Modifiers::default());
+    cx.run_until_parked();
+    app.update_in(cx, |app, _window, _cx| {
+        assert_eq!(app.diag_popup, Some(DiagKind::Error), "pill opens its list");
+        // Errors only, read top-down: row 1 before row 3.
+        let rows = app.diag_list(DiagKind::Error);
+        assert_eq!(rows, vec![2, 0], "errors listed in source order");
+    });
+
+    // The first row is the row-1 error; clicking it must move the caret there.
+    let row = cx
+        .debug_bounds("diag-row-0")
+        .expect("the first diagnostic row was painted");
+    cx.simulate_click(row.center(), Modifiers::default());
+    cx.run_until_parked();
+    app.update_in(cx, |app, _window, _cx| {
+        let caret = app.editor.active_tab().unwrap().caret_point();
+        assert_eq!((caret.row, caret.col), (1, 8), "caret jumped to the error");
+        assert!(app.diag_popup.is_none(), "jumping closes the list");
+    });
+
+    // A pill with nothing to show still opens — the popup is what says so.
+    let info = cx
+        .debug_bounds("pill-info")
+        .expect("the note pill was painted");
+    cx.simulate_click(info.center(), Modifiers::default());
+    cx.run_until_parked();
+    app.update_in(cx, |app, _window, _cx| {
+        assert_eq!(app.diag_popup, Some(DiagKind::Info));
+        assert!(app.diag_list(DiagKind::Info).is_empty());
+    });
+    // Clicking the same pill again closes it.
+    cx.simulate_click(info.center(), Modifiers::default());
+    cx.run_until_parked();
+    app.update_in(cx, |app, _window, _cx| {
+        assert!(app.diag_popup.is_none(), "the same pill toggles shut");
     });
 }
 
@@ -663,6 +789,9 @@ fn test_deps_driven(
         server,
         engine,
         ai: Arc::new(InlineCompletionBackend::new()),
+        // No credential is resolved until a request is made, so a headless app
+        // can hold a chat backend without touching the keychain or the network.
+        chat: Arc::new(jade_ai::ChatBackend::new()),
         sysmon: Arc::new(SystemMonitor::new()),
         term: Arc::new(TermManager::new()),
         runtime: runtime.handle().clone(),
@@ -674,6 +803,9 @@ fn test_deps_driven(
         workspace_opened: true,
         fs_watch: Arc::new(|_root| None),
         demo: false,
+        mode: crate::app::AppMode::Software,
+        hw_tx: None,
+        hw_watch: Arc::new(|_root| None),
     };
     (deps, app_rx)
 }
@@ -940,6 +1072,8 @@ async fn page_position_is_per_tab(cx: &mut TestAppContext) {
     // Open both files as tabs (B ends up active).
     app.update_in(cx, |app, _w, cx| {
         app.open_file(file_a.clone());
+        // Promote A so the open of B does not replace the preview tab.
+        app.editor.active_tab_mut().unwrap().preview = false;
         app.open_file(file_b.clone());
         cx.notify();
     });
@@ -1316,6 +1450,44 @@ async fn typing_inserts_through_input_pipeline(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("backspace");
     app.update_in(cx, |app, _w, _cx| {
         assert_eq!(app.editor.active_tab().unwrap().line(2), "z    int beta = 2;");
+    });
+}
+
+/// Auto-indent end to end in a Verilog file: Enter after `begin` adds one
+/// step, and a typed `end` re-aligns to the matching `begin`.
+#[gpui::test]
+async fn verilog_auto_indent_through_input_pipeline(cx: &mut TestAppContext) {
+    let (dir, _cpp) = test_workspace();
+    let file = dir.join("top.v");
+    std::fs::write(&file, "always @(posedge clk) begin\n\tq <= d;\n").unwrap();
+    let (deps, app_rx) = test_deps(dir);
+
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _window, cx| {
+        app.open_file(file.clone());
+        let tab = app.editor.active_tab_mut().unwrap();
+        let end = tab.buffer.len_bytes();
+        tab.buffer.set_caret(end);
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    // The caret sits after "\tq <= d;\n" (column 0 of row 2). Enter first: the
+    // balanced line above keeps its indent.
+    cx.simulate_input("\tif (rst) begin");
+    cx.simulate_keystrokes("enter");
+    app.update_in(cx, |app, _w, _cx| {
+        let tab = app.editor.active_tab().unwrap();
+        assert_eq!(tab.line(2), "\tif (rst) begin");
+        // Enter after `begin` adds one indent step.
+        assert_eq!(tab.line(3), "\t\t");
+    });
+
+    // Type `end`: the line re-aligns from two tabs to the `if`'s one tab.
+    cx.simulate_input("end");
+    app.update_in(cx, |app, _w, _cx| {
+        let tab = app.editor.active_tab().unwrap();
+        assert_eq!(tab.line(3), "\tend", "`end` aligns to its `begin`");
     });
 }
 
@@ -2007,6 +2179,8 @@ async fn sync_suggestions_detect_and_apply(cx: &mut TestAppContext) {
         let text = tab.buffer.to_string();
         let at = text.find("embedForward").unwrap();
         tab.buffer.edit(at..at + "embedForward".len(), "embedFwd");
+        // A direct buffer edit skips after_edit; promote the preview tab as it would.
+        tab.preview = false;
         assert!(app.sync_detect(idx), "kernel rename must produce a suggestion");
         match app.sync_suggestion.as_ref() {
             Some(crate::sync::SyncSuggestion::RenameKernel { old, new, refs, files }) => {
@@ -2030,6 +2204,8 @@ async fn sync_suggestions_detect_and_apply(cx: &mut TestAppContext) {
         let text = tab.buffer.to_string();
         let at = text.find("384").unwrap();
         tab.buffer.edit(at..at + 3, "512");
+        // A direct buffer edit skips after_edit; promote the preview tab as it would.
+        tab.preview = false;
         assert!(app.sync_detect(idx), "value change must produce a suggestion");
         match app.sync_suggestion.as_ref() {
             Some(crate::sync::SyncSuggestion::Hyperparam { name, to, sites, files }) => {
@@ -2313,3 +2489,1514 @@ async fn tab_indented_line_places_the_caret_on_the_glyph(cx: &mut TestAppContext
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+
+// ── Explain card (§4.14) ─────────────────────────────────────────────────────
+
+
+/// Give the app's chat backend a credential so `explain_trigger` takes the
+/// real request path instead of parking the card on "no model available".
+///
+/// The request itself never reaches the network: `test_deps` builds a
+/// current-thread runtime that is never driven, so the spawned task queues and
+/// is never polled. The test then injects the deltas it wants to assert on.
+fn stub_chat_credential(app: &JadeApp) {
+    app.chat
+        .set_credential_for_test(Some(jade_ai::ApiKey::new("sk-ant-test-not-a-real-key")));
+}
+
+/// Select a range in the open buffer by byte offsets.
+fn select_bytes(app: &mut JadeApp, range: std::ops::Range<usize>) {
+    let tab = app.editor.active_tab_mut().expect("a tab is open");
+    tab.buffer
+        .set_selection(jade_buffer::Selection::new(range.start, range.end));
+}
+
+/// ⌘⇧E over a selection opens a card, and it is really painted.
+#[gpui::test]
+async fn explain_opens_a_card_over_the_selection(cx: &mut TestAppContext) {
+    let (dir, file) = test_workspace();
+    let (deps, app_rx) = test_deps(dir);
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(file);
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    // "    int alpha = 1;" is row 1: bytes 13..31 of the fixture.
+    app.update_in(cx, |app, _w, cx| {
+        select_bytes(app, 17..31);
+        cx.notify();
+    });
+    cx.simulate_keystrokes("cmd-shift-e");
+    cx.run_until_parked();
+
+    app.update_in(cx, |app, _w, _cx| {
+        let c = app.explain.as_ref().expect("a card was opened");
+        assert_eq!(c.start_row, 1, "anchored on the selected row");
+        assert_eq!(c.language, "cpp");
+        assert_eq!(c.generation, 1);
+    });
+    assert!(
+        cx.debug_bounds("explain-card").is_some(),
+        "the card must actually paint, not just exist in state"
+    );
+}
+
+/// With nothing selected there is nothing to explain, and no request is spent.
+#[gpui::test]
+async fn explain_with_no_selection_opens_nothing(cx: &mut TestAppContext) {
+    let (dir, file) = test_workspace();
+    let (deps, app_rx) = test_deps(dir);
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(file);
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("cmd-shift-e");
+    cx.run_until_parked();
+    app.update_in(cx, |app, _w, _cx| {
+        assert!(app.explain.is_none(), "no selection → no card");
+        assert!(!app.toasts.is_empty(), "the user is told why");
+    });
+    assert!(cx.debug_bounds("explain-card").is_none());
+}
+
+/// Streamed deltas accumulate into the card's prose.
+#[gpui::test]
+async fn explain_streams_prose_into_the_card(cx: &mut TestAppContext) {
+    use crate::app::AppEvent;
+    let (dir, file) = test_workspace();
+    let (deps, app_rx) = test_deps(dir);
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(file);
+        stub_chat_credential(app);
+        select_bytes(app, 17..31);
+        app.explain_trigger(cx);
+    });
+    cx.run_until_parked();
+
+    app.update_in(cx, |app, _w, cx| {
+        app.apply_app_event(AppEvent::Explain {
+            generation: 1,
+            delta: jade_ai::ChatDelta::Started(jade_ai::ChatProviderId::Anthropic),
+        });
+        app.apply_app_event(AppEvent::Explain {
+            generation: 1,
+            delta: jade_ai::ChatDelta::Text("It declares ".into()),
+        });
+        app.apply_app_event(AppEvent::Explain {
+            generation: 1,
+            delta: jade_ai::ChatDelta::Text("alpha.".into()),
+        });
+        cx.notify();
+        let c = app.explain.as_ref().unwrap();
+        assert_eq!(c.prose, "It declares alpha.");
+        assert_eq!(c.status().0, "Explaining…");
+    });
+}
+
+/// A superseded request's deltas must never land in the new card. Aborting the
+/// task is not enough — deltas can already be queued on the pump.
+#[gpui::test]
+async fn explain_drops_deltas_from_a_superseded_request(cx: &mut TestAppContext) {
+    use crate::app::AppEvent;
+    let (dir, file) = test_workspace();
+    let (deps, app_rx) = test_deps(dir);
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(file);
+        stub_chat_credential(app);
+        select_bytes(app, 17..31);
+        app.explain_trigger(cx);
+        // A different selection supersedes.
+        select_bytes(app, 36..49);
+        app.explain_trigger(cx);
+    });
+    cx.run_until_parked();
+
+    app.update_in(cx, |app, _w, _cx| {
+        assert_eq!(app.explain.as_ref().unwrap().generation, 2);
+        app.apply_app_event(AppEvent::Explain {
+            generation: 1,
+            delta: jade_ai::ChatDelta::Text("STALE".into()),
+        });
+        app.apply_app_event(AppEvent::Explain {
+            generation: 2,
+            delta: jade_ai::ChatDelta::Text("fresh".into()),
+        });
+        assert_eq!(app.explain.as_ref().unwrap().prose, "fresh");
+    });
+}
+
+/// Re-triggering on the SAME selection must not spend a second request.
+#[gpui::test]
+async fn explain_on_the_same_selection_is_idempotent(cx: &mut TestAppContext) {
+    let (dir, file) = test_workspace();
+    let (deps, app_rx) = test_deps(dir);
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(file);
+        select_bytes(app, 17..31);
+        app.explain_trigger(cx);
+        let gen = app.explain.as_ref().unwrap().generation;
+        app.explain_trigger(cx);
+        assert_eq!(
+            app.explain.as_ref().unwrap().generation,
+            gen,
+            "holding the chord must not re-request"
+        );
+    });
+}
+
+/// Esc closes the card — but only after any completion popup has had its turn.
+#[gpui::test]
+async fn escape_closes_the_card(cx: &mut TestAppContext) {
+    let (dir, file) = test_workspace();
+    let (deps, app_rx) = test_deps(dir);
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(file);
+        select_bytes(app, 17..31);
+        app.explain_trigger(cx);
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("explain-card").is_some());
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    app.update_in(cx, |app, _w, _cx| {
+        assert!(app.explain.is_none(), "escape closes the card");
+    });
+    assert!(cx.debug_bounds("explain-card").is_none());
+}
+
+/// The existing ⌘⇧A and ⌘C bindings must survive the new arms.
+#[gpui::test]
+async fn explain_binding_does_not_shadow_the_existing_chords(cx: &mut TestAppContext) {
+    let (dir, file) = test_workspace();
+    let (deps, app_rx) = test_deps(dir);
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(file);
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    let before = app.update_in(cx, |app, _w, _cx| app.asm_visible);
+    cx.simulate_keystrokes("cmd-shift-a");
+    cx.run_until_parked();
+    app.update_in(cx, |app, _w, _cx| {
+        assert_ne!(app.asm_visible, before, "cmd-shift-a still toggles ASM");
+        assert!(app.explain.is_none(), "cmd-shift-a must not explain");
+    });
+
+    // ⌘E alone is the flow toggle, not Explain.
+    cx.simulate_keystrokes("cmd-e");
+    cx.run_until_parked();
+    app.update_in(cx, |app, _w, _cx| {
+        assert!(app.explain.is_none(), "cmd-e must not explain");
+    });
+}
+
+/// An edit under the card marks it stale rather than silently letting it
+/// describe code that is no longer there.
+#[gpui::test]
+async fn editing_under_the_card_marks_it_stale(cx: &mut TestAppContext) {
+    let (dir, file) = test_workspace();
+    let (deps, app_rx) = test_deps(dir);
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(file);
+        select_bytes(app, 17..31);
+        app.explain_trigger(cx);
+        assert!(!app.explain.as_ref().unwrap().stale);
+    });
+    cx.run_until_parked();
+
+    // Type inside the explained fragment.
+    app.update_in(cx, |app, _w, cx| {
+        select_bytes(app, 20..20);
+        cx.notify();
+    });
+    cx.simulate_keystrokes("x");
+    cx.run_until_parked();
+    app.update_in(cx, |app, _w, _cx| {
+        assert!(
+            app.explain.as_ref().unwrap().stale,
+            "an edit inside the fragment must mark the card stale"
+        );
+    });
+}
+
+/// With no API key, Explain must not dead-end: it brings the local model server
+/// up and parks the card on a transient, retryable "starting" state.
+#[gpui::test]
+async fn explain_without_a_key_falls_back_to_the_local_model(cx: &mut TestAppContext) {
+    let (dir, file) = test_workspace();
+    let (deps, app_rx) = test_deps(dir);
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(file);
+        // No key, and no local server yet — the state a fresh machine is in.
+        app.chat.set_credential_for_test(None);
+        app.chat.set_local_status(jade_ai::LocalStatus::Off);
+        select_bytes(app, 17..31);
+        app.explain_trigger(cx);
+    });
+    cx.run_until_parked();
+
+    app.update_in(cx, |app, _w, _cx| {
+        let c = app.explain.as_ref().expect("a card still opens");
+        assert_eq!(
+            c.failure(),
+            Some(&jade_ai::ChatError::LocalStarting),
+            "no key must start the local model, not give up"
+        );
+        assert!(c.can_retry(), "a starting server is a wait, not a dead end");
+    });
+    assert!(cx.debug_bounds("explain-card").is_some());
+}
+
+/// Only a machine with neither a key nor any local model says so.
+#[gpui::test]
+async fn explain_reports_setup_only_when_nothing_can_serve(cx: &mut TestAppContext) {
+    let (dir, file) = test_workspace();
+    let (deps, app_rx) = test_deps(dir);
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, _cx| {
+        app.open_file(file);
+        app.chat.set_credential_for_test(None);
+        app.chat.set_local_status(jade_ai::LocalStatus::Off);
+        // `effective_provider` is what the card's empty state reads.
+        assert_eq!(
+            app.chat.effective_provider(),
+            Err(jade_ai::ChatError::NoCredential)
+        );
+        app.chat
+            .set_local_status(jade_ai::LocalStatus::Ready { endpoint: "http://127.0.0.1:8630".into() });
+        assert_eq!(
+            app.chat.effective_provider(),
+            Ok(jade_ai::ChatProviderId::LlamaServer),
+            "a running local server is enough on its own"
+        );
+    });
+}
+
+/// A card parked on "starting" resumes by itself once the server is up.
+#[gpui::test]
+async fn a_parked_card_resumes_when_the_local_model_is_ready(cx: &mut TestAppContext) {
+    use crate::app::AppEvent;
+    let (dir, file) = test_workspace();
+    let (deps, app_rx) = test_deps(dir);
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(file);
+        app.chat.set_credential_for_test(None);
+        app.chat.set_local_status(jade_ai::LocalStatus::Off);
+        select_bytes(app, 17..31);
+        app.explain_trigger(cx);
+        assert_eq!(
+            app.explain.as_ref().unwrap().failure(),
+            Some(&jade_ai::ChatError::LocalStarting)
+        );
+    });
+    cx.run_until_parked();
+
+    // The server comes up.
+    app.update_in(cx, |app, _w, cx| {
+        app.apply_app_event(AppEvent::Ai(jade_ai::AiStatus {
+            state: jade_ai::AiState::Ready,
+            detail: "ready".into(),
+            endpoint: Some("http://127.0.0.1:8630".into()),
+        }));
+        app.after_events(cx);
+        let c = app.explain.as_ref().expect("the card is still open");
+        assert!(
+            c.failure().is_none(),
+            "the parked card must re-issue itself, not wait for a manual retry"
+        );
+        assert!(c.generation > 1, "it was actually re-requested");
+    });
+}
+
+// ── Visualize card (§4.15) ───────────────────────────────────────────────────
+
+/// Point the app's AI prefs at a throwaway file, with Visualize consent in a
+/// known state. The default `AiPrefs::load()` reads the developer's real
+/// `~/.config/jade/ai.json`, and a consent test must neither read nor write it.
+fn stub_ai_prefs(app: &mut JadeApp, dir: &std::path::Path, visualize_enabled: bool) {
+    let path = dir.join(".jade").join("ai-test.json");
+    let _ = std::fs::create_dir_all(path.parent().unwrap());
+    let mut prefs = crate::ai_prefs::AiPrefs::load_from(&path);
+    prefs.visualize_enabled = visualize_enabled;
+    app.ai_prefs = prefs;
+}
+
+/// The first ⌘⇧M shows the consent card: no request goes out and no generated
+/// Python can run until the user opts in.
+#[gpui::test]
+async fn visualize_asks_for_consent_first(cx: &mut TestAppContext) {
+    let (dir, file) = test_workspace();
+    let (deps, app_rx) = test_deps(dir.clone());
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(file);
+        stub_ai_prefs(app, &dir, false);
+        stub_chat_credential(app);
+        select_bytes(app, 17..31);
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("cmd-shift-m");
+    cx.run_until_parked();
+
+    app.update_in(cx, |app, _w, _cx| {
+        let c = app.visualize.as_ref().expect("a consent card was opened");
+        assert!(c.awaiting_consent(), "phase: {:?}", c.phase);
+        assert!(!c.in_flight(), "consent must not spend a request");
+    });
+    assert!(
+        cx.debug_bounds("visualize-card").is_some(),
+        "the consent card must actually paint"
+    );
+}
+
+/// Accepting consent persists the choice (to the test path) and starts the
+/// request the card was opened for.
+#[gpui::test]
+async fn visualize_consent_accept_starts_the_request(cx: &mut TestAppContext) {
+    let (dir, file) = test_workspace();
+    let (deps, app_rx) = test_deps(dir.clone());
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(file);
+        stub_ai_prefs(app, &dir, false);
+        stub_chat_credential(app);
+        select_bytes(app, 17..31);
+        app.visualize_trigger(cx);
+    });
+    cx.run_until_parked();
+
+    app.update_in(cx, |app, _w, cx| {
+        assert!(app.visualize.as_ref().unwrap().awaiting_consent());
+        app.visualize_consent_accept(cx);
+        assert!(app.ai_prefs.visualize_enabled);
+        let c = app.visualize.as_ref().expect("the card survives consent");
+        assert!(!c.awaiting_consent(), "the request started: {:?}", c.phase);
+        assert!(c.generation > 1, "a fresh generation for the real request");
+    });
+    // The choice landed in the throwaway prefs file, not the real one.
+    let saved = std::fs::read_to_string(dir.join(".jade").join("ai-test.json")).unwrap();
+    assert!(saved.contains("\"visualize_enabled\": true"), "{saved}");
+}
+
+/// With consent already given, ⌘⇧M goes straight to the request and paints
+/// the working card.
+#[gpui::test]
+async fn visualize_opens_a_card_when_enabled(cx: &mut TestAppContext) {
+    let (dir, file) = test_workspace();
+    let (deps, app_rx) = test_deps(dir.clone());
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(file);
+        stub_ai_prefs(app, &dir, true);
+        stub_chat_credential(app);
+        select_bytes(app, 17..31);
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("cmd-shift-m");
+    cx.run_until_parked();
+
+    app.update_in(cx, |app, _w, _cx| {
+        let c = app.visualize.as_ref().expect("a card was opened");
+        assert_eq!(c.start_row, 1, "anchored on the selected row");
+        assert_eq!(c.language, "cpp");
+        assert!(!c.awaiting_consent());
+        // Explain is untouched — the lanes are independent.
+        assert!(app.explain.is_none());
+    });
+    assert!(cx.debug_bounds("visualize-card").is_some());
+}
+
+/// The local gate: a selection with no executable code costs nothing — no
+/// card, no request, a toast that says why.
+#[gpui::test]
+async fn visualize_gate_rejects_inappropriate_selections(cx: &mut TestAppContext) {
+    let (dir, file) = test_workspace();
+    let (deps, app_rx) = test_deps(dir.clone());
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(file);
+        stub_ai_prefs(app, &dir, true);
+        stub_chat_credential(app);
+        // Row 4 is the bare `}` — nothing to animate.
+        select_bytes(app, 75..76);
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("cmd-shift-m");
+    cx.run_until_parked();
+
+    app.update_in(cx, |app, _w, _cx| {
+        assert!(app.visualize.is_none(), "gated selection → no card");
+        assert!(!app.toasts.is_empty(), "the user is told why");
+    });
+    assert!(cx.debug_bounds("visualize-card").is_none());
+}
+
+/// The local model tier cannot write scenes; ⌘⇧M says so instead of failing
+/// later with something confusing.
+#[gpui::test]
+async fn visualize_refuses_the_local_tier(cx: &mut TestAppContext) {
+    let (dir, file) = test_workspace();
+    let (deps, app_rx) = test_deps(dir.clone());
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(file);
+        stub_ai_prefs(app, &dir, true);
+        app.chat.set_model(jade_ai::ChatModel::Local);
+        select_bytes(app, 17..31);
+        app.visualize_trigger(cx);
+    });
+    cx.run_until_parked();
+    app.update_in(cx, |app, _w, _cx| {
+        assert!(app.visualize.is_none());
+        assert!(!app.toasts.is_empty());
+    });
+}
+
+/// The full pipeline, request → verdict → render events → Ready, driven by
+/// injected events exactly as the pump delivers them.
+#[gpui::test]
+async fn visualize_pipeline_reaches_ready(cx: &mut TestAppContext) {
+    use crate::app::AppEvent;
+    let (dir, file) = test_workspace();
+    let (deps, app_rx) = test_deps(dir.clone());
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(file);
+        stub_ai_prefs(app, &dir, true);
+        stub_chat_credential(app);
+        select_bytes(app, 17..31);
+        app.visualize_trigger(cx);
+    });
+    cx.run_until_parked();
+
+    let plan = serde_json::json!({
+        "suitable": true,
+        "reason": "Shows the addition.",
+        "title": "Adding alpha and beta",
+        "script": "from manim import *\n\nclass JadeScene(Scene):\n    def construct(self):\n        self.play(Write(Text(\"a+b\")))\n        self.wait(1)\n",
+        "duration_s": 7.0
+    })
+    .to_string();
+
+    // A real mp4 for the Ready hand-off, so the player has a file to open.
+    let video = dir.join("clip.mp4");
+    std::fs::write(&video, b"not really an mp4; open() only needs a path").unwrap();
+
+    app.update_in(cx, |app, _w, cx| {
+        app.apply_app_event(AppEvent::Visualize {
+            generation: 1,
+            delta: jade_ai::ChatDelta::Text(plan),
+        });
+        app.apply_app_event(AppEvent::Visualize {
+            generation: 1,
+            delta: jade_ai::ChatDelta::Done { stop_reason: jade_ai::StopReason::EndTurn },
+        });
+        let c = app.visualize.as_ref().unwrap();
+        assert_eq!(c.status().0, "Rendering…", "{:?}", c.phase);
+
+        app.apply_app_event(AppEvent::VisualizeRender {
+            generation: 1,
+            ev: jade_build::manim::RenderEvent::Log("INFO Animation 0: Write(Text)".into()),
+        });
+        app.apply_app_event(AppEvent::VisualizeRender {
+            generation: 1,
+            ev: jade_build::manim::RenderEvent::Done { video: video.clone() },
+        });
+        cx.notify();
+        let c = app.visualize.as_ref().unwrap();
+        assert_eq!(c.status().0, "Ready", "{:?}", c.phase);
+        assert!(app.visualize_player.is_some(), "a player was opened");
+    });
+    assert!(cx.debug_bounds("visualize-card").is_some());
+}
+
+/// The model-side gate: an unsuitable verdict ends benignly as "Skipped".
+#[gpui::test]
+async fn visualize_unsuitable_verdict_shows_skipped(cx: &mut TestAppContext) {
+    use crate::app::AppEvent;
+    let (dir, file) = test_workspace();
+    let (deps, app_rx) = test_deps(dir.clone());
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(file);
+        stub_ai_prefs(app, &dir, true);
+        stub_chat_credential(app);
+        select_bytes(app, 17..31);
+        app.visualize_trigger(cx);
+    });
+    cx.run_until_parked();
+
+    let verdict = serde_json::json!({
+        "suitable": false,
+        "reason": "The line only declares a constant.",
+        "title": "", "script": "", "duration_s": 0
+    })
+    .to_string();
+    app.update_in(cx, |app, _w, cx| {
+        app.apply_app_event(AppEvent::Visualize {
+            generation: 1,
+            delta: jade_ai::ChatDelta::Text(verdict),
+        });
+        app.apply_app_event(AppEvent::Visualize {
+            generation: 1,
+            delta: jade_ai::ChatDelta::Done { stop_reason: jade_ai::StopReason::EndTurn },
+        });
+        cx.notify();
+        let c = app.visualize.as_ref().unwrap();
+        assert_eq!(c.status(), ("Skipped", false));
+        // No render task was started for a declined verdict — the phase
+        // stayed terminal without touching manim.
+    });
+    assert!(cx.debug_bounds("visualize-card").is_some(), "the reason is shown");
+}
+
+/// Esc closes the card from the keyboard, and a queued stale delta cannot
+/// revive it.
+#[gpui::test]
+async fn escape_closes_the_visualize_card(cx: &mut TestAppContext) {
+    use crate::app::AppEvent;
+    let (dir, file) = test_workspace();
+    let (deps, app_rx) = test_deps(dir.clone());
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(file);
+        stub_ai_prefs(app, &dir, true);
+        stub_chat_credential(app);
+        select_bytes(app, 17..31);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("cmd-shift-m");
+    cx.run_until_parked();
+    app.update_in(cx, |app, _w, _cx| {
+        assert!(app.visualize.is_some());
+    });
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    app.update_in(cx, |app, _w, _cx| {
+        assert!(app.visualize.is_none(), "Esc closes the card");
+        // A straggler from the canceled generation is dropped, not revived.
+        app.apply_app_event(AppEvent::Visualize {
+            generation: 1,
+            delta: jade_ai::ChatDelta::Text("late".into()),
+        });
+        assert!(app.visualize.is_none());
+    });
+    assert!(cx.debug_bounds("visualize-card").is_none());
+}
+
+/// Explain and Visualize are independent: both cards can be open at once and
+/// closing one leaves the other.
+#[gpui::test]
+async fn explain_and_visualize_are_independent(cx: &mut TestAppContext) {
+    let (dir, file) = test_workspace();
+    let (deps, app_rx) = test_deps(dir.clone());
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(file);
+        stub_ai_prefs(app, &dir, true);
+        stub_chat_credential(app);
+        select_bytes(app, 17..31);
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("cmd-shift-e");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("cmd-shift-m");
+    cx.run_until_parked();
+
+    app.update_in(cx, |app, _w, _cx| {
+        assert!(app.explain.is_some(), "⌘⇧M must not cancel ⌘⇧E");
+        assert!(app.visualize.is_some());
+    });
+    assert!(cx.debug_bounds("explain-card").is_some());
+    assert!(cx.debug_bounds("visualize-card").is_some());
+
+    // Esc closes Visualize first, Explain second.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    app.update_in(cx, |app, _w, _cx| {
+        assert!(app.visualize.is_none());
+        assert!(app.explain.is_some());
+    });
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    app.update_in(cx, |app, _w, _cx| {
+        assert!(app.explain.is_none());
+    });
+}
+
+/// Enter accepts consent from the keyboard — ⌘⇧M, Enter, done.
+#[gpui::test]
+async fn visualize_consent_enter_accepts(cx: &mut TestAppContext) {
+    let (dir, file) = test_workspace();
+    let (deps, app_rx) = test_deps(dir.clone());
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(file);
+        stub_ai_prefs(app, &dir, false);
+        stub_chat_credential(app);
+        select_bytes(app, 17..31);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("cmd-shift-m");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    app.update_in(cx, |app, _w, _cx| {
+        assert!(app.ai_prefs.visualize_enabled, "Enter recorded consent");
+        let c = app.visualize.as_ref().expect("the card went on to request");
+        assert!(!c.awaiting_consent(), "{:?}", c.phase);
+        // Enter must NOT also type a newline into the buffer.
+        let text = app.editor.active_tab().unwrap().buffer.to_string();
+        assert_eq!(text.lines().count(), 5, "the buffer is unchanged");
+    });
+}
+
+/// No key and no explicit chat endpoint: the card fails as a setup step
+/// instead of burning a request on a model that cannot write scenes.
+#[gpui::test]
+async fn visualize_without_credential_is_a_setup_step(cx: &mut TestAppContext) {
+    let (dir, file) = test_workspace();
+    let (deps, app_rx) = test_deps(dir.clone());
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(file);
+        stub_ai_prefs(app, &dir, true);
+        // Force "resolved, absent" so the keychain is never touched.
+        app.chat.set_credential_for_test(None);
+        select_bytes(app, 17..31);
+        app.visualize_trigger(cx);
+    });
+    cx.run_until_parked();
+    app.update_in(cx, |app, _w, _cx| {
+        let c = app.visualize.as_ref().expect("a card reports the setup step");
+        match c.failure() {
+            Some(crate::visualize::VisualizeError::Chat(e)) => {
+                assert_eq!(e.headline(), "No model available");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(!c.can_retry(), "a missing key is a setup step, not a retry");
+    });
+    assert!(cx.debug_bounds("visualize-card").is_some());
+}
+
+/// A consent card parked behind another tab must not swallow Enter or record
+/// consent from a buffer the user cannot see (review finding).
+#[gpui::test]
+async fn hidden_consent_card_leaves_enter_to_the_editor(cx: &mut TestAppContext) {
+    let (dir, file) = test_workspace();
+    let other = dir.join("other.cpp");
+    std::fs::write(&other, "int x = 1;\n").unwrap();
+    let (deps, app_rx) = test_deps(dir.clone());
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(file);
+        stub_ai_prefs(app, &dir, false);
+        stub_chat_credential(app);
+        select_bytes(app, 17..31);
+        app.visualize_trigger(cx);
+        assert!(app.visualize.as_ref().unwrap().awaiting_consent());
+        // Another file comes to the front; the card is hidden, not closed.
+        app.open_file(other.clone());
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    app.update_in(cx, |app, _w, _cx| {
+        assert!(!app.ai_prefs.visualize_enabled, "consent must not be recorded blind");
+        assert!(app.visualize.as_ref().unwrap().awaiting_consent());
+        // Enter went to the editor as a newline in the VISIBLE buffer.
+        let text = app.editor.active_tab().unwrap().buffer.to_string();
+        assert!(text.starts_with('\n'), "the newline landed in the editor: {text:?}");
+    });
+}
+
+/// A retry while another tab is in front reads the tab that OWNS the card —
+/// and is a no-op once that tab is closed (review finding).
+#[gpui::test]
+async fn retry_reads_the_owning_tab_not_the_active_one(cx: &mut TestAppContext) {
+    use crate::app::AppEvent;
+    let (dir, file) = test_workspace();
+    let other = dir.join("other.cpp");
+    std::fs::write(&other, "int x = 1;\n").unwrap();
+    let (deps, app_rx) = test_deps(dir.clone());
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(file.clone());
+        // Promote the tab so the later open of `other` does not replace it.
+        app.editor.active_tab_mut().unwrap().preview = false;
+        stub_ai_prefs(app, &dir, true);
+        stub_chat_credential(app);
+        select_bytes(app, 17..31);
+        app.visualize_trigger(cx);
+        app.apply_app_event(AppEvent::Visualize {
+            generation: 1,
+            delta: jade_ai::ChatDelta::Failed(jade_ai::ChatError::Overloaded),
+        });
+        // Another file in front; the retry must still describe `main.cpp`.
+        app.open_file(other.clone());
+        app.visualize_retry(cx);
+        let c = app.visualize.as_ref().unwrap();
+        assert_eq!(c.generation, 2, "the retry was issued");
+        assert_eq!(c.path, file, "the card still describes its own file");
+
+        // Close the owning tab: a further retry has nothing to read and
+        // leaves the card alone rather than reading the wrong buffer.
+        app.apply_app_event(AppEvent::Visualize {
+            generation: 2,
+            delta: jade_ai::ChatDelta::Failed(jade_ai::ChatError::Overloaded),
+        });
+        let i = app.editor.tabs.iter().position(|t| t.path == file).unwrap();
+        app.close_tab(i);
+        app.visualize_retry(cx);
+        assert_eq!(app.visualize.as_ref().unwrap().generation, 2, "no blind retry");
+    });
+}
+
+/// A card that failed before any text has nothing to animate; the ticker must
+/// stop instead of repainting a static banner at 30fps (review finding).
+#[gpui::test]
+async fn a_failed_explain_card_does_not_spin_the_ticker(cx: &mut TestAppContext) {
+    let (dir, file) = test_workspace();
+    let (deps, app_rx) = test_deps(dir);
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(file);
+        // Resolved-absent credential and no local server: the card parks on
+        // a failure immediately, with no text ever arriving.
+        app.chat.set_credential_for_test(None);
+        select_bytes(app, 17..31);
+        app.explain_trigger(cx);
+        let c = app.explain.as_ref().unwrap();
+        assert!(c.failure().is_some(), "{:?}", c.phase);
+        assert!(
+            !app.explain_working(),
+            "a text-less terminal card must not keep the ticker alive"
+        );
+    });
+}
+
+/// Tab inserts one hard tab, Tab over a multi-row selection indents the block,
+/// and ⇧Tab takes one indent step back off every line the selection covers.
+#[gpui::test]
+async fn tab_inserts_a_hard_tab_and_shift_tab_outdents(cx: &mut TestAppContext) {
+    use jade_buffer::{Point, Selection};
+
+    let (dir, file) = test_workspace();
+    let (deps, app_rx) = test_deps(dir.clone());
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _window, cx| {
+        app.open_file(file.clone());
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    // A plain Tab at the start of row 0 inserts one char, not four spaces.
+    cx.simulate_keystrokes("tab");
+    app.update_in(cx, |app, _w, _cx| {
+        let tab = app.editor.active_tab().unwrap();
+        assert_eq!(tab.line(0), "\tint main() {", "Tab inserted a hard tab");
+        assert_eq!(tab.caret_point().col, 1, "the tab is one column of caret travel");
+    });
+
+    // One Backspace takes the whole indent step back.
+    cx.simulate_keystrokes("backspace");
+    app.update_in(cx, |app, _w, _cx| {
+        assert_eq!(app.editor.active_tab().unwrap().line(0), "int main() {");
+    });
+
+    // Select rows 1..2 ("    int alpha = 1;" and "    int beta = 2;"), then Tab.
+    app.update_in(cx, |app, _w, cx| {
+        let tab = app.editor.active_tab_mut().unwrap();
+        let start = tab.buffer.point_to_offset(Point::new(1, 0));
+        let end = tab.buffer.point_to_offset(Point::new(2, 4));
+        tab.buffer.set_selection(Selection::new(start, end));
+        cx.notify();
+    });
+    cx.simulate_keystrokes("tab");
+    app.update_in(cx, |app, _w, _cx| {
+        let tab = app.editor.active_tab().unwrap();
+        assert_eq!(tab.line(1), "\t    int alpha = 1;", "row 1 gained an indent");
+        assert_eq!(tab.line(2), "\t    int beta = 2;", "row 2 gained an indent");
+        assert_eq!(tab.line(3), "    return alpha + beta;", "row 3 is outside");
+    });
+
+    // ⇧Tab undoes it: the leading tab goes first.
+    cx.simulate_keystrokes("shift-tab");
+    app.update_in(cx, |app, _w, _cx| {
+        let tab = app.editor.active_tab().unwrap();
+        assert_eq!(tab.line(1), "    int alpha = 1;");
+        assert_eq!(tab.line(2), "    int beta = 2;");
+    });
+
+    // A second ⇧Tab eats the four spaces the file shipped with.
+    cx.simulate_keystrokes("shift-tab");
+    app.update_in(cx, |app, _w, _cx| {
+        let tab = app.editor.active_tab().unwrap();
+        assert_eq!(tab.line(1), "int alpha = 1;", "spaces outdent too");
+        assert_eq!(tab.line(2), "int beta = 2;");
+    });
+}
+
+/// Undo works in chunks, not per character: a typing burst is one group, Enter
+/// closes it, and a caret jump starts a new one.
+#[gpui::test]
+async fn undo_takes_back_a_typing_burst_not_one_letter(cx: &mut TestAppContext) {
+    let (dir, file) = test_workspace();
+    let (deps, app_rx) = test_deps(dir.clone());
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _window, cx| {
+        app.open_file(file.clone());
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    // Type through the platform input pipeline, the path the keyboard uses.
+    cx.simulate_input("hello");
+    app.update_in(cx, |app, _w, _cx| {
+        assert_eq!(
+            app.editor.active_tab().unwrap().line(0),
+            "helloint main() {"
+        );
+    });
+
+    // One ⌘Z takes back all five letters.
+    cx.simulate_keystrokes("cmd-z");
+    app.update_in(cx, |app, _w, _cx| {
+        assert_eq!(app.editor.active_tab().unwrap().line(0), "int main() {");
+    });
+
+    // One ⌘⇧Z puts them all back.
+    cx.simulate_keystrokes("cmd-shift-z");
+    app.update_in(cx, |app, _w, _cx| {
+        assert_eq!(
+            app.editor.active_tab().unwrap().line(0),
+            "helloint main() {"
+        );
+    });
+
+    // Enter closes the group: the burst after it undoes on its own.
+    cx.simulate_keystrokes("enter");
+    cx.simulate_input("world");
+    app.update_in(cx, |app, _w, _cx| {
+        let tab = app.editor.active_tab().unwrap();
+        assert_eq!(tab.line(0), "hello");
+        assert_eq!(tab.line(1), "worldint main() {");
+    });
+    cx.simulate_keystrokes("cmd-z");
+    app.update_in(cx, |app, _w, _cx| {
+        let tab = app.editor.active_tab().unwrap();
+        assert_eq!(tab.line(1), "int main() {", "only the second burst came off");
+        assert_eq!(tab.line(0), "hello", "the first burst stayed");
+    });
+}
+
+// ── Hardware mode (§B11) ─────────────────────────────────────────────────────
+
+/// Welcome keys pick a mode: `2` marks Hardware as pending and opens the
+/// folder prompt. No tree scan happens — no workspace is open yet.
+#[gpui::test]
+async fn welcome_keys_choose_mode_without_scanning_a_tree(cx: &mut TestAppContext) {
+    use crate::app::AppMode;
+
+    let (dir, _file) = test_workspace();
+    let (mut deps, app_rx) = test_deps(dir);
+    deps.workspace_opened = false;
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("2");
+    app.update_in(cx, |app, _w, _cx| {
+        assert_eq!(app.pending_mode, Some(AppMode::Hardware));
+        assert!(app.tree.is_none(), "choosing a mode must not scan a tree");
+        assert!(!app.workspace_opened);
+    });
+
+    // `1` overrides the pending pick with Software.
+    cx.simulate_keystrokes("1");
+    app.update_in(cx, |app, _w, _cx| {
+        assert_eq!(app.pending_mode, Some(AppMode::Software));
+        assert!(app.tree.is_none());
+    });
+}
+
+/// Hardware mode swaps the runtime sidebar for the board panel and drops the
+/// C++ build/run/debug cluster from the action bar.
+#[gpui::test]
+async fn hardware_mode_swaps_board_for_runtime_sidebar(cx: &mut TestAppContext) {
+    let (dir, file) = test_hw_workspace();
+    let (deps, app_rx, _hw_rx) = test_deps_hw(dir);
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(file.clone());
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    assert!(cx.debug_bounds("board-panel").is_some(), "board panel must render");
+    assert!(cx.debug_bounds("hw-run").is_some(), "board Run/Pause must render");
+    assert!(cx.debug_bounds("runtime-sidebar").is_none(), "no runtime sidebar");
+    assert!(cx.debug_bounds("btn-build").is_none(), "no Build button");
+    assert!(cx.debug_bounds("btn-run").is_none(), "no Run button");
+    assert!(cx.debug_bounds("btn-debug").is_none(), "no Debug button");
+}
+
+/// A pointer press on PB0 holds the board button down; release lets it up.
+/// Both transitions reach the engine channel as SetPb commands.
+#[gpui::test]
+async fn board_button_press_and_release(cx: &mut TestAppContext) {
+    use gpui::MouseButton;
+    use jade_hw::HwCommand;
+
+    let (dir, file) = test_hw_workspace();
+    let (deps, app_rx, mut hw_rx) = test_deps_hw(dir);
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(file.clone());
+        cx.notify();
+    });
+    cx.run_until_parked();
+    while hw_rx.try_recv().is_ok() {} // drop any startup replay commands
+
+    let pb = cx.debug_bounds("pb-0").expect("PB0 painted");
+    cx.simulate_mouse_down(pb.center(), MouseButton::Left, Modifiers::default());
+    app.update_in(cx, |app, _w, _cx| {
+        assert!(app.hw.as_ref().unwrap().pb[0], "PB0 held after mouse down");
+    });
+    cx.simulate_mouse_up(pb.center(), MouseButton::Left, Modifiers::default());
+    app.update_in(cx, |app, _w, _cx| {
+        assert!(!app.hw.as_ref().unwrap().pb[0], "PB0 released after mouse up");
+    });
+
+    let mut cmds = Vec::new();
+    while let Ok(c) = hw_rx.try_recv() {
+        cmds.push(c);
+    }
+    assert_eq!(
+        cmds,
+        vec![HwCommand::SetPb(0, true), HwCommand::SetPb(0, false)],
+        "both transitions reach the engine"
+    );
+}
+
+/// A click toggles DIP2; the position survives a hot swap (CompileDone).
+#[gpui::test]
+async fn dip_click_toggles_and_survives_hot_swap(cx: &mut TestAppContext) {
+    use crate::app::AppEvent;
+    use jade_hw::{HwCommand, HwEvent};
+
+    let (dir, file) = test_hw_workspace();
+    let (deps, app_rx, mut hw_rx) = test_deps_hw(dir);
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(file.clone());
+        cx.notify();
+    });
+    cx.run_until_parked();
+    while hw_rx.try_recv().is_ok() {}
+
+    let dip = cx.debug_bounds("dip-2").expect("DIP2 painted");
+    cx.simulate_click(dip.center(), Modifiers::default());
+    app.update_in(cx, |app, _w, _cx| {
+        assert!(app.hw.as_ref().unwrap().dip[2], "DIP2 is ON after the click");
+    });
+    assert_eq!(hw_rx.try_recv(), Ok(HwCommand::SetDip(2, true)));
+
+    // A hot swap must keep the DIP position (the session replays it into the
+    // fresh sim; the UI state is the source of truth).
+    app.update_in(cx, |app, _w, cx| {
+        app.apply_app_event(AppEvent::Hw(HwEvent::CompileDone { ok: true }));
+        assert!(app.hw.as_ref().unwrap().dip[2], "DIP2 survives the hot swap");
+        cx.notify();
+    });
+}
+
+/// LED frames update the render model's mask and per-LED duty.
+#[gpui::test]
+async fn led_frame_updates_duty(cx: &mut TestAppContext) {
+    use crate::app::AppEvent;
+    use jade_hw::HwEvent;
+
+    let (dir, file) = test_hw_workspace();
+    let (deps, app_rx, _hw_rx) = test_deps_hw(dir);
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(file.clone());
+        app.apply_app_event(AppEvent::Hw(HwEvent::LedFrame {
+            bitmask: 0b00101,
+            duty: [1.0, 0.0, 0.55, 0.0, 0.0],
+        }));
+        cx.notify();
+    });
+    app.update_in(cx, |app, _w, _cx| {
+        let hw = app.hw.as_ref().unwrap();
+        assert_eq!(hw.led_mask, 0b00101);
+        assert_eq!(hw.led_duty[0], 1.0);
+        assert_eq!(hw.led_duty[2], 0.55);
+        assert_eq!(hw.led_duty[1], 0.0);
+    });
+}
+
+/// Plain keys drive the board only while the board has focus; with the
+/// editor focused, `1` stays an ordinary keystroke.
+#[gpui::test]
+async fn board_keys_only_when_board_focused(cx: &mut TestAppContext) {
+    use gpui::MouseButton;
+
+    let (dir, file) = test_hw_workspace();
+    let (deps, app_rx, _hw_rx) = test_deps_hw(dir);
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(file.clone());
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    // Editor focused (open_file focuses it): `1` must NOT press PB0.
+    cx.simulate_keystrokes("1");
+    app.update_in(cx, |app, _w, _cx| {
+        assert!(!app.hw.as_ref().unwrap().pb[0], "editor keystroke must not press PB0");
+    });
+
+    // Click the board to focus it, then `1` presses PB0 (key down holds it).
+    let pcb = cx.debug_bounds("pb-0").expect("board painted");
+    cx.simulate_mouse_down(pcb.center(), MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_up(pcb.center(), MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_keystrokes("1");
+    app.update_in(cx, |app, _w, _cx| {
+        assert!(app.hw.as_ref().unwrap().pb[0], "board keystroke presses PB0");
+    });
+    // The key-up releases it.
+    cx.simulate_event(gpui::KeyUpEvent {
+        keystroke: gpui::Keystroke::parse("1").unwrap(),
+    });
+    app.update_in(cx, |app, _w, _cx| {
+        assert!(!app.hw.as_ref().unwrap().pb[0], "key up releases PB0");
+    });
+}
+
+/// A Verilog tab opens with tree-sitter highlighting and none of the C++
+/// analysis products (flow, structure, sizes) — and no clangd.
+#[gpui::test]
+async fn verilog_tab_opens_highlighted_without_lsp(cx: &mut TestAppContext) {
+    let (dir, file) = test_hw_workspace();
+    let (deps, app_rx, _hw_rx) = test_deps_hw(dir);
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(file.clone());
+        cx.notify();
+    });
+    app.update_in(cx, |app, _w, _cx| {
+        let tab = app.editor.active_tab().expect("blink.v is open");
+        assert!(tab.span_count() > 0, "Verilog highlight spans exist");
+        assert!(tab.flow.segments.is_empty(), "no C++ flow analysis");
+        assert!(tab.symbols.is_empty(), "no C++ structure symbols");
+        assert!(tab.sizes.is_empty(), "no C++ size annotations");
+    });
+}
+
+/// Saving an HDL file in hardware mode sends a Recompile to the engine and
+/// marks the panel as compiling.
+#[gpui::test]
+async fn save_in_hardware_mode_triggers_recompile_command(cx: &mut TestAppContext) {
+    use jade_hw::HwCommand;
+
+    let (dir, file) = test_hw_workspace();
+    let (deps, app_rx, mut hw_rx) = test_deps_hw(dir);
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(file.clone());
+        cx.notify();
+    });
+    cx.run_until_parked();
+    while hw_rx.try_recv().is_ok() {}
+
+    app.update_in(cx, |app, _w, _cx| {
+        app.editor_save();
+        assert!(app.hw.as_ref().unwrap().compiling, "save marks the panel compiling");
+    });
+    let mut cmds = Vec::new();
+    while let Ok(c) = hw_rx.try_recv() {
+        cmds.push(c);
+    }
+    assert!(
+        cmds.contains(&HwCommand::Recompile),
+        "the save reached the engine as a Recompile: {cmds:?}"
+    );
+}
+
+/// The schematic follows the selected editor tab: opening a second Verilog
+/// file sends its path to the engine, and the same tab sends nothing twice.
+#[gpui::test]
+async fn schematic_follows_the_selected_tab(cx: &mut TestAppContext) {
+    use jade_hw::HwCommand;
+
+    let (dir, file) = test_hw_workspace();
+    let other = dir.join("uart.v");
+    std::fs::write(&other, "module uart (input wire clk);\nendmodule\n").unwrap();
+
+    let (deps, app_rx, mut hw_rx) = test_deps_hw(dir);
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(file.clone());
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let mut cmds = Vec::new();
+    while let Ok(c) = hw_rx.try_recv() {
+        cmds.push(c);
+    }
+    assert!(
+        cmds.contains(&HwCommand::SchematicFor(Some(file.clone()))),
+        "the first tab reached the engine: {cmds:?}"
+    );
+
+    // The same tab stays selected: the render loop must stay quiet.
+    app.update_in(cx, |_app, _w, cx| cx.notify());
+    cx.run_until_parked();
+    assert!(
+        hw_rx.try_recv().is_err(),
+        "an unchanged selection sends no command"
+    );
+
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(other.clone());
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let mut cmds = Vec::new();
+    while let Ok(c) = hw_rx.try_recv() {
+        cmds.push(c);
+    }
+    assert!(
+        cmds.contains(&HwCommand::SchematicFor(Some(other.clone()))),
+        "the new tab reached the engine: {cmds:?}"
+    );
+}
+
+/// The chosen mode persists in the workspace `ui` blob and comes back on the
+/// next open of the same folder.
+#[gpui::test]
+async fn mode_persists_across_reopen(cx: &mut TestAppContext) {
+    use crate::app::AppMode;
+
+    let (dir, file) = test_hw_workspace();
+    let (deps, app_rx, _hw_rx) = test_deps_hw(dir.clone());
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(file.clone());
+        app.save_ui_state();
+        cx.notify();
+    });
+
+    let ui = crate::workspace_state::load(&dir);
+    assert_eq!(ui.mode.as_deref(), Some("hardware"), "mode persisted");
+
+    // A fresh app over the same folder resolves back into hardware mode
+    // WITHOUT the --hardware flag or a pending welcome pick.
+    let (dir2, _f2) = test_workspace();
+    let (mut deps2, app_rx2) = test_deps(dir2);
+    let (hw_tx2, _hw_rx2) = tokio::sync::mpsc::unbounded_channel();
+    deps2.hw_tx = Some(hw_tx2);
+    let (app2, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps2, app_rx2));
+    app2.update_in(cx, |app, _w, cx| {
+        assert_eq!(app.mode, AppMode::Software, "the C++ folder stays software");
+        app.open_project(dir.clone());
+        assert_eq!(app.mode, AppMode::Hardware, "the persisted mode comes back");
+        assert!(app.hw.is_some());
+        cx.notify();
+    });
+}
+
+/// The Schematic tab (hardware mode): a Netlist event renders the RTL graph
+/// in the bottom panel; software mode never shows the tab.
+#[gpui::test]
+async fn schematic_tab_renders_the_netlist(cx: &mut TestAppContext) {
+    use crate::app::{AppEvent, BottomView};
+    use jade_hw::netlist::{NetEdge, NetNode, Netlist, NodeKind};
+    use jade_hw::HwEvent;
+
+    let (dir, file) = test_hw_workspace();
+    let (deps, app_rx, _hw_rx) = test_deps_hw(dir);
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(file.clone());
+        // A tiny graph: clk → reg count → NOT → led.
+        let nl = Netlist {
+            top: "blink".into(),
+            nodes: vec![
+                NetNode { id: 0, kind: NodeKind::Input, label: "clk".into(), width: 1, clock: None, layer: 0 },
+                NetNode { id: 1, kind: NodeKind::Reg, label: "count".into(), width: 26, clock: Some("clk".into()), layer: 1 },
+                NetNode { id: 2, kind: NodeKind::Op, label: "~".into(), width: 5, clock: None, layer: 1 },
+                NetNode { id: 3, kind: NodeKind::Output, label: "led".into(), width: 5, clock: None, layer: 2 },
+            ],
+            edges: vec![
+                NetEdge { from: 1, to: 2, to_pin: 0, label: Some("[25:21]".into()), width: 5 },
+                NetEdge { from: 2, to: 3, to_pin: 0, label: None, width: 5 },
+            ],
+        };
+        app.apply_app_event(AppEvent::Hw(HwEvent::Netlist(nl)));
+        app.bottom_view = BottomView::Schematic;
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    assert!(
+        cx.debug_bounds("schematic-body").is_some(),
+        "the schematic body renders in hardware mode"
+    );
+    app.update_in(cx, |app, _w, _cx| {
+        assert!(app.hw.as_ref().unwrap().netlist.is_some());
+    });
+}
+
+/// The schematic's gate view: the eyebrow toggle sends `SchematicGates` to
+/// the engine, a `GateNetlist` event renders in gate mode, and a missing
+/// yosys stores the install hint.
+#[gpui::test]
+async fn schematic_gate_view_toggles_and_renders(cx: &mut TestAppContext) {
+    use crate::app::{AppEvent, BottomView};
+    use jade_hw::netlist::{NetEdge, NetNode, Netlist, NodeKind};
+    use jade_hw::{HwCommand, HwEvent};
+
+    let (dir, file) = test_hw_workspace();
+    let (deps, app_rx, mut hw_rx) = test_deps_hw(dir);
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(file.clone());
+        app.hw_toggle_schematic_gates();
+        let hw = app.hw.as_ref().unwrap();
+        assert!(hw.schematic_gates);
+        assert!(hw.synthesizing, "no gate graph yet: the wait state shows");
+
+        // The synthesized graph arrives: a AND-into-register circuit.
+        let nl = Netlist {
+            top: "blink".into(),
+            nodes: vec![
+                NetNode { id: 0, kind: NodeKind::Input, label: "a".into(), width: 2, clock: None, layer: 0 },
+                NetNode { id: 1, kind: NodeKind::Op, label: "&".into(), width: 1, clock: None, layer: 1 },
+                NetNode { id: 2, kind: NodeKind::Reg, label: "q".into(), width: 1, clock: Some("clk".into()), layer: 0 },
+                NetNode { id: 3, kind: NodeKind::Output, label: "y".into(), width: 1, clock: None, layer: 2 },
+            ],
+            edges: vec![
+                NetEdge { from: 0, to: 1, to_pin: 0, label: Some("[0]".into()), width: 1 },
+                NetEdge { from: 0, to: 1, to_pin: 1, label: Some("[1]".into()), width: 1 },
+                NetEdge { from: 1, to: 2, to_pin: 0, label: None, width: 1 },
+                NetEdge { from: 2, to: 3, to_pin: 0, label: None, width: 1 },
+            ],
+        };
+        app.apply_app_event(AppEvent::Hw(HwEvent::GateNetlist(nl)));
+        let hw = app.hw.as_ref().unwrap();
+        assert!(hw.gate_netlist.is_some());
+        assert!(!hw.synthesizing);
+        app.bottom_view = BottomView::Schematic;
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    assert!(
+        cx.debug_bounds("schematic-body").is_some(),
+        "the gate graph renders in the schematic body"
+    );
+    let mut cmds = Vec::new();
+    while let Ok(c) = hw_rx.try_recv() {
+        cmds.push(c);
+    }
+    assert!(
+        cmds.contains(&HwCommand::SchematicGates(true)),
+        "the toggle reached the engine: {cmds:?}"
+    );
+
+    // A missing yosys reports the install hint and ends the wait state.
+    app.update_in(cx, |app, _w, cx| {
+        app.apply_app_event(AppEvent::Hw(HwEvent::SchematicSynthMissing {
+            install_hint: "brew install yosys".into(),
+        }));
+        let hw = app.hw.as_ref().unwrap();
+        assert_eq!(hw.synth_missing.as_deref(), Some("brew install yosys"));
+        assert!(!hw.synthesizing);
+        // The toggle back returns to the RTL view.
+        app.hw_toggle_schematic_gates();
+        assert!(!app.hw.as_ref().unwrap().schematic_gates);
+        cx.notify();
+    });
+}
+
+/// Markdown preview panel: it opens by itself on a `.md` tab, a block click
+/// enters preview-edit mode (raw source + buffer caret), typed text lands in
+/// the buffer through the normal editor path, Escape returns to the rendered
+/// view, and ⌘⇧D hides the panel.
+#[gpui::test]
+async fn markdown_preview_edits_in_both_views(cx: &mut TestAppContext) {
+    let (dir, _file) = test_workspace();
+    let md = dir.join("README.md");
+    std::fs::write(&md, "# Title\n\nHello world paragraph.\n\n- item one\n").unwrap();
+    let (deps, app_rx) = test_deps(dir);
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(md.clone());
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    // The preview opens by itself on a Markdown tab.
+    assert!(cx.debug_bounds("markdown-panel").is_some(), "panel opens on the .md tab");
+    assert!(cx.debug_bounds("md-block-0").is_some(), "heading block rendered");
+
+    // A click on the heading block enters preview-edit mode: the caret moves
+    // to the block's first row and the block shows raw source.
+    let b = cx.debug_bounds("md-block-0").unwrap();
+    cx.simulate_click(b.center(), Modifiers::default());
+    cx.run_until_parked();
+    app.update_in(cx, |app, _w, _cx| {
+        assert!(app.md_edit, "preview click enters edit mode");
+        assert_eq!(app.editor.active_tab().unwrap().caret_point().row, 0);
+    });
+    assert!(cx.debug_bounds("md-raw-0").is_some(), "clicked block shows raw source");
+
+    // Typing goes through the editor pipeline into the shared buffer.
+    cx.simulate_keystrokes("cmd-right");
+    cx.simulate_input("!!");
+    app.update_in(cx, |app, _w, _cx| {
+        let tab = app.editor.active_tab().unwrap();
+        assert_eq!(tab.line(0), "# Title!!", "typed text reached the buffer");
+        assert!(tab.buffer.is_dirty());
+    });
+    cx.run_until_parked();
+
+    // Escape leaves preview-edit mode; the raw block renders again as prose.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    app.update_in(cx, |app, _w, _cx| {
+        assert!(!app.md_edit, "escape leaves edit mode");
+    });
+    assert!(cx.debug_bounds("md-raw-0").is_none());
+    assert!(cx.debug_bounds("md-block-0").is_some());
+
+    // An edit made in the CODE view reshapes the preview: a new heading at the
+    // end of the file becomes a new block.
+    app.update_in(cx, |app, _w, cx| {
+        let tab = app.editor.active_tab_mut().unwrap();
+        let end = tab.buffer.len_bytes();
+        tab.buffer.set_caret(end);
+        cx.notify();
+    });
+    cx.simulate_input("\n## Second\n");
+    cx.run_until_parked();
+    app.update_in(cx, |app, _w, _cx| {
+        let tab = app.editor.active_tab().unwrap();
+        let row = tab.line_count() - 2;
+        assert_eq!(tab.line(row), "## Second");
+    });
+
+    // ⌘⇧D hides the panel again.
+    cx.simulate_keystrokes("cmd-shift-d");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("markdown-panel").is_none());
+}
+
+/// The panel opens only for Markdown tabs, and it takes the right slot from
+/// the runtime sidebar while a `.md` tab is in front.
+#[gpui::test]
+async fn markdown_preview_gates_on_the_active_tab(cx: &mut TestAppContext) {
+    let (dir, cpp) = test_workspace();
+    let md = dir.join("notes.md");
+    std::fs::write(&md, "plain paragraph\n").unwrap();
+    let (deps, app_rx) = test_deps(dir);
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(cpp.clone());
+        // Show the runtime sidebar (off by default), so the test proves the
+        // preview takes its slot.
+        app.runtime_visible = true;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("markdown-panel").is_none(),
+        "no panel for a C++ tab"
+    );
+    assert!(
+        cx.debug_bounds("runtime-sidebar").is_some(),
+        "runtime sidebar in place on a C++ tab"
+    );
+
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(md.clone());
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("markdown-panel").is_some(),
+        "panel appears on the .md tab"
+    );
+    assert!(
+        cx.debug_bounds("runtime-sidebar").is_none(),
+        "the preview takes the runtime sidebar's slot"
+    );
+}
+
+/// The preview is universal: in hardware mode a Markdown tab replaces the
+/// board panel, and a Verilog tab brings the board back.
+#[gpui::test]
+async fn markdown_preview_replaces_the_board_in_hardware_mode(cx: &mut TestAppContext) {
+    let (dir, file) = test_hw_workspace();
+    let md = dir.join("README.md");
+    std::fs::write(&md, "# Board notes\n").unwrap();
+    let (deps, app_rx, _hw_rx) = test_deps_hw(dir);
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(md.clone());
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("markdown-panel").is_some(),
+        "preview renders in hardware mode"
+    );
+    assert!(
+        cx.debug_bounds("board-panel").is_none(),
+        "the preview takes the board's slot"
+    );
+
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(file.clone());
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("markdown-panel").is_none());
+    assert!(
+        cx.debug_bounds("board-panel").is_some(),
+        "the board returns on a Verilog tab"
+    );
+}

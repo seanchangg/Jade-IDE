@@ -575,6 +575,7 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
             app.editor_text_left.clone(),
             app.editor_rows.clone(),
             app.editor_char_w.clone(),
+            (app.editor_w.clone(), app.editor_h.clone()),
             handle.clone(),
             entity,
         ));
@@ -603,6 +604,16 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
     }
     if let Some(popup) = signature_popup(app, flow_visible_now, scroll_top) {
         container = container.child(popup);
+    }
+    // The Explain card (§4.14) paints above the other popups: it is the one
+    // the user summoned deliberately, so it wins any overlap.
+    if let Some(card) = super::explain_card::render(app, flow_visible_now, scroll_top, cx) {
+        container = container.child(card);
+    }
+    // The Visualize card (§4.15) paints last: opened last wins any overlap
+    // with an Explain card, and both stay usable.
+    if let Some(card) = super::visualize_card::render(app, flow_visible_now, scroll_top, cx) {
+        container = container.child(card);
     }
     container.into_any_element()
 }
@@ -1011,6 +1022,10 @@ fn ime_geometry_canvas(
     text_left: std::sync::Arc<std::sync::atomic::AtomicU32>,
     rows_store: std::sync::Arc<std::sync::atomic::AtomicU32>,
     char_w_store: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    size_store: (
+        std::sync::Arc<std::sync::atomic::AtomicU32>,
+        std::sync::Arc<std::sync::atomic::AtomicU32>,
+    ),
     handle: FocusHandle,
     entity: Entity<JadeApp>,
 ) -> impl IntoElement {
@@ -1033,6 +1048,11 @@ fn ime_geometry_canvas(
             }
             let h = f32::from(bounds.size.height);
             rows_store.store(((h / LINE_H).floor() as u32).max(1), Ordering::Relaxed);
+            // The editor's own box, so a floating card can clamp itself to it
+            // (`panels::explain_card::clamp_card`). Same capture-per-frame
+            // trick as `text_left` above — layout is only known at paint.
+            size_store.0.store(f32::from(bounds.size.width).to_bits(), Ordering::Relaxed);
+            size_store.1.store(h.to_bits(), Ordering::Relaxed);
             let region = Bounds::new(
                 point(px(left), bounds.origin.y + px(PAD_TOP)),
                 size(bounds.size.width, bounds.size.height),
@@ -1050,7 +1070,7 @@ fn ime_geometry_canvas(
 /// margin, for anchoring the floating popups inside the editor container. The
 /// code text scrolls horizontally under the fixed gutter, so `h_scroll` (the
 /// list's horizontal offset, ≤ 0) is folded in to keep popups under the glyph.
-fn popup_x(col: usize, flow_visible: bool, char_w: f32, h_scroll: f32) -> f32 {
+pub fn popup_x(col: usize, flow_visible: bool, char_w: f32, h_scroll: f32) -> f32 {
     let glyph = if flow_visible { GLYPH_W } else { 0.0 };
     8.0 + GUTTER_W + FOLD_W + glyph + editor_view::col_to_px(col, char_w) + h_scroll
 }
@@ -1065,8 +1085,15 @@ fn display_col(app: &JadeApp, row: usize, col: usize) -> usize {
         .unwrap_or(col)
 }
 
+/// The y pixel of the TOP of `row` itself, given the current scroll top —
+/// what a popup flipped ABOVE an anchor measures back from.
+pub fn row_top(row: usize, scroll_top: usize) -> f32 {
+    let rel = row.saturating_sub(scroll_top);
+    PAD_TOP + rel as f32 * LINE_H
+}
+
 /// The y pixel (top) of the row below `row`, given the current scroll top.
-fn popup_y(row: usize, scroll_top: usize) -> f32 {
+pub fn popup_y(row: usize, scroll_top: usize) -> f32 {
     let rel = row.saturating_sub(scroll_top);
     PAD_TOP + (rel as f32 + 1.0) * LINE_H
 }
@@ -1320,7 +1347,15 @@ pub fn tab_strip(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> imp
 
     for (i, tab) in app.editor.tabs.iter().enumerate() {
         let active = app.editor.active == Some(i);
-        strip = strip.child(tab_chip(i, &tab.name, active, tab.buffer.is_dirty(), theme, cx));
+        strip = strip.child(tab_chip(
+            i,
+            &tab.name,
+            active,
+            tab.buffer.is_dirty(),
+            tab.preview,
+            theme,
+            cx,
+        ));
     }
     // XP bar in the tab-bar right slot (§4.10): flex spacer pushes it to the edge.
     strip
@@ -1377,6 +1412,7 @@ fn tab_chip(
     name: &str,
     active: bool,
     dirty: bool,
+    preview: bool,
     theme: &Theme,
     cx: &mut Context<JadeApp>,
 ) -> impl IntoElement {
@@ -1413,7 +1449,14 @@ fn tab_chip(
             app.schedule_ui_save(cx);
             cx.notify();
         }))
-        .child(div().child(name.to_string()));
+        .child({
+            // A preview ("temp") tab shows its name in italic, VS Code-style.
+            let mut label = div().child(name.to_string());
+            if preview {
+                label = label.italic();
+            }
+            label
+        });
 
     if active {
         // `isUnderline && "absolute bottom-0 h-0.5 bg-kumo-brand"`.

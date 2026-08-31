@@ -115,3 +115,38 @@ fn to_string_roundtrips() {
     let text = "line1\n  indented\n🎉 end";
     assert_eq!(Buffer::from_text(text).to_string(), text);
 }
+
+// ── text_range ───────────────────────────────────────────────────────────────
+
+#[test]
+fn text_range_returns_just_the_slice() {
+    let b = Buffer::from_text("hello world");
+    assert_eq!(b.text_range(0..5), "hello");
+    assert_eq!(b.text_range(6..11), "world");
+    assert_eq!(b.text_range(0..0), "");
+}
+
+#[test]
+fn text_range_spans_lines() {
+    let b = Buffer::from_text("one\ntwo\nthree");
+    assert_eq!(b.text_range(4..11), "two\nthr");
+}
+
+/// A selection that outlived an edit must not panic the caller.
+#[test]
+fn text_range_clamps_out_of_bounds() {
+    let b = Buffer::from_text("abc");
+    assert_eq!(b.text_range(0..999), "abc");
+    assert_eq!(b.text_range(999..1000), "");
+    assert_eq!(b.text_range(2..1), "");
+}
+
+/// Slicing a multi-byte character in half would panic inside ropey.
+#[test]
+fn text_range_snaps_to_char_boundaries() {
+    let b = Buffer::from_text("h\u{e9}llo");
+    // Bytes 1..3 are exactly the two bytes of 'é'.
+    assert_eq!(b.text_range(1..3), "\u{e9}");
+    // A start inside the character widens outward rather than panicking.
+    assert_eq!(b.text_range(2..3), "\u{e9}");
+}
