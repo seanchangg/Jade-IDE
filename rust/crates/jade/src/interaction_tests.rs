@@ -1344,6 +1344,81 @@ async fn signature_hint_renders(cx: &mut TestAppContext) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Regression for the abort on "delete the `#include` lines under a hover".
+/// The hover popup keeps a buffer row. A delete that shortens the buffer must
+/// hide the popup, and a stale row that still reaches the render must not
+/// read a line past the end of the buffer.
+#[gpui::test]
+async fn hover_survives_line_deletion(cx: &mut TestAppContext) {
+    let (dir, _cpp) = test_workspace();
+    let file = dir.join("hdr.h");
+    std::fs::write(&file, "#include <a>\n#include <b>\n#include <c>\n").unwrap();
+    let (deps, app_rx) = test_deps(dir.clone());
+
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _window, cx| {
+        app.open_file(file.clone());
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    // Focus the editor with a real click on the last include line.
+    let cell = cx
+        .debug_bounds("code-cell-2")
+        .expect("code cell for row 2 was painted");
+    cx.simulate_click(
+        point(
+            cell.origin.x + px(1.0),
+            cell.origin.y + px(crate::panels::code_view::LINE_H / 2.0),
+        ),
+        Modifiers::default(),
+    );
+
+    // A squiggle tooltip sits on row 2, then the user selects all three
+    // include lines and presses Backspace.
+    app.update_in(cx, |app, _w, cx| {
+        app.hover = Some(crate::app::HoverState {
+            text: String::new(),
+            row: 2,
+            col: 3,
+            diagnostics: vec![(None, "included header is not used".into())],
+        });
+        select_bytes(app, 0..39);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("backspace");
+    cx.run_until_parked();
+
+    app.update_in(cx, |app, _w, _cx| {
+        let tab = app.editor.active_tab().unwrap();
+        assert_eq!(tab.buffer.to_string(), "", "the three lines are gone");
+        assert!(app.hover.is_none(), "an edit hides the hover popup");
+    });
+
+    // A late LSP reply can still land a row past the end. The render must
+    // clamp instead of abort.
+    app.update_in(cx, |app, _w, cx| {
+        app.hover = Some(crate::app::HoverState {
+            text: "int a".into(),
+            row: 2,
+            col: 3,
+            diagnostics: Vec::new(),
+        });
+        app.signature = Some(crate::app::SignatureState {
+            label: "f(int x)".into(),
+            active_param: Some(2..7),
+            anchor: (2, 3),
+        });
+        cx.notify();
+    });
+    cx.run_until_parked();
+    app.update_in(cx, |app, _w, _cx| {
+        assert!(app.hover.is_some(), "the frame painted with a stale hover row");
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// After the code list scrolls horizontally, a click at the same physical pixel
 /// must map to a column shifted by the scroll amount (the click→column mapping
 /// folds in `editor_h_scroll`). Regression for "everything misaligns when I

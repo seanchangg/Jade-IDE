@@ -1404,6 +1404,7 @@ pub fn popup_x(col: usize, flow_visible: bool, char_w: f32, h_scroll: f32) -> f3
 fn display_col(app: &JadeApp, row: usize, col: usize) -> usize {
     app.editor
         .active_tab()
+        .filter(|t| row < t.line_count())
         .map(|t| editor_view::DisplayLine::new(t.line(row)).display_col(col))
         .unwrap_or(col)
 }

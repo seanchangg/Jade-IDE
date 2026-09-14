@@ -4678,6 +4678,13 @@ impl JadeApp {
     fn after_edit(&mut self, record: jade_buffer::EditRecord, cx: &mut Context<Self>) {
         self.unfold_at_caret();
         self.caret_activity();
+        // Hide the hover popup on every edit. The popup keeps a buffer row, and
+        // an edit that removes lines can leave that row past the end of the
+        // buffer. The render then reads a line that does not exist and panics.
+        // The generation bump drops a late LSP hover reply for the same row.
+        self.hover = None;
+        self.hover_target = None;
+        self.hover_gen += 1;
         let now = self.now_ms();
         let payload = self.editor.active_tab_mut().map(|tab| {
             tab.on_edited(now);
