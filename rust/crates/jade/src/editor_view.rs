@@ -469,6 +469,53 @@ impl EditorState {
         }
     }
 
+    /// Remove a tab and hand it back (a move to another pane). The active
+    /// index adjusts the same way as [`close`](Self::close).
+    pub fn detach(&mut self, index: usize) -> Option<OpenTab> {
+        if index >= self.tabs.len() {
+            return None;
+        }
+        let was_active = self.active == Some(index);
+        let tab = self.tabs.remove(index);
+        if self.tabs.is_empty() {
+            self.active = None;
+        } else if was_active {
+            self.active = Some(index.min(self.tabs.len() - 1));
+        } else if let Some(a) = self.active {
+            if index < a {
+                self.active = Some(a - 1);
+            }
+        }
+        Some(tab)
+    }
+
+    /// Insert a tab before `before` (else at the end) and make it active.
+    /// A tab for the same path already here wins; the given one drops.
+    pub fn insert_tab(&mut self, tab: OpenTab, before: Option<usize>) -> usize {
+        if let Some(i) = self.index_of(&tab.path) {
+            self.active = Some(i);
+            return i;
+        }
+        let at = before.unwrap_or(self.tabs.len()).min(self.tabs.len());
+        self.tabs.insert(at, tab);
+        self.active = Some(at);
+        at
+    }
+
+    /// Move the tab at `from` so it sits before the tab that is at `to` now
+    /// (`to == len` moves it to the end). The active tab stays the same tab.
+    pub fn reorder(&mut self, from: usize, to: usize) {
+        if from >= self.tabs.len() {
+            return;
+        }
+        let active_path = self.active_path();
+        let to = to.min(self.tabs.len());
+        let tab = self.tabs.remove(from);
+        let dest = if to > from { to - 1 } else { to };
+        self.tabs.insert(dest, tab);
+        self.active = active_path.and_then(|p| self.index_of(&p));
+    }
+
     pub fn active_tab(&self) -> Option<&OpenTab> {
         self.active.and_then(|i| self.tabs.get(i))
     }
@@ -592,16 +639,14 @@ pub fn fold_regions(text: &str) -> HashMap<usize, usize> {
             '\\' if in_str || in_chr => esc = true,
             '"' if !in_chr && !in_line_c && !in_block_c => in_str = !in_str,
             '\'' if !in_str && !in_line_c && !in_block_c => in_chr = !in_chr,
-            '/' if !in_str && !in_chr && !in_block_c && !in_line_c => {
-                match chars.peek() {
-                    Some('/') => in_line_c = true,
-                    Some('*') => {
-                        chars.next();
-                        in_block_c = true;
-                    }
-                    _ => {}
+            '/' if !in_str && !in_chr && !in_block_c && !in_line_c => match chars.peek() {
+                Some('/') => in_line_c = true,
+                Some('*') => {
+                    chars.next();
+                    in_block_c = true;
                 }
-            }
+                _ => {}
+            },
             '*' if in_block_c => {
                 if chars.peek() == Some(&'/') {
                     chars.next();
@@ -908,7 +953,10 @@ pub fn diagnostic_underlines_for_row(
     let line_len_u16 = line_utf16_len(buffer, row);
     let mut out = Vec::new();
     for d in diagnostics {
-        let start = (d.range.start.line as usize, d.range.start.character as usize);
+        let start = (
+            d.range.start.line as usize,
+            d.range.start.character as usize,
+        );
         let end = (d.range.end.line as usize, d.range.end.character as usize);
         if let Some((sc, ec)) = diag_span_on_row(start, end, row, line_len_u16) {
             let sb = buffer.lsp_to_offset(LspPosition::new(row, sc)) - line_start;
@@ -919,6 +967,35 @@ pub fn diagnostic_underlines_for_row(
         }
     }
     out
+}
+
+/// The diagnostics whose range covers the character column `col` on `row`.
+/// `col` is a char index into the row (what [`px_to_char_col`] returns). The
+/// match uses the same per-row span as the underline, so a hover over any part
+/// of a squiggle finds its diagnostic. Order follows the diagnostics list.
+pub fn diagnostics_at<'a>(
+    diagnostics: &'a [Diagnostic],
+    buffer: &Buffer,
+    row: usize,
+    col: usize,
+) -> Vec<&'a Diagnostic> {
+    let line = buffer.line(row);
+    let col_u16: usize = line.chars().take(col).map(|c| c.len_utf16()).sum();
+    let line_len_u16: usize = line.chars().map(|c| c.len_utf16()).sum();
+    diagnostics
+        .iter()
+        .filter(|d| {
+            let start = (
+                d.range.start.line as usize,
+                d.range.start.character as usize,
+            );
+            let end = (d.range.end.line as usize, d.range.end.character as usize);
+            match diag_span_on_row(start, end, row, line_len_u16) {
+                Some((s, e)) => s <= col_u16 && col_u16 < e,
+                None => false,
+            }
+        })
+        .collect()
 }
 
 /// Count severities across a diagnostics list → (errors, warnings, infos). Hints
@@ -975,7 +1052,13 @@ pub fn completion_edit(
     // fills in its parameters as editable text (the signature hint shows them
     // too); tabstops/variables are dropped.
     let is_snippet = item.insert_text_format == Some(lsp_types::InsertTextFormat::SNIPPET);
-    let expand = |text: String| if is_snippet { strip_snippet(&text) } else { text };
+    let expand = |text: String| {
+        if is_snippet {
+            strip_snippet(&text)
+        } else {
+            text
+        }
+    };
 
     if let Some(te) = &item.text_edit {
         let (range, text) = match te {
@@ -1198,7 +1281,11 @@ mod tests {
     use lsp_types::TextEdit;
 
     fn tab_from(name: &str, text: &str) -> OpenTab {
-        OpenTab::from_text(&PathBuf::from(format!("/x/{name}")), text, TokenPalette::jade_dark())
+        OpenTab::from_text(
+            &PathBuf::from(format!("/x/{name}")),
+            text,
+            TokenPalette::jade_dark(),
+        )
     }
 
     #[test]
@@ -1369,7 +1456,7 @@ mod tests {
         assert_eq!(d.text, "    int x");
         assert_eq!(d.map_range(1..4), 4..7); // "int"
         assert_eq!(d.map_range(5..6), 8..9); // "x"
-        // A multi-byte char keeps its whole span (bytes map to the char start).
+                                             // A multi-byte char keeps its whole span (bytes map to the char start).
         let d = DisplayLine::new("\tü".to_string());
         assert_eq!(d.map_range(1..3), 4..6);
     }
@@ -1382,7 +1469,7 @@ mod tests {
         assert_eq!(px_to_char_col("\tx", 15.0, 8.0), 0);
         assert_eq!(px_to_char_col("\tx", 18.0, 8.0), 1); // 2.25 cols → the 'x'
         assert_eq!(px_to_char_col("\tx", 999.0, 8.0), 2); // clamps past EOL
-        // No tab → same rounding as px_to_col.
+                                                          // No tab → same rounding as px_to_col.
         assert_eq!(px_to_char_col("abcd", 11.0, 8.0), 1);
         assert_eq!(px_to_char_col("abcd", 13.0, 8.0), 2);
     }
@@ -1458,6 +1545,43 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_at_finds_the_squiggle_under_the_pointer() {
+        let buf = Buffer::from_text("int x = 1;\nlong yy = 2;\n");
+        let mk = |sl, sc, el, ec, msg: &str| Diagnostic {
+            range: LspR {
+                start: Position::new(sl, sc),
+                end: Position::new(el, ec),
+            },
+            message: msg.to_string(),
+            ..Default::default()
+        };
+        let ds = vec![
+            mk(1, 5, 1, 7, "unused variable 'yy'"),
+            mk(0, 4, 1, 4, "spans two rows"),
+            mk(0, 4, 0, 4, "zero width"),
+        ];
+        // Inside "yy" and inside the two-row span's tail.
+        let hit: Vec<_> = diagnostics_at(&ds, &buf, 1, 5)
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect();
+        assert_eq!(hit, vec!["unused variable 'yy'"]);
+        let hit: Vec<_> = diagnostics_at(&ds, &buf, 1, 2)
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect();
+        assert_eq!(hit, vec!["spans two rows"]);
+        // The zero-width diagnostic covers one column, so col 4 hits both.
+        let hit: Vec<_> = diagnostics_at(&ds, &buf, 0, 4)
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect();
+        assert_eq!(hit, vec!["spans two rows", "zero width"]);
+        // Past the end of "yy": nothing.
+        assert!(diagnostics_at(&ds, &buf, 1, 7).is_empty());
+    }
+
+    #[test]
     fn diagnostic_counts_by_severity() {
         let mk = |s| Diagnostic {
             severity: Some(s),
@@ -1478,7 +1602,12 @@ mod tests {
             label: l.to_string(),
             ..Default::default()
         };
-        let items = vec![mk("push_back"), mk("pop_back"), mk("push_front"), mk("size")];
+        let items = vec![
+            mk("push_back"),
+            mk("pop_back"),
+            mk("push_front"),
+            mk("size"),
+        ];
         let f = completion_filter(&items, "pu");
         assert_eq!(f, vec![0, 2]); // push_back, push_front
         assert_eq!(completion_filter(&items, "").len(), 4);
@@ -1522,7 +1651,10 @@ mod tests {
     #[test]
     fn strip_snippet_keeps_parameter_defaults() {
         // The exact clangd shape for a two-arg call.
-        assert_eq!(strip_snippet("foo(${1:int a}, ${2:int b})"), "foo(int a, int b)");
+        assert_eq!(
+            strip_snippet("foo(${1:int a}, ${2:int b})"),
+            "foo(int a, int b)"
+        );
         // Bare tabstops and the final `$0` vanish; `()` stays.
         assert_eq!(strip_snippet("bar($1)$0"), "bar()");
         assert_eq!(strip_snippet("baz(${1})"), "baz()");
@@ -1582,7 +1714,7 @@ mod tests {
         let sel = Selection::new(2, 7);
         assert_eq!(selection_on_line(sel, 0, 4), Some(2..4)); // row 0: cols 2..4
         assert_eq!(selection_on_line(sel, 5, 9), Some(0..2)); // row 1: cols 0..2
-        // A row entirely outside.
+                                                              // A row entirely outside.
         assert_eq!(selection_on_line(sel, 10, 14), None);
     }
 
@@ -1715,7 +1847,7 @@ mod fold_tests {
         t.folds.insert(5); // fold the namespace: hides 6..=8, keeps 9
         let vis = t.visible_rows();
         assert_eq!(vis, vec![0, 1, 2, 3, 4, 5, 9, 10]); // 10 = trailing empty line
-        // folding the inner fn alone (namespace open) hides only 7
+                                                        // folding the inner fn alone (namespace open) hides only 7
         t.folds.clear();
         t.folds.insert(6);
         assert_eq!(t.visible_rows(), vec![0, 1, 2, 3, 4, 5, 6, 8, 9, 10]);

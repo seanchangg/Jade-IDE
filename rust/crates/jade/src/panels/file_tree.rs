@@ -22,28 +22,6 @@ use crate::workspace_tree::{FileKind, Row};
 pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> impl IntoElement {
     let theme = app.theme.clone();
 
-    // Header: FILES + a (non-functional) minimize placeholder.
-    let header = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .justify_between()
-        .child(
-            KumoText::new("Files")
-                .tone(TextTone::Secondary)
-                .size(KumoSize::Xs)
-                .medium(true)
-                .render(&theme.kumo),
-        )
-        .child(
-            div()
-                .id("files-minimize")
-                .flex()
-                .items_center()
-                .text_color(rgb(theme.muted))
-                .child(crate::assets::ui_icon("minus", 14., theme.muted)),
-        );
-
     let mut list = div().flex().flex_col().w_full();
 
     match &app.tree {
@@ -62,10 +40,12 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> impl IntoElement {
         }
         None => {
             list = list.child(
-                div()
-                    .text_color(rgb(theme.muted))
-                    .text_xs()
-                    .child("Open a folder to get started"),
+                div().px(scale::SPACE_2).py(scale::SPACE_1_5).child(
+                    KumoText::new("Open a folder to get started")
+                        .tone(TextTone::Secondary)
+                        .size(KumoSize::Xs)
+                        .render(&theme.kumo),
+                ),
             );
         }
     }
@@ -73,8 +53,6 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> impl IntoElement {
     div()
         .flex()
         .flex_col()
-        .gap_2()
-        .child(header)
         .child(div().id("file-tree-scroll").flex_1().overflow_y_scroll().child(list))
 }
 
@@ -85,7 +63,7 @@ fn tree_row(
     theme: &Theme,
     cx: &mut Context<JadeApp>,
 ) -> impl IntoElement {
-    let indent = 12.0 + row.depth as f32 * 16.0;
+    let indent = 8.0 + row.depth as f32 * 14.0;
     let is_active = active == Some(row.path.as_path());
     // The selected row is the one a new terminal opens in (§5.2). A directory
     // shows it; for a file the active-tab highlight already says the same thing.
@@ -102,17 +80,9 @@ fn tree_row(
         kind_glyph(row.kind, theme)
     };
 
-    // Label color: source accent, header types-color, dirs/others default text.
-    // Other kinds keep the plain text color so the icon carries the type.
-    let label_color = if is_active {
-        theme.accent
-    } else {
-        match (row.is_dir, row.kind) {
-            (false, FileKind::Source) => theme.accent,
-            (false, FileKind::Header) => theme.blue_gray,
-            _ => theme.text,
-        }
-    };
+    // Label color (`.file-tree-name`): the default ink, brand on the active
+    // row. The icon alone carries the file kind.
+    let label_color = if is_active { theme.accent } else { theme.text };
 
     let mut el = div()
         .id(("tree-row", row_id(&row.path)))
@@ -122,16 +92,16 @@ fn tree_row(
         .gap(scale::SPACE_1_5)
         .h(px(24.))
         .pl(px(indent))
-        .pr(scale::SPACE_1_5)
-        .rounded(scale::RADIUS_MD)
+        .pr(scale::SPACE_2)
         .text_size(scale::TEXT_XS)
         .cursor_pointer()
         // Hover affordance — Kumo's `hover:bg-kumo-fill-hover`.
         .hover(|s| s.bg(theme.kumo.fill_hover));
 
-    // The selected row keeps `bg-kumo-tint`, one step stronger than hover.
+    // The active row takes `.active-line`, the recessed step; a selected
+    // directory the same.
     if is_active || is_selected {
-        el = el.bg(theme.kumo.tint);
+        el = el.bg(theme.kumo.recessed);
     }
 
     let is_dir = row.is_dir;
@@ -160,21 +130,25 @@ fn tree_row(
 
 /// The icon name and tint for one file kind. Every name here must also appear in
 /// `assets::ICONS` (the `every_ui_icon_resolves` test guards that).
+///
+/// Color follows the old `.file-tree-icon` rules: the source kinds take the
+/// brand, headers the type color, and everything else the subtle ink — so a
+/// tree reads as one column of glyphs with the compilable files picked out.
 fn kind_glyph(kind: FileKind, theme: &Theme) -> (&'static str, u32) {
     match kind {
         FileKind::Source => ("file-code", theme.accent),
         FileKind::Header => ("code", theme.blue_gray),
         FileKind::Hdl => ("cpu", theme.accent),
-        FileKind::Shader => ("cpu", theme.amber),
-        FileKind::Script => ("file-code", theme.periwinkle),
-        FileKind::Shell => ("file-terminal", theme.periwinkle),
-        FileKind::Build => ("hammer", theme.amber),
-        FileKind::Config => ("settings", theme.blue_gray),
-        FileKind::Data => ("braces", theme.amber),
-        FileKind::Table => ("table", theme.accent),
-        FileKind::Model => ("box", theme.periwinkle),
-        FileKind::Doc => ("file-text", theme.text),
-        FileKind::Image => ("image", theme.periwinkle),
+        FileKind::Shader => ("cpu", theme.accent),
+        FileKind::Script => ("file-code", theme.muted),
+        FileKind::Shell => ("file-terminal", theme.muted),
+        FileKind::Build => ("hammer", theme.muted),
+        FileKind::Config => ("settings", theme.muted),
+        FileKind::Data => ("braces", theme.muted),
+        FileKind::Table => ("table", theme.muted),
+        FileKind::Model => ("box", theme.muted),
+        FileKind::Doc => ("file-text", theme.muted),
+        FileKind::Image => ("image", theme.muted),
         FileKind::Archive => ("package", theme.muted),
         FileKind::Lock => ("lock", theme.muted),
         FileKind::Other => ("file", theme.muted),

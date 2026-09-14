@@ -15,5 +15,5 @@ pub fn separator_h(t: &KumoTokens) -> Div {
 /// A vertical rule between toolbar clusters. Kumo's table draws this one at
 /// `h-5 w-[2px] rounded`.
 pub fn separator_v(t: &KumoTokens, height: f32) -> Div {
-    div().w(px(1.)).h(px(height)).rounded(px(1.)).bg(t.hairline)
+    div().w(px(1.)).h(px(height)).bg(t.hairline)
 }

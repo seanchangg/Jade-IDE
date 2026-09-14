@@ -58,12 +58,12 @@ pub use tokens::{dark, BeautifulTokens};
 /// ```
 pub mod radius {
     use gpui::{px, Pixels};
-    pub const CHIP: Pixels = px(6.);
-    pub const CONTROL: Pixels = px(8.);
-    pub const CARD: Pixels = px(10.);
-    pub const WINDOW: Pixels = px(14.);
+    pub const CHIP: Pixels = px(0.);
+    pub const CONTROL: Pixels = px(0.);
+    pub const CARD: Pixels = px(0.);
+    pub const WINDOW: Pixels = px(0.);
     /// `rounded-full` on a short control.
-    pub const PILL: Pixels = px(9999.);
+    pub const PILL: Pixels = px(0.);
 }
 
 /// The type scale, in half-pixel steps. Everything is 10.5–13px except one
@@ -145,7 +145,7 @@ impl Card {
     pub fn new(t: &BeautifulTokens) -> Div {
         div()
             .overflow_hidden()
-            .rounded(radius::CARD)
+            
             .bg(t.surface)
             .border_1()
             .border_color(t.line)
@@ -157,7 +157,7 @@ impl Card {
     pub fn flat(t: &BeautifulTokens) -> Div {
         div()
             .overflow_hidden()
-            .rounded(radius::CARD)
+            
             .bg(t.surface)
             .border_1()
             .border_color(t.line)
@@ -209,7 +209,7 @@ pub fn chip(t: &BeautifulTokens, label: impl Into<SharedString>) -> Div {
         .gap(px(6.))
         .h(px(22.))
         .px(px(6.))
-        .rounded(radius::CHIP)
+        
         .bg(t.field)
         .border_1()
         .border_color(t.line)
@@ -239,7 +239,7 @@ pub fn status_pill(
         .gap(px(6.))
         .h(px(22.))
         .px(px(8.))
-        .rounded(radius::PILL)
+        
         .bg(tint)
         .text_size(text::CHIP)
         .font_weight(gpui::FontWeight::MEDIUM)
@@ -268,7 +268,7 @@ pub fn icon_button(
         .justify_center()
         .size(px(28.))
         .flex_none()
-        .rounded(radius::CONTROL)
+        
         .text_color(t.ink_3)
         .cursor_pointer()
         .hover(move |s| s.bg(hover_bg))

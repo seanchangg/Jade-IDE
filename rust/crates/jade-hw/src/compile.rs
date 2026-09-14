@@ -146,7 +146,7 @@ pub fn module_for_file(path: &Path) -> Option<String> {
 
 /// Replace every comment with nothing, and keep the line breaks so a
 /// line-anchored match still lands on the right line.
-fn strip_comments(text: &str) -> String {
+pub(crate) fn strip_comments(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     let mut in_line = false;

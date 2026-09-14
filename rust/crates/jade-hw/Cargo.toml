@@ -10,6 +10,8 @@ tokio = { workspace = true, features = ["process"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 regex = "1"
+# Waveform dump reader (VCD/FST) for the wave panel: the parser Surfer uses.
+wellen = "0.25"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }

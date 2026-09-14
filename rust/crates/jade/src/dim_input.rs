@@ -46,7 +46,12 @@ impl DimEditState {
     /// both empty when there is none — the placeholder text for an empty field
     /// is supplied separately by the caller at render time, per
     /// `syncDimInputs`'s placeholder fallback to the latest frame's source dims).
-    pub fn new(name: impl Into<String>, init_rows: String, init_cols: String, field: DimField) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        init_rows: String,
+        init_cols: String,
+        field: DimField,
+    ) -> Self {
         DimEditState {
             name: name.into(),
             rows: init_rows,
@@ -160,7 +165,10 @@ mod tests {
     #[test]
     fn enter_commits_valid_shape() {
         let mut s = DimEditState::new("W", "256".into(), "384".into(), DimField::Cols);
-        assert_eq!(s.on_key("enter", None, false), DimKeyAction::Commit(256, 384));
+        assert_eq!(
+            s.on_key("enter", None, false),
+            DimKeyAction::Commit(256, 384)
+        );
     }
 
     #[test]

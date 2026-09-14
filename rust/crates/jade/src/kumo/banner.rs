@@ -107,11 +107,6 @@ impl Banner {
             } else {
                 scale::SPACE_3
             })
-            .rounded(if small {
-                scale::RADIUS_MD
-            } else {
-                scale::RADIUS_LG
-            })
             .text_size(if small {
                 scale::TEXT_SM
             } else {

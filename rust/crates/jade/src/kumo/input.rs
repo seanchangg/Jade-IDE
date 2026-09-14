@@ -120,7 +120,7 @@ impl TextField {
             el = el.w_full();
         }
         if self.monospace {
-            el = el.font_family("JetBrains Mono");
+            el = el.font_family(crate::fonts::mono_family());
         }
         if let Some(name) = &self.icon_name {
             el = el.child(icon(name, self.size.icon(), t.text_subtle));

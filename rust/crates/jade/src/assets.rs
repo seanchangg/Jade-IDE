@@ -58,6 +58,8 @@ icons![
     // Explain / Visualize cards (§4.14, §4.15): retry a failed request,
     // pause the playing clip (play is already registered).
     "rotate-ccw", "pause",
+    // Split editor panes (window management): the split-right button.
+    "columns-2",
     // Hardware mode (board panel): step one clock, flash the real board.
     "skip-forward", "zap",
 ];

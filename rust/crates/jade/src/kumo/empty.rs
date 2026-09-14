@@ -46,9 +46,18 @@ impl Empty {
     pub fn render(self, t: &KumoTokens) -> Div {
         // `px-6 py-8 gap-4` | `px-10 py-16 gap-6` | `px-12 py-20 gap-8`.
         let (px_pad, py_pad, gap) = match self.size {
-            Size::Xs | Size::Sm => (px(24.), px(32.), scale::SPACE_4),
+            Size::Xs | Size::Sm => (px(24.), px(28.), scale::SPACE_2_5),
             Size::Base => (px(40.), px(64.), scale::SPACE_6),
             Size::Lg => (px(48.), px(80.), px(32.)),
+        };
+        // The small sizes sit inside a sidebar or a panel, where Kumo's 24px
+        // title would be the largest text on screen. They take the base
+        // label size instead, with the body a step below it.
+        let small = matches!(self.size, Size::Xs | Size::Sm);
+        let (icon_px, title_px, body_px) = if small {
+            (20., scale::TEXT_BASE, scale::TEXT_XS)
+        } else {
+            (28., scale::TEXT_2XL, scale::TEXT_BASE)
         };
 
         let mut el = div()
@@ -60,18 +69,18 @@ impl Empty {
             .gap(gap)
             .px(px_pad)
             .py(py_pad)
-            .rounded(scale::RADIUS_XL)
+            
             .border_1()
             .border_color(t.fill)
             .bg(t.control)
             .text_color(t.text_default);
 
         if let Some(name) = &self.icon_name {
-            el = el.child(icon(name, 28., t.text_subtle));
+            el = el.child(icon(name, icon_px, t.text_subtle));
         }
         el = el.child(
             div()
-                .text_size(scale::TEXT_2XL)
+                .text_size(title_px)
                 .font_weight(gpui::FontWeight::SEMIBOLD)
                 .child(self.title),
         );
@@ -80,7 +89,7 @@ impl Empty {
                 div()
                     .max_w(px(560.)) // max-w-140
                     .text_center()
-                    .text_size(scale::TEXT_BASE)
+                    .text_size(body_px)
                     .text_color(t.text_subtle)
                     .child(body),
             );

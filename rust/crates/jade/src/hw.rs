@@ -1,6 +1,7 @@
 //! Hardware-mode state and event handling (§B4).
 //!
-//! `HwState` is the render model for the board panel. The engine lives in the
+//! `HwState` is the render model for the hardware surfaces (wave panel,
+//! schematic, action bar). The engine lives in the
 //! `jade-hw` crate; commands go out through the session's channel and
 //! [`jade_hw::HwEvent`]s come back through the unified app pump
 //! (`AppEvent::Hw`). All values here are logical: `lit`, `pressed`, `on`.
@@ -17,7 +18,7 @@ use crate::output::push_output;
 /// recompile, so one save does not build twice (plan C4).
 const RECOMPILE_DEDUPE_MS: u64 = 600;
 
-/// Render model for the board panel.
+/// Render model for hardware mode.
 #[derive(Debug, Clone)]
 pub struct HwState {
     /// Per-LED lit fraction 0..1 (PWM brightness).
@@ -58,6 +59,8 @@ pub struct HwState {
     pub schematic_path: Option<std::path::PathBuf>,
     /// What the pointer rests on in the schematic, for highlight + tooltip.
     pub schematic_hover: Option<crate::panels::schematic_view::SchematicHover>,
+    /// The wave panel: testbench run, loaded dump, view transform.
+    pub wave: crate::wave::WaveState,
     /// `now_ms()` of the last explicit (editor-save) recompile request.
     last_recompile_ms: u64,
 }
@@ -87,6 +90,7 @@ impl Default for HwState {
             synth_missing: None,
             schematic_path: None,
             schematic_hover: None,
+            wave: crate::wave::WaveState::default(),
             last_recompile_ms: 0,
         }
     }
@@ -181,38 +185,6 @@ impl JadeApp {
         self.hw_send(HwCommand::SchematicGates(on));
     }
 
-    /// Press or release a board push button.
-    pub fn hw_set_pb(&mut self, i: usize, pressed: bool) {
-        let Some(hw) = &mut self.hw else { return };
-        if i >= 4 || hw.pb[i] == pressed {
-            return;
-        }
-        hw.pb[i] = pressed;
-        self.hw_send(HwCommand::SetPb(i, pressed));
-    }
-
-    /// Release every held push button (mouse-up safety and focus-out safety).
-    pub fn hw_release_all_pb(&mut self) {
-        for i in 0..4 {
-            let held = self.hw.as_ref().map(|h| h.pb[i]).unwrap_or(false);
-            if held {
-                self.hw_set_pb(i, false);
-            }
-        }
-    }
-
-    /// Toggle one DIP switch. The position persists in the `ui` blob; the
-    /// caller schedules the save.
-    pub fn hw_toggle_dip(&mut self, i: usize) {
-        let Some(hw) = &mut self.hw else { return };
-        if i >= 5 {
-            return;
-        }
-        hw.dip[i] = !hw.dip[i];
-        let on = hw.dip[i];
-        self.hw_send(HwCommand::SetDip(i, on));
-    }
-
     /// Run/Pause toggle (⌘R / space on the board).
     pub fn hw_toggle_run(&mut self) {
         let Some(hw) = &mut self.hw else { return };
@@ -253,20 +225,21 @@ impl JadeApp {
         self.hw_send(HwCommand::Flash);
     }
 
-    /// Save-hook recompile (§B10): open the bottom panel and ask the session
-    /// to rebuild. The fs watcher's follow-up burst is deduped by timestamp.
+    /// Save-hook recompile (§B10): ask the session to rebuild. The fs
+    /// watcher's follow-up burst is deduped by timestamp.
     ///
-    /// The active bottom tab stays in place: a save never yanks the user off
-    /// the Terminal or Schematic tab. The Output tab is one click away.
+    /// The bottom panel stays as the user left it: a save never opens it
+    /// and never changes the active tab. The status line, the toasts, and
+    /// the editor pills report the result. The Output tab is one click away.
     pub fn hw_recompile(&mut self) {
         let now = self.now_ms();
         let Some(hw) = &mut self.hw else { return };
         hw.compiling = true;
         hw.last_recompile_ms = now;
-        self.output_visible = true;
-        self.bottom_closing = false;
         self.status_line("[jade] Rebuilding the simulation...");
         self.hw_send(HwCommand::Recompile);
+        // The wave panel follows the same save: re-run the last testbench.
+        self.hw_rerun_testbench();
     }
 
     /// Apply one engine event to the render model (the `AppEvent::Hw` arm).
@@ -364,12 +337,11 @@ impl JadeApp {
                 }
             }
             HwEvent::CompileStarted => {
+                // The bottom panel stays as the user left it (see
+                // `hw_recompile`).
                 if let Some(hw) = &mut self.hw {
                     hw.compiling = true;
                 }
-                // Open the panel, but never steal the active bottom tab.
-                self.output_visible = true;
-                self.bottom_closing = false;
             }
             HwEvent::CompileOutput(line) => push_output(&mut self.output, &line),
             HwEvent::Diagnostics(errors) => self.on_hw_diagnostics(errors),
@@ -382,10 +354,9 @@ impl JadeApp {
                     self.status_line("[jade] Simulation rebuilt");
                 } else {
                     // The toast, the status line, and the editor pills carry
-                    // the failure; the active bottom tab stays in place.
+                    // the failure; the bottom panel stays as the user left it.
                     self.push_toast(ToastKind::Error, "Hardware build failed");
                     self.status_line("[jade] Hardware build failed");
-                    self.output_visible = true;
                 }
             }
             HwEvent::SimExited { reason } => {
@@ -409,7 +380,7 @@ impl JadeApp {
     /// Route hardware diagnostics like `on_build_done` routes C++ ones: into
     /// the OUTPUT pane (clickable `path:line:col:` lines) and into the open
     /// tabs' diagnostics vecs so the action-bar pills work unmodified.
-    fn on_hw_diagnostics(&mut self, errors: Vec<jade_build::BuildError>) {
+    pub(crate) fn on_hw_diagnostics(&mut self, errors: Vec<jade_build::BuildError>) {
         for e in &errors {
             let tag = match e.severity {
                 jade_build::Severity::Error => "error",
@@ -467,7 +438,7 @@ impl JadeApp {
             state.dip[i] = *on;
         }
         if let Some(w) = ui.board_width {
-            self.board_width = (w as f32).clamp(340.0, 640.0);
+            self.wave_width = (w as f32).clamp(crate::wave::MIN_W, crate::wave::MAX_W);
         }
         self.hw = Some(state);
         self.sidebar_tab = crate::app::SidebarTab::Files;
@@ -482,6 +453,8 @@ impl JadeApp {
             }
         }
         self.hw_start_watch();
+        // Open on the last dump, so the panel is not an empty sheet.
+        self.hw_load_existing_wave();
     }
 
     /// Leave hardware mode: stop the session, drop the watch and the state.

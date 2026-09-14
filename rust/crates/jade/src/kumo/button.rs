@@ -45,6 +45,10 @@ pub enum ButtonVariant {
     SecondaryDestructive,
     /// `bg-transparent text-kumo-default ring ring-kumo-line`.
     Outline,
+    /// Not a Kumo variant. The old Jade action bar drew Build and Run as a
+    /// colored outline: the label in a status color, a ring of that color at
+    /// 30%, and a 14% wash of it on hover. `ink` supplies the color.
+    Tinted,
 }
 
 /// A Kumo button.
@@ -298,6 +302,22 @@ impl Button {
                     el = el.hover(move |s| s.text_color(strong).border_color(focus_25));
                 }
             }
+            ButtonVariant::Tinted => {
+                let color = self.ink.unwrap_or(t.brand);
+                let ring = KumoTokens::alpha(color, if self.disabled { 0.18 } else { 0.35 });
+                let ring_hover = KumoTokens::alpha(color, 0.5);
+                let wash = KumoTokens::alpha(color, 0.12);
+                el = el
+                    .text_color(if self.disabled {
+                        KumoTokens::alpha(color, 0.5)
+                    } else {
+                        color
+                    })
+                    .border_color(ring);
+                if interactive {
+                    el = el.hover(move |s| s.bg(wash).border_color(ring_hover));
+                }
+            }
         }
 
         // The icon inherits the label color, so resolve it the same way.
@@ -305,11 +325,17 @@ impl Button {
             ButtonVariant::Primary | ButtonVariant::Destructive => rgb(0xFFFFFF),
             ButtonVariant::SecondaryDestructive if !self.disabled => t.danger,
             ButtonVariant::SecondaryDestructive => KumoTokens::alpha(t.danger, 0.7),
+            ButtonVariant::Tinted if self.disabled => {
+                KumoTokens::alpha(self.ink.unwrap_or(t.brand), 0.5)
+            }
             _ if self.disabled => t.text_subtle,
             _ => t.text_default,
         };
-        let ink = self.ink.unwrap_or(ink);
-        if self.ink.is_some() {
+        let ink = match self.variant {
+            ButtonVariant::Tinted => ink,
+            _ => self.ink.unwrap_or(ink),
+        };
+        if self.ink.is_some() && self.variant != ButtonVariant::Tinted {
             el = el.text_color(ink);
         }
 

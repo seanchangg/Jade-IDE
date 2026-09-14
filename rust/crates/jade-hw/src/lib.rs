@@ -20,6 +20,8 @@ pub mod qsf;
 pub mod session;
 pub mod sim;
 pub mod synth;
+pub mod testbench;
+pub mod wave;
 
 use std::path::PathBuf;
 use std::sync::Mutex;

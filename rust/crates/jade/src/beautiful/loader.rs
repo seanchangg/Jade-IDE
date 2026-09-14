@@ -109,7 +109,7 @@ pub fn pixel_loader(t: &BeautifulTokens, pattern: LoaderPattern, elapsed_ms: u64
             cell = if round {
                 cell.rounded_full()
             } else {
-                cell.rounded(px(1.))
+                cell
             };
             let alpha = match ds[i] {
                 // A cell with no delay sits below the dim level so the ring

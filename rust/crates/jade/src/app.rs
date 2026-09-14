@@ -19,16 +19,21 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use gpui::{
+    div, prelude::*, px, rgb, Bounds, BoxShadow, ClipboardItem, Context, EntityInputHandler,
+    FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent, PathPromptOptions, Pixels,
+    UTF16Selection, Window, WindowControlArea,
+};
 use jade_ai::{
     AiModelId, AiState, AiStatus, ChatBackend, ChatDelta, ChatError, InfillRequest,
     InlineCompletionBackend, Lane, LocalStatus,
 };
+use jade_buffer::{Point, Selection};
 use jade_build::{
     parse_alloc_free, parse_heap_summary, parse_scalar, parse_timing, AsmResult, AtosSymbolicator,
     BuildEngine, BuildResult, CompileRequest, MemoryEvent, RunConfig, RunEvent, RunResult,
     INTERPOSE_DYLIB, PROBE_DYLIB,
 };
-use jade_buffer::{Point, Selection};
 use jade_debug::{DebugEvent, LldbDriver, LocalVariable};
 use jade_lsp::{
     active_signature_hint, CompletionItem, Diagnostic, DiagnosticSeverity, DidChange,
@@ -37,11 +42,6 @@ use jade_lsp::{
 use jade_sysmon::{SystemMonitor, SystemStats};
 use jade_telemetry::{Event, Kind, TelemetryServer};
 use jade_term::{TermEvent, TermId, TermManager};
-use gpui::{
-    div, prelude::*, px, rgb, Bounds, BoxShadow, ClipboardItem, Context,
-    EntityInputHandler, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent, PathPromptOptions,
-    Pixels, UTF16Selection, Window, WindowControlArea,
-};
 use serde_json::{Map, Value};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -55,34 +55,40 @@ use tokio::sync::Mutex as AsyncMutex;
 #[path = "dim_input.rs"]
 pub mod dim_input;
 
+use crate::ai_prefs::AiPrefs;
 use crate::editor_view::{self, EditorState};
-use crate::kumo::{
-    self, scale, separator_v, Badge, BadgeVariant, Button, ButtonVariant, Card, DotColor, Heading,
-    HeadingLevel, Size as KumoSize, TabBar, TabItem, TabsAppearance, Text as KumoText, TextTone,
-};
+use crate::explain::{ExplainCard, Selected};
 use crate::highlight::TokenPalette;
+use crate::kumo::{
+    self, scale, separator_v, BadgeVariant, Button, ButtonVariant, Card, Heading, HeadingLevel,
+    Size as KumoSize, TabBar, TabItem, TabsAppearance, Text as KumoText, TextTone,
+};
 use crate::memory_bar::{project, Level, MemoryBarState};
 use crate::output::push_output;
-use crate::panels::runtime_panel::{self, RunRecord};
+use crate::panes::SplitPane;
 use crate::panels::metric_popout::{MetricPopout, MetricSection};
+use crate::panels::runtime_panel::{self, RunRecord};
 use crate::panels::terminal_panel::TermSession;
 use crate::panels::{
     asm_view, code_view, debug_panel, file_tree, structure_panel, telemetry_sidebar,
     terminal_panel, training_view,
 };
-use crate::ai_prefs::AiPrefs;
-use crate::explain::{ExplainCard, Selected};
 
 /// How long the whole symbol lookup may take before the card gives up on it.
 /// Short: the explanation is better with declarations, but not worth a visible
 /// pause, and clangd answers a warm hover in single-digit milliseconds.
 const SYMBOL_BUDGET: Duration = Duration::from_millis(600);
+
+/// The pending language-server lookups behind an Explain or Visualize
+/// request. Resolved on the tokio runtime, never on the UI thread.
+type SymbolLookup =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Vec<crate::explain::SymbolDoc>> + Send>>;
 use crate::prefs::TelemetryPrefs;
 use crate::quick_open::{self, FileEntry, KeyAction, Match, QuickOpenState};
 use crate::registry::{key_of, TelemetryRegistry, DEFAULT_MAX_DIM};
+use crate::run_store::{PendingRun, RunMeta, RunStore, KIND_DEBUG, KIND_RUN};
 use crate::structure::Symbol;
 use crate::theme::Theme;
-use crate::run_store::{PendingRun, RunMeta, RunStore, KIND_DEBUG, KIND_RUN};
 use crate::training::{TensorFrame, TrainingData};
 use crate::wg3d::WeightGrid3D;
 use crate::workspace_tree::FileTree;
@@ -178,11 +184,7 @@ pub const DISCOVERY_HARD_CAP_SECS: u64 = 180;
 /// Whether the discovery watchdog should stop the scan now. `warm_for` is the
 /// time since the first scalar/timing event of the scan; `has_decls` is
 /// whether any probe decl arrived (an instrumented app mid-startup).
-fn discovery_should_stop(
-    elapsed: Duration,
-    warm_for: Option<Duration>,
-    has_decls: bool,
-) -> bool {
+fn discovery_should_stop(elapsed: Duration, warm_for: Option<Duration>, has_decls: bool) -> bool {
     match warm_for {
         // Warm: give the run a full post-warm window, however long startup took.
         Some(w) => w >= Duration::from_secs(DISCOVERY_SECS),
@@ -232,6 +234,8 @@ pub enum AppEvent {
     BuildOutput(String),
     /// A build finished (success or failure).
     BuildDone(BuildResult),
+    /// A wave-panel background result: testbench done, dump loaded.
+    Wave(crate::wave::WaveEvent),
     /// A run event: program output or a memory event (incl. `AllocBatch`).
     Run(RunEvent),
     /// A run finished with its terminal result.
@@ -283,18 +287,23 @@ pub enum AppEvent {
     },
     /// A go-to-definition target resolved from a ⌘-click (E2): open + reveal.
     Definition { path: PathBuf, line: usize },
+    /// The Explain request is built: the language-server lookups that feed
+    /// it ran off the UI thread, and the chat call can start (§4.14).
+    ExplainReady {
+        generation: u64,
+        req: jade_ai::ChatRequest,
+    },
     /// One streamed delta of an Explain response (§4.14). Stale generations
     /// are dropped — an aborted task can still have deltas queued behind it.
-    Explain {
+    Explain { generation: u64, delta: ChatDelta },
+    /// The Visualize request is built (see `ExplainReady`).
+    VisualizeReady {
         generation: u64,
-        delta: ChatDelta,
+        req: jade_ai::ChatRequest,
     },
     /// One streamed delta of a Visualize response (§4.15). Independent of
     /// Explain: its own lane, its own generation counter.
-    Visualize {
-        generation: u64,
-        delta: ChatDelta,
-    },
+    Visualize { generation: u64, delta: ChatDelta },
     /// Progress from the sandboxed Manim render a Visualize card started.
     VisualizeRender {
         generation: u64,
@@ -319,7 +328,10 @@ pub enum AppEvent {
     AsmReady { generation: u64, result: AsmResult },
     /// Lazily-fetched children of an expandable debug variable (§5.8): the lldb
     /// expression `path` the fetch was keyed on plus the resolved `children`.
-    VarChildren { path: String, children: Vec<LocalVariable> },
+    VarChildren {
+        path: String,
+        children: Vec<LocalVariable>,
+    },
     /// A hardware-mode engine event (compile progress, LED frames, rates).
     Hw(jade_hw::HwEvent),
 }
@@ -403,11 +415,14 @@ impl CompletionState {
     }
 }
 
-/// Floating hover-panel state (E2): plain-text contents at a screen anchor.
+/// Floating hover-panel state (E2): the diagnostics under the pointer (shown
+/// first, colored by severity) plus the plain-text LSP hover contents, at a
+/// screen anchor. Either part can be empty, but not both.
 pub struct HoverState {
     pub text: String,
     pub row: usize,
     pub col: usize,
+    pub diagnostics: Vec<(Option<jade_lsp::DiagnosticSeverity>, String)>,
 }
 
 /// Signature-help state: the active signature label (e.g. `Point(int x, int y)`),
@@ -441,6 +456,8 @@ pub struct BenchNaming {
 /// switching back restores everything instead of reloading pristine files.
 struct StashedProject {
     editor: EditorState,
+    /// The split-pane layout (background pane editors and view modes).
+    panes: Vec<SplitPane>,
 }
 
 pub struct JadeApp {
@@ -510,8 +527,8 @@ pub struct JadeApp {
     engine: Arc<BuildEngine>,
     ai: Arc<InlineCompletionBackend>,
     sysmon: Arc<SystemMonitor>,
-    runtime: Handle,
-    app_tx: UnboundedSender<AppEvent>,
+    pub(crate) runtime: Handle,
+    pub(crate) app_tx: UnboundedSender<AppEvent>,
     repo_root: PathBuf,
     /// Root the file tree scans + the cwd new terminals spawn in.
     pub(crate) workspace_root: PathBuf,
@@ -570,8 +587,18 @@ pub struct JadeApp {
     /// row in the panel and gives a new terminal its cwd (see [`Self::terminal_cwd`]).
     /// `None` until the user clicks a row, and cleared on a project switch.
     pub tree_selection: Option<PathBuf>,
-    /// Open tabs + editable buffer-backed editor state (center).
+    /// Open tabs + editable buffer-backed editor state (center). In split
+    /// mode this is the focused pane's editor; see [`crate::panes`].
     pub editor: EditorState,
+    /// Split editor panes in display order. Always at least one; exactly one
+    /// slot is the focused pane (`editor: None`).
+    pub panes: Vec<SplitPane>,
+    /// While a pane divider is held: `(left pane, mouse_x_at_start,
+    /// left share at start, right share at start)`. `None` when not resizing.
+    pub pane_resize: Option<(usize, f32, f32, f32)>,
+    /// The pane row's width in px (f32 bits), captured each paint by a canvas
+    /// so a divider drag can turn pointer travel into width share.
+    pub pane_row_w: Arc<AtomicU32>,
 
     // ── Editable editor surface (E2) ──────────────────────────────────────────
     /// Focus handle for the editor surface (created lazily; None headless).
@@ -655,6 +682,12 @@ pub struct JadeApp {
     pub ai_model: AiModelId,
     /// Whether the sparkle AI settings menu (completion/multiline/model) is open.
     pub ai_menu_open: bool,
+    /// Whether the Run split button's menu (Run · Run with tracking · Debug ·
+    /// Debug with tracking) is open.
+    pub run_menu_open: bool,
+    /// Bottom-left corner of the Run split button in window px (same packing
+    /// as [`diag_anchor`](Self::diag_anchor)), so the run menu hangs under it.
+    pub run_anchor: Arc<std::sync::atomic::AtomicU64>,
     /// Global (cross-workspace) AI prefs — the model tier + multi-line mode —
     /// mirrored here so a menu change can rewrite `~/.config/jade/ai.json`.
     pub ai_prefs: AiPrefs,
@@ -906,15 +939,15 @@ pub struct JadeApp {
     hw_watch: FsWatchSpawn,
     /// Keep-alive guard for the live hardware source watch.
     hw_watcher: Option<Box<dyn Send>>,
-    /// Focus handle for the board panel (scopes the plain-key bindings).
+    /// Focus handle for the wave panel (scopes the plain-key bindings).
     pub hw_focus: Option<FocusHandle>,
-    /// Whether the board drawer is shown (the `tgl-board` toggle).
-    pub board_visible: bool,
+    /// Whether the wave drawer is shown (the `tgl-wave` toggle).
+    pub wave_visible: bool,
     /// Board drawer width in px (left-edge drag to resize).
-    pub board_width: f32,
+    pub wave_width: f32,
     /// While dragging the board's resize handle: `(mouse_x_at_start,
     /// width_at_start)`.
-    pub board_resize: Option<(f32, f32)>,
+    pub wave_resize: Option<(f32, f32)>,
 
     /// Markdown preview override (⌘⇧D / the `tgl-md` toggle). The preview
     /// opens by itself on a `.md` tab; `false` keeps it hidden.
@@ -1124,6 +1157,9 @@ impl JadeApp {
             tree,
             tree_selection: None,
             editor,
+            panes: vec![SplitPane::focused()],
+            pane_resize: None,
+            pane_row_w: Arc::new(AtomicU32::new(0)),
 
             editor_focus: None,
             editor_selecting: false,
@@ -1133,9 +1169,7 @@ impl JadeApp {
             editor_text_left: Arc::new(AtomicU32::new(0)),
             editor_w: Arc::new(AtomicU32::new(0)),
             editor_h: Arc::new(AtomicU32::new(0)),
-            editor_char_w: Arc::new(AtomicU32::new(
-                crate::panels::code_view::CHAR_W.to_bits(),
-            )),
+            editor_char_w: Arc::new(AtomicU32::new(crate::panels::code_view::CHAR_W.to_bits())),
             editor_rows: Arc::new(AtomicU32::new(30)),
             caret_blink_show: true,
             caret_last_active: 0,
@@ -1176,6 +1210,8 @@ impl JadeApp {
             visualize_scrubbing: false,
             visualize_ticking: false,
             ai_menu_open: false,
+            run_menu_open: false,
+            run_anchor: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ai_prefs,
             ghost: None,
             ghost_gen: 0,
@@ -1191,10 +1227,7 @@ impl JadeApp {
             quick_open: None,
             quick_open_focus: None,
             find: None,
-            find_field_left: [
-                Arc::new(AtomicU32::new(0)),
-                Arc::new(AtomicU32::new(0)),
-            ],
+            find_field_left: [Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0))],
             find_char_w: Arc::new(AtomicU32::new(0)),
             find_focus: None,
             pending_find_focus: false,
@@ -1275,9 +1308,9 @@ impl JadeApp {
             hw_watch: deps.hw_watch,
             hw_watcher: None,
             hw_focus: None,
-            board_visible: true,
-            board_width: 440.0,
-            board_resize: None,
+            wave_visible: true,
+            wave_width: 440.0,
+            wave_resize: None,
 
             md_visible: ui.markdown_visible.unwrap_or(true),
             md_width: ui
@@ -1321,6 +1354,9 @@ impl JadeApp {
         // Safe in the headless suites: `ensure_lsp` spawns onto the runtime,
         // and `test_deps` builds one that is never driven, so no clangd is
         // launched during tests.
+        // A persisted split layout replaces the single-pane tab set.
+        app.restore_panes(&ui);
+        app.active_file = app.editor.active_path();
         if let Some(path) = app.editor.active_path() {
             app.ensure_lsp();
             app.lsp_did_open(&path);
@@ -1372,9 +1408,9 @@ impl JadeApp {
                         match endpoint {
                             // The router serves both models; which one answers
                             // is chosen per request by its `model` field.
-                            Some(endpoint) => self
-                                .chat
-                                .set_local_status(LocalStatus::Ready { endpoint }),
+                            Some(endpoint) => {
+                                self.chat.set_local_status(LocalStatus::Ready { endpoint })
+                            }
                             None => self.chat.set_local_status(LocalStatus::Off),
                         }
                     }
@@ -1430,7 +1466,11 @@ impl JadeApp {
                 self.open_file(path);
                 self.reveal_line(line);
             }
+            AppEvent::ExplainReady { generation, req } => self.on_explain_ready(generation, req),
             AppEvent::Explain { generation, delta } => self.on_explain(generation, delta),
+            AppEvent::VisualizeReady { generation, req } => {
+                self.on_visualize_ready(generation, req)
+            }
             AppEvent::Visualize { generation, delta } => self.on_visualize(generation, delta),
             AppEvent::VisualizeRender { generation, ev } => {
                 self.on_visualize_render(generation, ev)
@@ -1443,12 +1483,21 @@ impl JadeApp {
                 line_suffix,
                 anchor,
                 max_lines,
-            } => self.on_ghost(generation, content, prefix, suffix, line_suffix, anchor, max_lines),
+            } => self.on_ghost(
+                generation,
+                content,
+                prefix,
+                suffix,
+                line_suffix,
+                anchor,
+                max_lines,
+            ),
             AppEvent::AsmReady { generation, result } => self.on_asm_ready(generation, result),
             AppEvent::VarChildren { path, children } => {
                 self.debug.set_children(path, children);
             }
             AppEvent::Hw(ev) => self.on_hw_event(ev),
+            AppEvent::Wave(ev) => self.on_wave_event(ev),
         }
     }
 
@@ -1468,8 +1517,7 @@ impl JadeApp {
         if self.hw_test_tx.is_some() || self.hw_engine.is_some() {
             return;
         }
-        let (ev_tx, mut ev_rx) =
-            tokio::sync::mpsc::unbounded_channel::<jade_hw::HwEvent>();
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<jade_hw::HwEvent>();
         let tx = self.app_tx.clone();
         self.runtime.spawn(async move {
             while let Some(ev) = ev_rx.recv().await {
@@ -1531,9 +1579,10 @@ impl JadeApp {
                 // so what the user is reading stays in place (clamped in the
                 // renderer). At the live bottom (offset 0) we stay pinned.
                 if session.scroll_back > 0 {
-                    if let (Some(old), Some(new)) =
-                        (old_sb, session.snapshot.as_ref().map(|s| s.scrollback.len()))
-                    {
+                    if let (Some(old), Some(new)) = (
+                        old_sb,
+                        session.snapshot.as_ref().map(|s| s.scrollback.len()),
+                    ) {
                         let grown = new.saturating_sub(old);
                         session.scroll_back = (session.scroll_back + grown).min(new);
                     }
@@ -1799,10 +1848,7 @@ impl JadeApp {
                 .count();
             self.status_line(&format!("[jade] Build failed ({nerr} error(s), {ms}ms)"));
             let plural = if nerr == 1 { "error" } else { "errors" };
-            self.push_toast(
-                ToastKind::Error,
-                format!("Build failed · {nerr} {plural}"),
-            );
+            self.push_toast(ToastKind::Error, format!("Build failed · {nerr} {plural}"));
             for e in &res.errors {
                 let tag = match e.severity {
                     jade_build::Severity::Error => "error",
@@ -2020,7 +2066,8 @@ impl JadeApp {
                 locals,
             } => {
                 let refetch =
-                    self.debug.on_stopped(reason.clone(), file.clone(), line, frames, locals);
+                    self.debug
+                        .on_stopped(reason.clone(), file.clone(), line, frames, locals);
                 self.status_line(&format!("[jade] paused at {file}:{line} ({reason})"));
                 self.reveal_line(line as usize);
                 // Re-fetch children of paths that were expanded before the step so
@@ -2059,7 +2106,11 @@ impl JadeApp {
     /// Write the just-finished run (`training.current` + the launch context
     /// captured at start) to the store. No-ops without a pending run or store;
     /// empty runs (no telemetry) are skipped by the store itself.
-    pub(crate) fn persist_finished_run(&mut self, duration_ms: Option<i64>, exit_code: Option<i64>) {
+    pub(crate) fn persist_finished_run(
+        &mut self,
+        duration_ms: Option<i64>,
+        exit_code: Option<i64>,
+    ) {
         let Some(pending) = self.pending_run.take() else {
             return;
         };
@@ -2114,7 +2165,10 @@ impl JadeApp {
     pub fn open_pre_run(&mut self, launch: PreRunLaunch) {
         let have_items = !self.registry.items_of_kind(Kind::Timer).is_empty()
             || !self.registry.items_of_kind(Kind::Buffer).is_empty();
-        self.pre_run = Some(PreRunPanel { launch, discovering: false });
+        self.pre_run = Some(PreRunPanel {
+            launch,
+            discovering: false,
+        });
         // Fresh editing state per open (stale staging/filters confuse).
         self.group_staging.clear();
         self.group_name_input.clear();
@@ -2423,20 +2477,48 @@ impl JadeApp {
         true
     }
 
-    /// Run button / ⌘R: opens the pre-run tracking panel (pick timers/buffers
-    /// first); the panel's Run confirms into [`launch_run`](Self::launch_run).
+    /// Run button (the main half of the split button) and the menu's "Run"
+    /// row: launch the last build now with the persisted tracking choices.
+    /// The pre-run tracking panel does not open; that is the
+    /// [`action_run_tracked`](Self::action_run_tracked) path.
     pub fn action_run(&mut self) {
-        if self.mode == AppMode::Hardware {
-            return; // the board panel's Run/Pause owns this surface
-        }
-        if self.last_build.is_none() {
-            self.status_line("[jade] Build first");
+        if !self.run_gate() {
             return;
         }
-        if self.running || self.discovery_active {
+        self.launch_run();
+    }
+
+    /// Run menu "Run with tracking…": open the pre-run tracking panel first
+    /// (pick timers/buffers); the panel's Run confirms into
+    /// [`launch_run`](Self::launch_run).
+    pub fn action_run_tracked(&mut self) {
+        if !self.run_gate() {
             return;
         }
         self.open_pre_run(PreRunLaunch::Run);
+    }
+
+    /// Shared guard for the two Run entry points. False when a run cannot
+    /// start now (hardware mode, no build, or a run/scan already up).
+    fn run_gate(&mut self) -> bool {
+        if self.mode == AppMode::Hardware {
+            return false; // the board panel's Run/Pause owns this surface
+        }
+        if self.last_build.is_none() {
+            self.status_line("[jade] Build first");
+            return false;
+        }
+        !(self.running || self.discovery_active)
+    }
+
+    /// Open/close the Run split button's menu.
+    pub fn toggle_run_menu(&mut self) {
+        self.run_menu_open = !self.run_menu_open;
+    }
+
+    /// Dismiss the run menu (outside click / Esc / after a choice).
+    pub fn close_run_menu(&mut self) {
+        self.run_menu_open = false;
     }
 
     /// Launch the last successful build (deliverable §3) — the pre-run panel's
@@ -2461,8 +2543,8 @@ impl JadeApp {
         self.run_started = Some(Instant::now()); // drive the live SPEED tick
         self.error_line = None; // clear any prior run's error line
         self.training.clear(); // fresh charts per run (compare via RUNS overlays)
-        // (preview_images prunes on the next render — dropping textures needs
-        // the window, see ensure_preview_images.)
+                               // (preview_images prunes on the next render — dropping textures needs
+                               // the window, see ensure_preview_images.)
         self.mem.reset(); // reset run-memory state
         self.output.clear(); // fresh OUTPUT scrollback per run
         self.output_stick = true; // a new run always starts following the tail
@@ -2475,7 +2557,11 @@ impl JadeApp {
             .unwrap_or_default();
         // Launch context for the run store; consumed by `persist_finished_run`
         // in `on_run_done` (captures start time + git sha *before* the run).
-        self.pending_run = Some(PendingRun::begin(name.clone(), KIND_RUN, &self.workspace_root));
+        self.pending_run = Some(PendingRun::begin(
+            name.clone(),
+            KIND_RUN,
+            &self.workspace_root,
+        ));
         self.status_line(&format!("[jade] Running ./{name}..."));
 
         let cfg = RunConfig {
@@ -2515,20 +2601,35 @@ impl JadeApp {
 
     /// Debug the active file (deliverable §3): build with forced `-O0`, then
     /// start LLDB with the telemetry-socket + probe-dylib env seam.
-    /// Debug button: opens the pre-run tracking panel first (same flow as Run);
-    /// confirming lands in [`launch_debug`](Self::launch_debug).
+    /// Debug button and the run menu's "Debug with tracking…" row: opens the
+    /// pre-run tracking panel first; confirming lands in
+    /// [`launch_debug`](Self::launch_debug).
     pub fn action_debug(&mut self) {
-        if self.mode == AppMode::Hardware {
-            return; // no LLDB surface in hardware mode
-        }
-        if self.active_file.is_none() {
-            self.status_line("[jade] No active file — pass --file or --project");
-            return;
-        }
-        if self.building || self.debugging || self.discovery_active {
+        if !self.debug_gate() {
             return;
         }
         self.open_pre_run(PreRunLaunch::Debug);
+    }
+
+    /// Run menu "Debug": build `-O0` and start LLDB now, with the persisted
+    /// tracking choices and no panel.
+    pub fn action_debug_direct(&mut self) {
+        if !self.debug_gate() {
+            return;
+        }
+        self.launch_debug();
+    }
+
+    /// Shared guard for the two Debug entry points.
+    fn debug_gate(&mut self) -> bool {
+        if self.mode == AppMode::Hardware {
+            return false; // no LLDB surface in hardware mode
+        }
+        if self.active_file.is_none() {
+            self.status_line("[jade] No active file — pass --file or --project");
+            return false;
+        }
+        !(self.building || self.debugging || self.discovery_active)
     }
 
     pub fn launch_debug(&mut self) {
@@ -2740,7 +2841,7 @@ impl JadeApp {
         } else {
             Theme::jade_dark()
         };
-        self.editor.set_palette(if light {
+        self.set_all_palettes(if light {
             TokenPalette::jade_light()
         } else {
             TokenPalette::jade_dark()
@@ -2748,7 +2849,7 @@ impl JadeApp {
     }
 
     /// The syntax-highlight palette matching the active theme.
-    fn editor_palette(&self) -> TokenPalette {
+    pub(crate) fn editor_palette(&self) -> TokenPalette {
         if self.theme.is_light {
             TokenPalette::jade_light()
         } else {
@@ -2789,6 +2890,15 @@ impl JadeApp {
     /// through the single preview ("temp") tab: a new open replaces the
     /// unedited preview tab, and the first edit makes the tab permanent.
     pub fn open_file(&mut self, path: PathBuf) {
+        // A file lives in one pane at most: when another pane already holds
+        // it, that pane takes the keyboard instead of a second buffer.
+        if self.editor.index_of(&path).is_none() {
+            if let Some((pane, tab)) = self.find_in_background_panes(&path) {
+                self.focus_pane(pane);
+                self.switch_tab(tab);
+                return;
+            }
+        }
         // Remember the outgoing tab's page position before we switch/open, then
         // restore the destination tab's own remembered position.
         self.stash_scroll();
@@ -2818,7 +2928,7 @@ impl JadeApp {
     /// Shared post-`editor.open` bookkeeping for the active file (LSP init +
     /// `didOpen`, focus, popup dismissal) — no scroll handling, so the project
     /// switch path can manage the page position itself.
-    fn after_open_active(&mut self, path: &Path) {
+    pub(crate) fn after_open_active(&mut self, path: &Path) {
         self.dismiss_popups();
         self.pending_editor_focus = true; // caret + keys live immediately
         self.ensure_lsp();
@@ -2879,8 +2989,15 @@ impl JadeApp {
             // restores the in-memory state instead of reloading pristine files.
             self.stash_scroll();
             let outgoing = std::mem::take(&mut self.editor);
-            self.project_editors
-                .insert(self.workspace_root.clone(), StashedProject { editor: outgoing });
+            let panes = std::mem::take(&mut self.panes);
+            self.reset_panes();
+            self.project_editors.insert(
+                self.workspace_root.clone(),
+                StashedProject {
+                    editor: outgoing,
+                    panes,
+                },
+            );
         }
         // Register in the project subtabs (dedupe; active follows workspace_root).
         if !self.open_projects.iter().any(|p| p == &dir) {
@@ -2914,8 +3031,7 @@ impl JadeApp {
         self.breakpoints = crate::debug::Breakpoints::from_map(ui.breakpoints.clone());
         self.benchmarks = ui.benchmarks.clone();
         // Timer bundles are per-workspace (kernel names differ per project).
-        self.timer_groups =
-            crate::timer_groups::GroupAggregator::new(ui.timer_groups.clone());
+        self.timer_groups = crate::timer_groups::GroupAggregator::new(ui.timer_groups.clone());
         self.declare_loaded_timer_groups();
         self.group_staging.clear();
         self.group_name_input.clear();
@@ -2928,10 +3044,7 @@ impl JadeApp {
         self.output_visible = ui.terminal_visible.unwrap_or(true);
         self.md_visible = ui.markdown_visible.unwrap_or(true);
         if let Some(w) = ui.markdown_width {
-            let w = (w as f32).clamp(
-                crate::panels::md_view::MIN_W,
-                crate::panels::md_view::MAX_W,
-            );
+            let w = (w as f32).clamp(crate::panels::md_view::MIN_W, crate::panels::md_view::MAX_W);
             self.md_width = w;
         }
         self.md_edit = false;
@@ -2957,15 +3070,19 @@ impl JadeApp {
         // session (keeps unsaved edits); otherwise build a fresh one from the
         // persisted tab set on disk.
         if let Some(saved) = self.project_editors.remove(&dir) {
-            let StashedProject { mut editor } = saved;
+            let StashedProject { mut editor, panes } = saved;
             // The old clangd session is gone; force each tab to re-`didOpen` in
             // the new root's session when it's next made active.
             for tab in &mut editor.tabs {
                 tab.lsp_opened = false;
             }
             self.editor = editor;
+            self.panes = panes;
+            for tab in self.all_tabs_mut() {
+                tab.lsp_opened = false;
+            }
             // Re-resolve syntax colors in case the theme changed while away.
-            self.editor.set_palette(self.editor_palette());
+            self.set_all_palettes(self.editor_palette());
         } else {
             self.editor = EditorState::new(self.editor_palette());
             // Restore persisted open tabs (skipping deleted files), then the
@@ -2991,6 +3108,8 @@ impl JadeApp {
                     let _ = self.editor.open(&first);
                 }
             }
+            // A persisted split layout replaces the single-pane tab set.
+            self.restore_panes(&ui);
         }
         self.active_file = self.editor.active_path();
 
@@ -3100,6 +3219,11 @@ impl JadeApp {
         }
         let prev_active = self.active_file.clone();
         self.editor.close(index);
+        // The last tab left a split pane: the pane goes with it.
+        if self.editor.tabs.is_empty() && self.split_mode() {
+            self.close_pane(self.focused_pane());
+            return;
+        }
         self.active_file = self.editor.active_path();
         // Only restore scroll when the active *tab* actually changed (closing a
         // background tab must not jerk the current tab to a stale position).
@@ -3381,8 +3505,11 @@ impl JadeApp {
                 return None;
             }
             let repl = s.replace.clone();
-            let edits: Vec<(std::ops::Range<usize>, String)> =
-                s.matches.iter().map(|r| (r.clone(), repl.clone())).collect();
+            let edits: Vec<(std::ops::Range<usize>, String)> = s
+                .matches
+                .iter()
+                .map(|r| (r.clone(), repl.clone()))
+                .collect();
             Some(edits)
         }) else {
             return;
@@ -3599,9 +3726,12 @@ impl JadeApp {
                 }
             }
             Event::Scalar(s) => {
-                let out = self.registry.note_scalar(&s.name, s.step, s.value, &self.prefs);
+                let out = self
+                    .registry
+                    .note_scalar(&s.name, s.step, s.value, &self.prefs);
                 if out.auto_enabled {
-                    self.server.set_track(Kind::Scalar, &s.name, true, None, None);
+                    self.server
+                        .set_track(Kind::Scalar, &s.name, true, None, None);
                 }
                 if out.pref_enabled {
                     self.push_track(Kind::Scalar, &s.name, true);
@@ -3610,7 +3740,8 @@ impl JadeApp {
                 self.scalars_seen += 1;
             }
             Event::Timing(t) => {
-                self.registry.note_timing(&t.name, t.ms, t.step, &self.prefs);
+                self.registry
+                    .note_timing(&t.name, t.ms, t.step, &self.prefs);
                 // Bundled members chart through their group's summed series;
                 // the raw series only also lands when individually checked.
                 let grouped = self.timer_groups.contains_member(&t.name);
@@ -3717,7 +3848,9 @@ impl JadeApp {
             .map(|(k, _)| k.clone())
             .collect();
         for key in keys {
-            let Some((kind_s, name)) = key.split_once(' ') else { continue };
+            let Some((kind_s, name)) = key.split_once(' ') else {
+                continue;
+            };
             let kind = match kind_s {
                 "scalar" => Kind::Scalar,
                 "timer" => Kind::Timer,
@@ -3836,7 +3969,8 @@ impl JadeApp {
         }
         self.timer_groups.add(name, members.clone());
         // The synthetic series behaves like any timer: registry row + pref.
-        self.registry.declare(Kind::Timer, name, None, None, &self.prefs);
+        self.registry
+            .declare(Kind::Timer, name, None, None, &self.prefs);
         self.registry.set_enabled(Kind::Timer, name, true);
         self.prefs.set_enabled(&key_of(Kind::Timer, name), true);
         self.prefs.save();
@@ -3844,7 +3978,10 @@ impl JadeApp {
             self.sync_member_tracking(m);
         }
         self.save_ui_state();
-        self.status_line(&format!("[jade] Bundled {} timers as \"{name}\"", members.len()));
+        self.status_line(&format!(
+            "[jade] Bundled {} timers as \"{name}\"",
+            members.len()
+        ));
     }
 
     /// Dissolve a bundle: members stay in the registry (and stop being tracked
@@ -3913,9 +4050,20 @@ impl JadeApp {
             }
         }
         let item = self.registry.get(Kind::Buffer, name);
-        let rows = item.and_then(|i| i.shape_rows).map(|r| r.to_string()).unwrap_or_default();
-        let cols = item.and_then(|i| i.shape_cols).map(|c| c.to_string()).unwrap_or_default();
-        self.dim_edit = Some(dim_input::DimEditState::new(name.to_string(), rows, cols, field));
+        let rows = item
+            .and_then(|i| i.shape_rows)
+            .map(|r| r.to_string())
+            .unwrap_or_default();
+        let cols = item
+            .and_then(|i| i.shape_cols)
+            .map(|c| c.to_string())
+            .unwrap_or_default();
+        self.dim_edit = Some(dim_input::DimEditState::new(
+            name.to_string(),
+            rows,
+            cols,
+            field,
+        ));
     }
 
     /// Switch which field (rows/cols) has the caret without closing the editor
@@ -4079,9 +4227,7 @@ fn lsp_eligible(path: &Path) -> bool {
         .map(|e| e.to_ascii_lowercase());
     matches!(
         ext.as_deref(),
-        Some(
-            "c" | "cc" | "cpp" | "cxx" | "c++" | "h" | "hpp" | "hxx" | "hh" | "inl" | "m" | "mm"
-        )
+        Some("c" | "cc" | "cpp" | "cxx" | "c++" | "h" | "hpp" | "hxx" | "hh" | "inl" | "m" | "mm")
     )
 }
 
@@ -4105,8 +4251,26 @@ fn ghost_eligible(path: &Path) -> bool {
     matches!(
         ext.as_deref(),
         Some(
-            "c" | "cc" | "cpp" | "cxx" | "c++" | "h" | "hpp" | "hxx" | "hh" | "inl" | "m" | "mm"
-                | "metal" | "py" | "js" | "jsx" | "ts" | "tsx" | "sh" | "bash" | "zsh"
+            "c" | "cc"
+                | "cpp"
+                | "cxx"
+                | "c++"
+                | "h"
+                | "hpp"
+                | "hxx"
+                | "hh"
+                | "inl"
+                | "m"
+                | "mm"
+                | "metal"
+                | "py"
+                | "js"
+                | "jsx"
+                | "ts"
+                | "tsx"
+                | "sh"
+                | "bash"
+                | "zsh"
         )
     )
 }
@@ -4238,6 +4402,11 @@ impl JadeApp {
                 "m" if shift => self.visualize_trigger(cx),
                 // ⌘⇧D toggles the Markdown preview panel.
                 "d" if shift => self.toggle_md_preview(cx),
+                // ⌘\ splits the editor: a new pane to the right takes focus.
+                "\\" => {
+                    self.split_pane();
+                    self.schedule_ui_save(cx);
+                }
                 "w" => {
                     if let Some(i) = self.editor.active {
                         self.close_tab(i);
@@ -4364,9 +4533,7 @@ impl JadeApp {
                 });
                 self.after_edit(r, cx);
             }
-            "escape" if self.completion.is_some() || self.hover.is_some() => {
-                self.dismiss_popups()
-            }
+            "escape" if self.completion.is_some() || self.hover.is_some() => self.dismiss_popups(),
             // Ordered AFTER the popup gate on purpose: a first Esc clears a
             // completion popup, and only a second one closes the card.
             // Esc closes the newest selection card first: Visualize, then
@@ -4423,12 +4590,11 @@ impl JadeApp {
             };
             let caret = tab.caret_point();
             let line = tab.buffer.line(caret.row).into_owned();
-            let first_ns = line
-                .chars()
-                .position(|c| !c.is_whitespace())
-                .unwrap_or(0);
+            let first_ns = line.chars().position(|c| !c.is_whitespace()).unwrap_or(0);
             let target_col = if caret.col == first_ns { 0 } else { first_ns };
-            let byte = tab.buffer.point_to_offset(Point::new(caret.row, target_col));
+            let byte = tab
+                .buffer
+                .point_to_offset(Point::new(caret.row, target_col));
             if extend {
                 let anchor = tab.buffer.selection().anchor;
                 tab.buffer.set_selection(Selection::new(anchor, byte));
@@ -4458,9 +4624,9 @@ impl JadeApp {
         self.hover = None;
         self.hover_target = None;
         self.ghost = None; // any caret move dismisses ghost text (§4.11)
-        // Signature help follows the caret: while a hint is up, re-request so
-        // moving between arguments updates the active parameter, and clangd
-        // returning nothing (caret left the call) dismisses it.
+                           // Signature help follows the caret: while a hint is up, re-request so
+                           // moving between arguments updates the active parameter, and clangd
+                           // returning nothing (caret left the call) dismisses it.
         if self.signature.is_some() {
             self.schedule_signature_help();
         }
@@ -4583,7 +4749,9 @@ impl JadeApp {
         // derive the first FULLY visible row from the scroll offset (the
         // handle's last_item_size.item is the viewport, not a row — measured).
         let scrolled = -f32::from(self.code_scroll.0.borrow().base_handle.offset().y);
-        (((scrolled - crate::panels::code_view::PAD_TOP) / LINE_H).ceil().max(0.0)) as usize
+        (((scrolled - crate::panels::code_view::PAD_TOP) / LINE_H)
+            .ceil()
+            .max(0.0)) as usize
     }
 
     /// The code list's horizontal scroll offset in px (≤ 0; more negative the
@@ -4614,7 +4782,7 @@ impl JadeApp {
     /// leaving it — a tab switch, a project switch, or opening another file — so
     /// its page position is remembered). Reads the current *painted* offset, so
     /// it must run before any deferred `scroll_to_item` for the new tab.
-    fn stash_scroll(&mut self) {
+    pub(crate) fn stash_scroll(&mut self) {
         let top = self.editor_scroll_top();
         if let Some(tab) = self.editor.active_tab_mut() {
             tab.scroll_top = top;
@@ -4623,7 +4791,7 @@ impl JadeApp {
 
     /// Scroll the code list to the active tab's remembered page position (a
     /// deferred scroll honored on the next paint). Called after switching to a tab.
-    fn apply_scroll(&mut self) {
+    pub(crate) fn apply_scroll(&mut self) {
         let top = self.editor.active_tab().map(|t| t.scroll_top).unwrap_or(0);
         self.code_scroll
             .scroll_to_item(top, gpui::ScrollStrategy::Top);
@@ -4651,8 +4819,7 @@ impl JadeApp {
     /// Spawn the decoration-recompute wake loop if one isn't already running and
     /// some tab has a pending debounce.
     fn ensure_decoration_wake(&mut self, cx: &mut Context<Self>) {
-        if self.decoration_wake_running
-            || !self.editor.tabs.iter().any(|t| t.decorations_pending())
+        if self.decoration_wake_running || !self.editor.tabs.iter().any(|t| t.decorations_pending())
         {
             return;
         }
@@ -4791,8 +4958,12 @@ impl JadeApp {
                 }
                 if sites > 0 {
                     self.sync_scope = scope;
-                    self.sync_suggestion =
-                        Some(sync::SyncSuggestion::Hyperparam { name, to, sites, files });
+                    self.sync_suggestion = Some(sync::SyncSuggestion::Hyperparam {
+                        name,
+                        to,
+                        sites,
+                        files,
+                    });
                     return true;
                 }
                 // No sites left (for example the user typed the value back):
@@ -4815,9 +4986,11 @@ impl JadeApp {
                 // rename above): anchor on the token the file still holds.
                 let mut chained = false;
                 let from = match &self.sync_suggestion {
-                    Some(sync::SyncSuggestion::SimilarLines { from: orig, to: prev, .. })
-                        if *prev == from =>
-                    {
+                    Some(sync::SyncSuggestion::SimilarLines {
+                        from: orig,
+                        to: prev,
+                        ..
+                    }) if *prev == from => {
                         chained = true;
                         orig.clone()
                     }
@@ -5053,7 +5226,11 @@ impl JadeApp {
     fn editor_history(&mut self, undo: bool, cx: &mut Context<Self>) {
         let now = self.now_ms();
         let payload = self.editor.active_tab_mut().and_then(|tab| {
-            let changed = if undo { tab.buffer.undo() } else { tab.buffer.redo() };
+            let changed = if undo {
+                tab.buffer.undo()
+            } else {
+                tab.buffer.redo()
+            };
             if !changed {
                 return None;
             }
@@ -5108,7 +5285,12 @@ impl JadeApp {
         if end_row > start_row && tab.buffer.offset_to_point(end_off).col == 0 {
             end_row -= 1;
         }
-        Some((tab.buffer.text_range(range.clone()), range, start_row, end_row))
+        Some((
+            tab.buffer.text_range(range.clone()),
+            range,
+            start_row,
+            end_row,
+        ))
     }
 
     fn editor_copy(&mut self, cx: &mut Context<Self>) {
@@ -5137,13 +5319,7 @@ impl JadeApp {
 
     /// Left mouse-down on row `row` at window x `x` (click_count drives the
     /// caret/word/line selection).
-    pub fn editor_mouse_down(
-        &mut self,
-        row: usize,
-        x: f32,
-        shift: bool,
-        clicks: usize,
-    ) {
+    pub fn editor_mouse_down(&mut self, row: usize, x: f32, shift: bool, clicks: usize) {
         self.dismiss_popups();
         // Fold in the horizontal scroll so click→column and caret geometry track
         // the glyphs after the code list scrolls sideways (the text_left canvas
@@ -5388,7 +5564,12 @@ impl JadeApp {
         });
     }
 
-    fn on_completion(&mut self, generation: u64, items: Vec<CompletionItem>, anchor: (usize, usize)) {
+    fn on_completion(
+        &mut self,
+        generation: u64,
+        items: Vec<CompletionItem>,
+        anchor: (usize, usize),
+    ) {
         if generation != self.completion_gen {
             return; // superseded
         }
@@ -5643,7 +5824,11 @@ impl JadeApp {
         let line_suffix: String = line.chars().skip(point.col).collect();
         let anchor = (point.row, point.col);
         let path = tab.path.clone();
-        let max_lines = if self.ai_multiline { crate::ghost::MAX_LINES } else { 1 };
+        let max_lines = if self.ai_multiline {
+            crate::ghost::MAX_LINES
+        } else {
+            1
+        };
 
         // Cache hit → serve immediately, no request.
         if let Some(cached) = self.ghost_cache.lookup(&prefix, &suffix) {
@@ -5776,8 +5961,9 @@ impl JadeApp {
 
     // ── Hover ─────────────────────────────────────────────────────────────────
 
-    /// Pointer moved over the code at row `row`, window x `x`: schedule a hover
-    /// request after a 300ms dwell if the target cell changed.
+    /// Pointer moved over the code at row `row`, window x `x`. When the target
+    /// cell changed: show the diagnostics under the pointer at once (the squiggle
+    /// tooltip), and schedule an LSP hover request after a 300ms dwell.
     pub fn editor_hover_move(&mut self, row: usize, x: f32) {
         if self.editor_selecting {
             return;
@@ -5788,30 +5974,47 @@ impl JadeApp {
         let text_left =
             f32::from_bits(self.editor_text_left.load(Ordering::Relaxed)) + self.editor_h_scroll();
         let cw = self.char_w();
-        let (path, pos, cell) = {
+        let (path, pos, cell, diagnostics) = {
             let Some(tab) = self.editor.active_tab() else {
                 return;
             };
-            if !lsp_eligible(&tab.path) {
-                return;
-            }
             let row = row.min(tab.line_count().saturating_sub(1));
             let col = editor_view::px_to_char_col(&tab.buffer.line(row), x - text_left, cw);
             let byte = tab.buffer.point_to_offset(Point::new(row, col));
-            (tab.path.clone(), tab.buffer.offset_to_lsp(byte), (row, col))
+            let diagnostics: Vec<_> =
+                editor_view::diagnostics_at(&tab.diagnostics, &tab.buffer, row, col)
+                    .into_iter()
+                    .map(|d| (d.severity, d.message.clone()))
+                    .collect();
+            (
+                tab.path.clone(),
+                tab.buffer.offset_to_lsp(byte),
+                (row, col),
+                diagnostics,
+            )
         };
         if self.hover_target == Some(cell) {
             return; // same cell — don't re-request
         }
         self.hover_target = Some(cell);
-        self.hover = None;
+        let (row, col) = cell;
+        self.hover = (!diagnostics.is_empty()).then(|| HoverState {
+            text: String::new(),
+            row,
+            col,
+            diagnostics,
+        });
+        // Bump the generation even when no request goes out, so a late reply
+        // for the previous cell cannot land on this one.
+        self.hover_gen += 1;
+        if !lsp_eligible(&path) {
+            return;
+        }
         let Some(lsp) = self.lsp.clone() else {
             return;
         };
-        self.hover_gen += 1;
         let generation = self.hover_gen;
         let tx = self.app_tx.clone();
-        let (row, col) = cell;
         self.runtime.spawn(async move {
             tokio::time::sleep(Duration::from_millis(300)).await;
             let position = jade_lsp::Position::new(pos.line as u32, pos.character as u32);
@@ -5832,11 +6035,19 @@ impl JadeApp {
         if generation != self.hover_gen {
             return;
         }
-        match text {
-            Some(t) if !t.trim().is_empty() => {
-                self.hover = Some(HoverState { text: t, row, col })
-            }
-            _ => self.hover = None,
+        // Keep the diagnostics the move handler already showed for this cell;
+        // the LSP text joins them below.
+        let diagnostics = self.hover.take().map(|h| h.diagnostics).unwrap_or_default();
+        let text = text.filter(|t| !t.trim().is_empty()).unwrap_or_default();
+        if text.is_empty() && diagnostics.is_empty() {
+            self.hover = None;
+        } else {
+            self.hover = Some(HoverState {
+                text,
+                row,
+                col,
+                diagnostics,
+            });
         }
     }
 
@@ -5940,16 +6151,29 @@ impl JadeApp {
         match ev {
             LspEvent::Ready => {}
             LspEvent::Diagnostics { path, diagnostics } => {
-                if let Some(tab) = self.editor.tab_mut_for(&path) {
+                if let Some(tab) = self.any_tab_mut_for(&path) {
                     tab.diagnostics = diagnostics;
                 }
             }
             LspEvent::Exited => {
                 self.lsp = None;
-                for tab in &mut self.editor.tabs {
+                for tab in self.all_tabs_mut() {
                     tab.lsp_opened = false;
                 }
                 self.status_line("[jade] clangd exited");
+            }
+        }
+    }
+
+    /// Send `didClose` for every tab of `editor` that clangd has open (a
+    /// pane close drops a whole tab set at once).
+    pub(crate) fn lsp_close_tabs(&self, editor: &EditorState) {
+        let Some(lsp) = &self.lsp else {
+            return;
+        };
+        for tab in &editor.tabs {
+            if tab.lsp_opened {
+                let _ = lsp.did_close(&tab.path);
             }
         }
     }
@@ -6036,7 +6260,8 @@ impl JadeApp {
         // LSP counts `character` in UTF-16 code units; the buffer converts.
         self.buf_move(
             move |b, _| {
-                let offset = b.lsp_to_offset(jade_buffer::LspPosition::new(row, character as usize));
+                let offset =
+                    b.lsp_to_offset(jade_buffer::LspPosition::new(row, character as usize));
                 b.set_caret(offset);
             },
             false,
@@ -6057,18 +6282,33 @@ impl JadeApp {
     /// True when the right slot shows the Markdown preview: the active tab is
     /// a `.md` file and the preview is not hidden. The preview opens by
     /// itself on a Markdown tab and replaces the mode's side panel (runtime
-    /// sidebar / board) while that tab is in front.
+    /// sidebar / wave panel) while that tab is in front.
     pub fn md_panel_active(&self) -> bool {
-        self.md_visible
+        !self.split_mode()
+            && self.md_visible
             && self
                 .editor
                 .active_tab()
                 .is_some_and(|t| crate::panels::md_view::is_markdown(&t.path))
     }
 
+    /// True when a formatted Markdown view of the active tab is on screen:
+    /// the docked preview, or the focused pane in its formatted mode.
+    pub fn md_preview_shown(&self) -> bool {
+        self.md_panel_active() || self.pane_shows_md(self.focused_pane())
+    }
+
     /// Toggle the Markdown preview panel (⌘⇧D / the `tgl-md` toggle). Hiding
-    /// the panel also leaves preview-edit mode.
+    /// the panel also leaves preview-edit mode. In split mode the chord flips
+    /// the focused pane between formatted and raw instead.
     pub fn toggle_md_preview(&mut self, cx: &mut Context<Self>) {
+        if self.split_mode() {
+            let idx = self.focused_pane();
+            let rendered = self.panes[idx].md_rendered;
+            self.set_pane_md(idx, !rendered);
+            self.schedule_ui_save(cx);
+            return;
+        }
         self.md_visible = !self.md_visible;
         if !self.md_visible {
             self.md_edit = false;
@@ -6146,7 +6386,9 @@ impl JadeApp {
 
     /// The active tab's caret source line (1-based), for asm cross-highlighting.
     fn caret_source_line(&self) -> Option<u32> {
-        self.editor.active_tab().map(|t| t.caret_point().row as u32 + 1)
+        self.editor
+            .active_tab()
+            .map(|t| t.caret_point().row as u32 + 1)
     }
 
     /// Sync the ASM overlay's highlight to the source caret and scroll the first
@@ -6432,14 +6674,12 @@ impl JadeApp {
                 }
                 .to_string(),
             ),
-            dip_switches: self
-                .hw
-                .as_ref()
-                .map(|h| h.dip.to_vec())
-                .unwrap_or_default(),
-            board_width: (self.mode == AppMode::Hardware).then_some(self.board_width as f64),
+            dip_switches: self.hw.as_ref().map(|h| h.dip.to_vec()).unwrap_or_default(),
+            board_width: (self.mode == AppMode::Hardware).then_some(self.wave_width as f64),
             markdown_visible: Some(self.md_visible),
             markdown_width: Some(self.md_width as f64),
+            panes: self.pane_states(),
+            focused_pane: self.split_mode().then(|| self.focused_pane() as i64),
         }
     }
 
@@ -6563,7 +6803,9 @@ impl JadeApp {
         // From the tab that OWNS the card, not the active one — the card
         // survives tab switches, and `after_events` can retry it while a
         // different file is in front.
-        let Some(tab) = self.tab_by_path(&path) else { return };
+        let Some(tab) = self.tab_by_path(&path) else {
+            return;
+        };
         let text = tab.buffer.text_range(range.clone());
         self.start_explain(path, text, range, start_row, end_row, cx);
     }
@@ -6591,15 +6833,15 @@ impl JadeApp {
         text: &str,
         start_row: usize,
         sel_start: usize,
-    ) -> Vec<crate::explain::SymbolDoc> {
+    ) -> SymbolLookup {
         let Some(lsp) = self.lsp.clone() else {
-            return Vec::new();
+            return Box::pin(async { Vec::new() });
         };
         // The tab that owns the fragment — a retry can run while another tab
         // is in front, and positions against the wrong buffer resolve the
         // wrong symbols.
         let Some(tab) = self.tab_by_path(path) else {
-            return Vec::new();
+            return Box::pin(async { Vec::new() });
         };
         let path = tab.path.clone();
         // A selection that starts mid-line yields fragment-relative columns
@@ -6611,7 +6853,7 @@ impl JadeApp {
             start_col,
         );
         if candidates.is_empty() {
-            return Vec::new();
+            return Box::pin(async { Vec::new() });
         }
         // Convert to the UTF-16 positions clangd speaks while the buffer is
         // still borrowed; the async block must not hold it.
@@ -6627,7 +6869,9 @@ impl JadeApp {
             })
             .collect();
 
-        self.runtime.block_on(async move {
+        // The lookups run on the tokio runtime, never on the UI thread: a
+        // cold clangd used to hold the whole window for the budget.
+        Box::pin(async move {
             let lookups = positions.into_iter().map(|(name, pos)| {
                 let lsp = lsp.clone();
                 let path = path.clone();
@@ -6703,7 +6947,9 @@ impl JadeApp {
             .map(|c| {
                 matches!(
                     c.failure(),
-                    Some(crate::visualize::VisualizeError::Chat(ChatError::LocalStarting))
+                    Some(crate::visualize::VisualizeError::Chat(
+                        ChatError::LocalStarting
+                    ))
                 )
             })
             .unwrap_or(false);
@@ -6749,42 +6995,81 @@ impl JadeApp {
         // Resolve the fragment's identifiers against the language server. The
         // reason a fragment is shaped the way it is usually lives in a
         // declaration it refers to, and a line window only catches that when
-        // the declaration happens to be nearby.
+        // the declaration happens to be nearby. The lookups are a future: they
+        // finish on the runtime, and the request is built there too.
         let symbols = self.explain_symbols(&path, &text, start_row, range.start);
         // The file's declarations, without any bodies. A line window shows what
         // is physically near the selection; the outline shows what the file is
         // actually made of, for a fraction of the tokens.
         let skeleton = if crate::explain::has_skeleton(language) {
             self.tab_by_path(&path)
-                .map(|t| {
-                    crate::explain::file_skeleton(&t.buffer.to_string(), start_row..=end_row)
-                })
+                .map(|t| crate::explain::file_skeleton(&t.buffer.to_string(), start_row..=end_row))
                 .unwrap_or_default()
         } else {
             String::new()
         };
-        let sel = Selected {
-            path: &path,
-            language,
-            start_row,
-            end_row,
-            text: &text,
-            line: &line,
-            symbols: &symbols,
-            skeleton: &skeleton,
+        let card = {
+            let sel = Selected {
+                path: &path,
+                language,
+                start_row,
+                end_row,
+                text: &text,
+                line: &line,
+                symbols: &[],
+                skeleton: &skeleton,
+            };
+            ExplainCard::new(generation, &sel, range).started_at(self.now_ms())
         };
-        let req = crate::explain::explain_request(&sel);
-        let mut card = ExplainCard::new(generation, &sel, range).started_at(self.now_ms());
 
         // Nothing can serve yet: park the card with the reason rather than
         // sending a request that is certain to fail.
         if let Some(blocked) = self.ensure_chat_model() {
+            let mut card = card;
             card.apply(ChatDelta::Failed(blocked));
             self.explain = Some(card);
             cx.notify();
             return;
         }
         self.explain = Some(card);
+
+        let app_tx = self.app_tx.clone();
+        self.runtime.spawn(async move {
+            let symbols = symbols.await;
+            let sel = Selected {
+                path: &path,
+                language,
+                start_row,
+                end_row,
+                text: &text,
+                line: &line,
+                symbols: &symbols,
+                skeleton: &skeleton,
+            };
+            let req = crate::explain::explain_request(&sel);
+            let _ = app_tx.send(AppEvent::ExplainReady { generation, req });
+        });
+        cx.notify();
+    }
+
+    /// The request is built: start the chat call and forward its deltas.
+    fn on_explain_ready(&mut self, generation: u64, req: jade_ai::ChatRequest) {
+        if generation != self.explain_gen {
+            return;
+        }
+        let Some(card) = &mut self.explain else {
+            return;
+        };
+        if card.generation != generation || !card.in_flight() {
+            return;
+        }
+        // The model may have gone away while the lookups ran.
+        if let Some(blocked) = self.ensure_chat_model() {
+            if let Some(card) = &mut self.explain {
+                card.apply(ChatDelta::Failed(blocked));
+            }
+            return;
+        }
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         self.chat.start(Lane::Explain, req, tx);
@@ -6802,7 +7087,6 @@ impl JadeApp {
                 }
             }
         });
-        cx.notify();
     }
 
     /// Apply one streamed delta, dropping anything from a superseded request.
@@ -6810,7 +7094,9 @@ impl JadeApp {
         if generation != self.explain_gen {
             return;
         }
-        let Some(card) = &mut self.explain else { return };
+        let Some(card) = &mut self.explain else {
+            return;
+        };
         if card.generation != generation {
             return;
         }
@@ -7003,9 +7289,8 @@ impl JadeApp {
                 symbols: &[],
                 skeleton: "",
             };
-            let mut card =
-                crate::visualize::VisualizeCard::new(self.visualize_gen, &sel, range)
-                    .started_at(self.now_ms());
+            let mut card = crate::visualize::VisualizeCard::new(self.visualize_gen, &sel, range)
+                .started_at(self.now_ms());
             card.phase = crate::visualize::VisualizePhase::Consent;
             self.visualize = Some(card);
             cx.notify();
@@ -7027,7 +7312,9 @@ impl JadeApp {
         let (path, start_row, end_row, range) =
             (c.path.clone(), c.start_row, c.end_row, c.sel_range.clone());
         // The tab that owns the card, not the active one.
-        let Some(tab) = self.tab_by_path(&path) else { return };
+        let Some(tab) = self.tab_by_path(&path) else {
+            return;
+        };
         let text = tab.buffer.text_range(range.clone());
         self.start_visualize(path, text, range, start_row, end_row, cx);
     }
@@ -7040,7 +7327,9 @@ impl JadeApp {
             (c.path.clone(), c.start_row, c.end_row, c.sel_range.clone());
         // The tab that owns the card, not the active one — `after_events`
         // retries a parked card while any tab may be in front.
-        let Some(tab) = self.tab_by_path(&path) else { return };
+        let Some(tab) = self.tab_by_path(&path) else {
+            return;
+        };
         let text = tab.buffer.text_range(range.clone());
         self.start_visualize(path, text, range, start_row, end_row, cx);
     }
@@ -7068,8 +7357,7 @@ impl JadeApp {
         // user explicitly pointed chat at their own instruct server
         // (JADE_CHAT_ENDPOINT), Visualize needs the Anthropic credential —
         // and says so up front, as a setup step.
-        if jade_ai::ChatBackend::endpoint_override().is_none()
-            && self.chat.credential().0.is_none()
+        if jade_ai::ChatBackend::endpoint_override().is_none() && self.chat.credential().0.is_none()
         {
             let f = |_: usize| None;
             let sel = Selected {
@@ -7113,21 +7401,22 @@ impl JadeApp {
         } else {
             String::new()
         };
-        let sel = Selected {
-            path: &path,
-            language,
-            start_row,
-            end_row,
-            text: &text,
-            line: &line,
-            symbols: &symbols,
-            skeleton: &skeleton,
+        let card = {
+            let sel = Selected {
+                path: &path,
+                language,
+                start_row,
+                end_row,
+                text: &text,
+                line: &line,
+                symbols: &[],
+                skeleton: &skeleton,
+            };
+            crate::visualize::VisualizeCard::new(generation, &sel, range).started_at(self.now_ms())
         };
-        let req = crate::visualize::visualize_request(&sel);
-        let mut card = crate::visualize::VisualizeCard::new(generation, &sel, range)
-            .started_at(self.now_ms());
 
         if let Some(blocked) = self.ensure_chat_model() {
+            let mut card = card;
             card.apply_chat(ChatDelta::Failed(blocked));
             self.visualize = Some(card);
             cx.notify();
@@ -7135,6 +7424,40 @@ impl JadeApp {
         }
         self.visualize = Some(card);
 
+        let app_tx = self.app_tx.clone();
+        self.runtime.spawn(async move {
+            let symbols = symbols.await;
+            let sel = Selected {
+                path: &path,
+                language,
+                start_row,
+                end_row,
+                text: &text,
+                line: &line,
+                symbols: &symbols,
+                skeleton: &skeleton,
+            };
+            let req = crate::visualize::visualize_request(&sel);
+            let _ = app_tx.send(AppEvent::VisualizeReady { generation, req });
+        });
+        cx.notify();
+    }
+
+    /// The request is built: start the chat call and forward its deltas.
+    fn on_visualize_ready(&mut self, generation: u64, req: jade_ai::ChatRequest) {
+        if generation != self.visualize_gen {
+            return;
+        }
+        let Some(card) = &self.visualize else { return };
+        if card.generation != generation {
+            return;
+        }
+        if let Some(blocked) = self.ensure_chat_model() {
+            if let Some(card) = &mut self.visualize {
+                card.apply_chat(ChatDelta::Failed(blocked));
+            }
+            return;
+        }
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         self.chat.start(Lane::Visualize, req, tx);
         let app_tx = self.app_tx.clone();
@@ -7148,7 +7471,6 @@ impl JadeApp {
                 }
             }
         });
-        cx.notify();
     }
 
     /// Apply one streamed chat delta; when the script clears the gate, start
@@ -7157,7 +7479,9 @@ impl JadeApp {
         if generation != self.visualize_gen {
             return;
         }
-        let Some(card) = &mut self.visualize else { return };
+        let Some(card) = &mut self.visualize else {
+            return;
+        };
         if card.generation != generation {
             return;
         }
@@ -7213,7 +7537,9 @@ impl JadeApp {
         if generation != self.visualize_gen {
             return;
         }
-        let Some(card) = &mut self.visualize else { return };
+        let Some(card) = &mut self.visualize else {
+            return;
+        };
         if card.generation != generation {
             return;
         }
@@ -7267,7 +7593,10 @@ impl JadeApp {
     /// True while the card has request/render animation to run (the ticker's
     /// gate; playback repaints come from `request_animation_frame` instead).
     pub fn visualize_working(&self) -> bool {
-        self.visualize.as_ref().map(|c| c.in_flight()).unwrap_or(false)
+        self.visualize
+            .as_ref()
+            .map(|c| c.in_flight())
+            .unwrap_or(false)
     }
 
     pub fn visualize_card_height(&self) -> Option<f32> {
@@ -7278,7 +7607,9 @@ impl JadeApp {
     /// True when a Visualize card is open for the active tab (hidden, not
     /// destroyed, while another tab is in front — same as Explain).
     pub fn visualize_visible(&self) -> bool {
-        let Some(c) = &self.visualize else { return false };
+        let Some(c) = &self.visualize else {
+            return false;
+        };
         self.editor
             .active_tab()
             .map(|t| t.path == c.path)
@@ -7352,7 +7683,9 @@ impl JadeApp {
         if !self.visualize_visible() && !popped_out {
             return;
         }
-        let Some(player) = &mut self.visualize_player else { return };
+        let Some(player) = &mut self.visualize_player else {
+            return;
+        };
         let t = player.transport();
         if !t.playing {
             return;
@@ -7627,8 +7960,8 @@ impl Render for JadeApp {
         // §4.15 risk 1: a playing clip repaints this whole tree per frame.
         // `JADE_RENDER_TRACE=1` prints the element-build time so a stutter can
         // be measured against the 16ms budget instead of argued about.
-        let trace_started = std::env::var_os("JADE_RENDER_TRACE")
-            .map(|_| std::time::Instant::now());
+        let trace_started =
+            std::env::var_os("JADE_RENDER_TRACE").map(|_| std::time::Instant::now());
         let theme = self.theme.clone();
 
         // Re-bake tensor-preview textures whose newest frame advanced (a step
@@ -7665,8 +7998,8 @@ impl Render for JadeApp {
         if self.editor_focus.is_none() {
             self.editor_focus = Some(cx.focus_handle());
         }
-        // The board panel's focus handle (hardware mode): scopes the plain
-        // keys (1-4, q-t, space, `.`) to the board.
+        // The wave panel's focus handle (hardware mode): scopes the plain
+        // keys (+/-, f, arrows) to the panel.
         if self.mode == AppMode::Hardware && self.hw_focus.is_none() {
             self.hw_focus = Some(cx.focus_handle());
         }
@@ -7682,7 +8015,11 @@ impl Render for JadeApp {
                         .await;
                     let alive = this.update(cx, |app, cx| {
                         let idle = app.now_ms().saturating_sub(app.caret_last_active);
-                        let show = if idle < 530 { true } else { !app.caret_blink_show };
+                        let show = if idle < 530 {
+                            true
+                        } else {
+                            !app.caret_blink_show
+                        };
                         if show != app.caret_blink_show {
                             app.caret_blink_show = show;
                             cx.notify();
@@ -7731,22 +8068,20 @@ impl Render for JadeApp {
         // through this — `ensure_video_frame` paces itself off vsync.
         if !self.visualize_ticking && self.visualize_working() {
             self.visualize_ticking = true;
-            cx.spawn(async move |this, cx| {
-                loop {
-                    cx.background_executor()
-                        .timer(std::time::Duration::from_millis(33))
-                        .await;
-                    let alive = this.update(cx, |app, cx| {
-                        if !app.visualize_working() {
-                            app.visualize_ticking = false;
-                            return false;
-                        }
-                        cx.notify();
-                        true
-                    });
-                    if !matches!(alive, Ok(true)) {
-                        break;
+            cx.spawn(async move |this, cx| loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(33))
+                    .await;
+                let alive = this.update(cx, |app, cx| {
+                    if !app.visualize_working() {
+                        app.visualize_ticking = false;
+                        return false;
                     }
+                    cx.notify();
+                    true
+                });
+                if !matches!(alive, Ok(true)) {
+                    break;
                 }
             })
             .detach();
@@ -7815,7 +8150,10 @@ impl Render for JadeApp {
         // frame) lets the user click into the editor with the bar still showing.
         if self.pending_find_focus && self.find.is_some() {
             self.pending_find_focus = false;
-            let fh = self.find_focus.get_or_insert_with(|| cx.focus_handle()).clone();
+            let fh = self
+                .find_focus
+                .get_or_insert_with(|| cx.focus_handle())
+                .clone();
             if !fh.is_focused(window) {
                 fh.focus(window, cx);
             }
@@ -7825,15 +8163,25 @@ impl Render for JadeApp {
         self.find_bar_focused = self
             .find
             .is_some()
-            .then(|| self.find_focus.as_ref().map(|f| f.is_focused(window)).unwrap_or(false))
+            .then(|| {
+                self.find_focus
+                    .as_ref()
+                    .map(|f| f.is_focused(window))
+                    .unwrap_or(false)
+            })
             .unwrap_or(false);
 
         // Benchmark-name input focus (§5.4): focus it while naming so keystrokes
         // reach the inline input instead of the editor/terminal. Skipped while a
         // dim editor (below) also wants focus — the two rarely coexist, but
         // guard the ping-pong anyway.
-        let bench_handle = self.bench_focus.get_or_insert_with(|| cx.focus_handle()).clone();
-        if self.bench_naming.is_some() && !bench_handle.is_focused(window) && self.dim_edit.is_none()
+        let bench_handle = self
+            .bench_focus
+            .get_or_insert_with(|| cx.focus_handle())
+            .clone();
+        if self.bench_naming.is_some()
+            && !bench_handle.is_focused(window)
+            && self.dim_edit.is_none()
         {
             bench_handle.focus(window, cx);
         }
@@ -7842,7 +8190,10 @@ impl Render for JadeApp {
         // inline editor (wg3d toolbar or telemetry sidebar row) while a session
         // is open, same pattern as the benchmark-name input above.
         if self.dim_edit.is_some() {
-            let dim_handle = self.dim_edit_focus.get_or_insert_with(|| cx.focus_handle()).clone();
+            let dim_handle = self
+                .dim_edit_focus
+                .get_or_insert_with(|| cx.focus_handle())
+                .clone();
             if !dim_handle.is_focused(window) && self.bench_naming.is_none() {
                 dim_handle.focus(window, cx);
             }
@@ -7853,16 +8204,17 @@ impl Render for JadeApp {
         // screen. (The preview → editor direction lives in
         // `md_preview_click`.) Guarded by `md_synced` so it fires once per
         // caret move, not on every animation frame.
-        if self.md_panel_active() {
+        if self.md_preview_shown() {
             if let Some(tab) = self.editor.active_tab() {
                 let key = (tab.path.clone(), tab.caret_point().row);
                 if self.md_synced.as_ref() != Some(&key) {
                     let blocks = crate::panels::md_view::parse_blocks(&tab.buffer.to_string());
-                    self.md_scroll.scroll_to_item(crate::panels::md_view::child_index_for_row(
-                        &blocks,
-                        key.1,
-                        self.md_edit,
-                    ));
+                    self.md_scroll
+                        .scroll_to_item(crate::panels::md_view::child_index_for_row(
+                            &blocks,
+                            key.1,
+                            self.md_edit,
+                        ));
                     self.md_synced = Some(key);
                 }
             }
@@ -7874,7 +8226,9 @@ impl Render for JadeApp {
             .size_full()
             .bg(rgb(theme.bg))
             .text_color(rgb(theme.text))
-            .font_family(crate::fonts::mono_family()) // bundled JetBrains Mono, else Menlo
+            // The chrome is set in the system UI font; every code, terminal,
+            // and numeric surface opts back into the mono family itself.
+            .font_family(crate::fonts::ui_family())
             .font_features(crate::fonts::code_features()) // no `<=` ligatures
             .text_sm()
             // Global ⌘P: toggle Quick Open (§5.7). Root-level so it fires whether
@@ -7916,6 +8270,20 @@ impl Render for JadeApp {
                         app.toggle_quick_open();
                         cx.notify();
                     }
+                    // ⌘\ splits the editor (also bound in the editor path;
+                    // this catches an unfocused editor).
+                    "\\" if m.platform && app.workspace_opened => {
+                        app.split_pane();
+                        app.schedule_ui_save(cx);
+                        cx.notify();
+                    }
+                    // ⌘1..⌘4 give pane N the keyboard (split mode only).
+                    "1" | "2" | "3" | "4" if m.platform && app.split_mode() => {
+                        let n = ks.key.parse::<usize>().unwrap_or(1).saturating_sub(1);
+                        app.focus_pane(n);
+                        app.schedule_ui_save(cx);
+                        cx.notify();
+                    }
                     // ⌘⇧O / ⌘O (both unbound in the editor path) open the folder
                     // picker (inventory §2). Fires whether or not a workspace is
                     // already open, so you can switch folders any time.
@@ -7953,6 +8321,14 @@ impl Render for JadeApp {
                         app.close_diag_popup();
                         cx.notify();
                     }
+                    "escape" if app.ai_menu_open => {
+                        app.close_ai_menu();
+                        cx.notify();
+                    }
+                    "escape" if app.run_menu_open => {
+                        app.close_run_menu();
+                        cx.notify();
+                    }
                     // Debug stepping (§3): F5 continue, F10 over, F11 into, ⇧F11 out.
                     // Software mode only — hardware has no LLDB surface.
                     "f5" if app.mode == AppMode::Software => {
@@ -7977,84 +8353,106 @@ impl Render for JadeApp {
             // Bottom-panel resize drag: while the top-edge handle is held, track
             // the pointer at the root so an upward drag past the panel edge (over
             // the editor) still resizes. Dragging up grows the panel.
-            .on_mouse_move(cx.listener(|app: &mut JadeApp, ev: &gpui::MouseMoveEvent, window, cx| {
-                // Visualize scrub drag: tracked at the root so the drag keeps
-                // seeking when the pointer leaves the bar (same reason the
-                // bottom-panel resize lives here).
-                if app.visualize_scrubbing {
-                    if ev.pressed_button != Some(MouseButton::Left) {
-                        app.visualize_scrubbing = false;
-                    } else {
-                        let x0 = f32::from_bits(
-                            app.visualize_scrub_bounds[0].load(Ordering::Relaxed),
-                        );
-                        let w = f32::from_bits(
-                            app.visualize_scrub_bounds[1].load(Ordering::Relaxed),
-                        );
-                        if w > 1.0 {
-                            let frac = (f32::from(ev.position.x) - x0) / w;
-                            app.visualize_seek_fraction(frac);
-                            cx.notify();
+            .on_mouse_move(cx.listener(
+                |app: &mut JadeApp, ev: &gpui::MouseMoveEvent, window, cx| {
+                    // Visualize scrub drag: tracked at the root so the drag keeps
+                    // seeking when the pointer leaves the bar (same reason the
+                    // bottom-panel resize lives here).
+                    if app.visualize_scrubbing {
+                        if ev.pressed_button != Some(MouseButton::Left) {
+                            app.visualize_scrubbing = false;
+                        } else {
+                            let x0 = f32::from_bits(
+                                app.visualize_scrub_bounds[0].load(Ordering::Relaxed),
+                            );
+                            let w = f32::from_bits(
+                                app.visualize_scrub_bounds[1].load(Ordering::Relaxed),
+                            );
+                            if w > 1.0 {
+                                let frac = (f32::from(ev.position.x) - x0) / w;
+                                app.visualize_seek_fraction(frac);
+                                cx.notify();
+                            }
+                            return;
                         }
-                        return;
                     }
-                }
-                // Markdown-preview resize drag: left-edge handle, dragging
-                // left grows the panel (same shape as the board drawer).
-                if let Some((start_x, start_w)) = app.md_resize {
+                    // Pane divider drag: the divider follows the pointer, and
+                    // width share moves between its two neighbors.
+                    if let Some((left, start_x, w0, w1)) = app.pane_resize {
+                        if ev.pressed_button != Some(MouseButton::Left) {
+                            app.pane_resize = None;
+                        } else {
+                            let dx = f32::from(ev.position.x) - start_x;
+                            let row_w = f32::from_bits(app.pane_row_w.load(Ordering::Relaxed));
+                            app.resize_panes(left, dx, w0, w1, row_w);
+                            cx.notify();
+                            return;
+                        }
+                    }
+                    // Markdown-preview resize drag: left-edge handle, dragging
+                    // left grows the panel (same shape as the wave drawer).
+                    if let Some((start_x, start_w)) = app.md_resize {
+                        if ev.pressed_button != Some(MouseButton::Left) {
+                            app.md_resize = None;
+                        } else {
+                            let dx = start_x - f32::from(ev.position.x);
+                            app.md_width = (start_w + dx).clamp(
+                                crate::panels::md_view::MIN_W,
+                                crate::panels::md_view::MAX_W,
+                            );
+                            cx.notify();
+                            return;
+                        }
+                    }
+                    // Wave-drawer resize drag (hardware mode): left-edge handle,
+                    // dragging left grows the drawer.
+                    if let Some((start_x, start_w)) = app.wave_resize {
+                        if ev.pressed_button != Some(MouseButton::Left) {
+                            app.wave_resize = None;
+                        } else {
+                            let dx = start_x - f32::from(ev.position.x);
+                            app.wave_width =
+                                (start_w + dx).clamp(crate::wave::MIN_W, crate::wave::MAX_W);
+                            cx.notify();
+                            return;
+                        }
+                    }
+                    let Some((start_y, start_h)) = app.bottom_resize else {
+                        return;
+                    };
                     if ev.pressed_button != Some(MouseButton::Left) {
-                        app.md_resize = None;
-                    } else {
-                        let dx = start_x - f32::from(ev.position.x);
-                        app.md_width = (start_w + dx).clamp(
-                            crate::panels::md_view::MIN_W,
-                            crate::panels::md_view::MAX_W,
-                        );
-                        cx.notify();
+                        app.bottom_resize = None;
                         return;
                     }
-                }
-                // Board-drawer resize drag (hardware mode): left-edge handle,
-                // dragging left grows the drawer.
-                if let Some((start_x, start_w)) = app.board_resize {
-                    if ev.pressed_button != Some(MouseButton::Left) {
-                        app.board_resize = None;
-                    } else {
-                        let dx = start_x - f32::from(ev.position.x);
-                        app.board_width = (start_w + dx).clamp(340., 640.);
-                        cx.notify();
-                        return;
-                    }
-                }
-                let Some((start_y, start_h)) = app.bottom_resize else { return };
-                if ev.pressed_button != Some(MouseButton::Left) {
-                    app.bottom_resize = None;
-                    return;
-                }
-                let dy = start_y - f32::from(ev.position.y);
-                let max_h = (f32::from(window.viewport_size().height) - 200.).max(160.);
-                app.bottom_height = (start_h + dy).clamp(120., max_h);
-                cx.notify();
-            }))
+                    let dy = start_y - f32::from(ev.position.y);
+                    let max_h = (f32::from(window.viewport_size().height) - 200.).max(160.);
+                    app.bottom_height = (start_h + dy).clamp(120., max_h);
+                    cx.notify();
+                },
+            ))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|app: &mut JadeApp, _ev: &gpui::MouseUpEvent, _w, cx| {
                     if app.bottom_resize.take().is_some() {
                         cx.notify();
                     }
-                    if app.board_resize.take().is_some() {
-                        app.schedule_ui_save(cx); // boardWidth (§B8)
+                    if app.wave_resize.take().is_some() {
+                        app.schedule_ui_save(cx); // boardWidth (the wave drawer width)
                         cx.notify();
                     }
                     if app.md_resize.take().is_some() {
                         app.schedule_ui_save(cx); // markdownWidth
                         cx.notify();
                     }
-                    // Mouse-up anywhere releases held board buttons, so a
-                    // drag off a button cannot leave it stuck down.
-                    if app.hw.as_ref().is_some_and(|h| h.pb.iter().any(|p| *p)) {
-                        app.hw_release_all_pb();
+                    if app.pane_resize.take().is_some() {
+                        app.schedule_ui_save(cx); // pane weights
                         cx.notify();
+                    }
+                    // Mouse-up anywhere ends a wave-canvas pan.
+                    if let Some(hw) = &mut app.hw {
+                        if hw.wave.drag.take().is_some() {
+                            cx.notify();
+                        }
                     }
                     if std::mem::take(&mut app.visualize_scrubbing) {
                         cx.notify();
@@ -8078,12 +8476,12 @@ impl Render for JadeApp {
                     .child(left_panel(self, cx, &theme))
                     .child(center_content(self, cx, &theme))
                     // Right slot: a Markdown tab shows the preview (both
-                    // modes); else hardware shows the board and software the
-                    // runtime sidebar.
+                    // modes); else hardware shows the wave panel and software
+                    // the runtime sidebar.
                     .child(if self.md_panel_active() {
                         crate::panels::md_view::panel(self, cx, &theme)
                     } else if self.mode == AppMode::Hardware {
-                        crate::panels::board_view::panel(self, cx, &theme)
+                        crate::panels::wave_view::panel(self, cx, &theme)
                     } else {
                         runtime_sidebar(self, cx, &theme, bench_handle)
                     }),
@@ -8103,7 +8501,13 @@ impl Render for JadeApp {
                 div()
                     .flex_none()
                     .overflow_hidden()
-                    .child(bottom_panel(self, cx, &theme, term_handle, f32::from(window.viewport_size().width)))
+                    .child(bottom_panel(
+                        self,
+                        cx,
+                        &theme,
+                        term_handle,
+                        f32::from(window.viewport_size().width),
+                    ))
                     .with_animation(
                         ("bottom-slide", self.bottom_anim_gen),
                         Animation::new(std::time::Duration::from_millis(SIDEBAR_SLIDE_MS))
@@ -8115,11 +8519,9 @@ impl Render for JadeApp {
                     ),
             );
         }
-        // The memory bar is a C++ telemetry surface — software mode only.
-        if self.mode == AppMode::Software {
-            root = root.child(memory_bar(self, &theme));
-        }
-        let mut root = root.child(status_strip(self, &theme));
+        // One bottom strip: probe status, the memory metrics (software mode),
+        // and CPU / GPU load.
+        let mut root = root.child(status_bar(self, &theme));
 
         // §7.2 open/close hook: while visible, overlay the full-window 3D grid
         // on top of everything and hand it keyboard focus (for Esc).
@@ -8173,6 +8575,12 @@ impl Render for JadeApp {
         // (completion · multiline · model tier + live status).
         if self.ai_menu_open {
             root = root.child(ai_menu(self, cx, &theme));
+        }
+
+        // Run menu: hangs under the Run split button (Run · Run with tracking
+        // · Debug · Debug with tracking).
+        if self.run_menu_open {
+            root = root.child(run_menu(self, cx, &theme));
         }
 
         // Diagnostic popup: the error / warning / note list for the active tab,
@@ -8281,9 +8689,9 @@ fn action_bar_frame(theme: &Theme) -> gpui::Div {
         .flex_row()
         .items_center()
         .justify_between()
-        .h(px(44.))
+        .h(px(38.))
         .pl(px(80.)) // clear the traffic lights (hiddenInset title bar)
-        .pr(scale::SPACE_3)
+        .pr(scale::SPACE_2)
         .bg(theme.kumo.elevated)
         .border_b_1()
         .border_color(theme.kumo.hairline)
@@ -8297,31 +8705,55 @@ fn diag_badges_row(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> g
     div()
         .flex()
         .items_center()
-        .gap_2()
+        .gap(scale::SPACE_1)
         .text_xs()
         .child(diag_pill(
-            "pill-err", "circle-x", errs, BadgeVariant::Error, DiagKind::Error,
-            open == Some(DiagKind::Error), theme, cx,
+            "pill-err",
+            "circle-x",
+            errs,
+            BadgeVariant::Error,
+            DiagKind::Error,
+            open == Some(DiagKind::Error),
+            theme,
+            cx,
         ))
         .child(diag_pill(
-            "pill-warn", "triangle-alert", warns, BadgeVariant::Warning, DiagKind::Warning,
-            open == Some(DiagKind::Warning), theme, cx,
+            "pill-warn",
+            "triangle-alert",
+            warns,
+            BadgeVariant::Warning,
+            DiagKind::Warning,
+            open == Some(DiagKind::Warning),
+            theme,
+            cx,
         ))
         .child(diag_pill(
-            "pill-info", "info", infos, BadgeVariant::Secondary, DiagKind::Info,
-            open == Some(DiagKind::Info), theme, cx,
+            "pill-info",
+            "info",
+            infos,
+            BadgeVariant::Secondary,
+            DiagKind::Info,
+            open == Some(DiagKind::Info),
+            theme,
+            cx,
         ))
         // Record the row's bottom-left in window px so the popup hangs under
         // the pills wherever the action bar puts them.
         .child(anchor_canvas(app.diag_anchor.clone()))
 }
 
-/// The hardware-mode action bar (§B6): board/terminal/files toggles + the
+/// The hardware-mode action bar (§B6): wave/terminal/files toggles + the
 /// diagnostic pills on the left; the simulation transport (Run/Pause, Step,
 /// slow motion), "Flash board", theme, and open-folder on the right.
-fn hardware_action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> gpui::AnyElement {
+fn hardware_action_bar(
+    app: &JadeApp,
+    cx: &mut Context<JadeApp>,
+    theme: &Theme,
+) -> gpui::AnyElement {
     let hw = app.hw.as_ref();
-    let running = hw.map(|h| h.run_state == jade_hw::HwRunState::Running).unwrap_or(false);
+    let running = hw
+        .map(|h| h.run_state == jade_hw::HwRunState::Running)
+        .unwrap_or(false);
     let compiling = hw.map(|h| h.compiling).unwrap_or(false);
     let flashing = hw.map(|h| h.flashing).unwrap_or(false);
     let slow_mo = hw.map(|h| h.slow_mo).unwrap_or(false);
@@ -8331,48 +8763,88 @@ fn hardware_action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) 
         .flex()
         .items_center()
         .gap_1()
-        .child(icon_btn("tgl-files", "panel-left", theme, !app.sidebar_collapsed, cx, |a, _| {
-            a.toggle_sidebar()
-        }))
-        .child(icon_btn("tgl-terminal", "terminal", theme, terminal_active, cx, |a, cx| {
-            if a.output_visible && a.bottom_view == BottomView::Terminal {
-                a.action_toggle_output(cx);
-            } else {
-                a.set_bottom_view(BottomView::Terminal);
-            }
-            a.schedule_ui_save(cx);
-        }))
-        .child(icon_btn("tgl-board", "cpu", theme, app.board_visible, cx, |a, _| {
-            a.board_visible = !a.board_visible;
-        }));
+        .child(icon_btn(
+            "tgl-files",
+            "panel-left",
+            theme,
+            !app.sidebar_collapsed,
+            cx,
+            |a, _| a.toggle_sidebar(),
+        ))
+        .child(icon_btn(
+            "tgl-terminal",
+            "terminal",
+            theme,
+            terminal_active,
+            cx,
+            |a, cx| {
+                if a.output_visible && a.bottom_view == BottomView::Terminal {
+                    a.action_toggle_output(cx);
+                } else {
+                    a.set_bottom_view(BottomView::Terminal);
+                }
+                a.schedule_ui_save(cx);
+            },
+        ))
+        .child(icon_btn(
+            "tgl-wave",
+            "activity",
+            theme,
+            app.wave_visible,
+            cx,
+            |a, _| {
+                a.wave_visible = !a.wave_visible;
+            },
+        ));
 
     let run_label = if running { "Pause" } else { "Run" }.to_string();
     let right_group = div()
         .flex()
         .items_center()
-        .gap(scale::SPACE_2)
+        .gap(scale::SPACE_1)
         .child(pill_btn(
             "hw-run",
             if running { "pause" } else { "play" },
             run_label,
-            ButtonVariant::Primary,
+            theme.kumo.text_link,
             theme,
             false,
             cx,
             |a, _| a.hw_toggle_run(),
         ))
         // Step is meaningful only while paused.
-        .child(flat_btn("hw-step", "skip-forward", "Step", theme.muted, theme, false, running, cx, |a, _| {
-            a.hw_step()
-        }))
-        .child(flat_btn("hw-slowmo", "timer", "Slow", theme.muted, theme, slow_mo, false, cx, |a, _| {
-            a.hw_toggle_slowmo()
-        }))
+        .child(flat_btn(
+            "hw-step",
+            "skip-forward",
+            "Step",
+            theme.muted,
+            theme,
+            false,
+            running,
+            cx,
+            |a, _| a.hw_step(),
+        ))
+        .child(flat_btn(
+            "hw-slowmo",
+            "timer",
+            "Slow",
+            theme.muted,
+            theme,
+            slow_mo,
+            false,
+            cx,
+            |a, _| a.hw_toggle_slowmo(),
+        ))
         .child(pill_btn(
             "hw-flash",
             "zap",
-            if flashing { "Flashing…" } else { "Flash board" }.to_string(),
-            ButtonVariant::Secondary,
+            if flashing {
+                "Flashing…"
+            } else {
+                "Flash board"
+            }
+            .to_string(),
+            theme.kumo.success,
             theme,
             compiling || flashing,
             cx,
@@ -8386,9 +8858,14 @@ fn hardware_action_bar(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) 
             cx,
             |a, _| a.action_theme(),
         ))
-        .child(icon_btn("btn-open-folder", "folder-open", theme, false, cx, |a, cx| {
-            a.prompt_open_project(cx)
-        }));
+        .child(icon_btn(
+            "btn-open-folder",
+            "folder-open",
+            theme,
+            false,
+            cx,
+            |a, cx| a.prompt_open_project(cx),
+        ));
 
     action_bar_frame(theme)
         .child(
@@ -8421,26 +8898,55 @@ fn software_action_bar(
         .flex()
         .items_center()
         .gap_1()
-        .child(icon_btn("tgl-files", "panel-left", theme, !app.sidebar_collapsed, cx, |a, _| {
-            a.toggle_sidebar()
-        }))
-        .child(icon_btn("tgl-terminal", "terminal", theme, terminal_active, cx, |a, cx| {
-            if a.output_visible && a.bottom_view == BottomView::Terminal {
-                a.action_toggle_output(cx);
-            } else {
-                a.set_bottom_view(BottomView::Terminal);
-            }
-            a.schedule_ui_save(cx); // terminalVisible (§1.2)
-        }))
-        .child(icon_btn("tgl-flow", "corner-down-right", theme, app.flow_visible, cx, |a, _| {
-            a.action_toggle_flow()
-        }))
-        .child(icon_btn("tgl-runtime", "gauge", theme, app.runtime_visible, cx, |a, cx| {
-            a.action_toggle_runtime(cx)
-        }))
-        .child(icon_btn("tgl-md", "file-text", theme, app.md_visible, cx, |a, cx| {
-            a.toggle_md_preview(cx) // markdownVisible
-        }));
+        .child(icon_btn(
+            "tgl-files",
+            "panel-left",
+            theme,
+            !app.sidebar_collapsed,
+            cx,
+            |a, _| a.toggle_sidebar(),
+        ))
+        .child(icon_btn(
+            "tgl-terminal",
+            "terminal",
+            theme,
+            terminal_active,
+            cx,
+            |a, cx| {
+                if a.output_visible && a.bottom_view == BottomView::Terminal {
+                    a.action_toggle_output(cx);
+                } else {
+                    a.set_bottom_view(BottomView::Terminal);
+                }
+                a.schedule_ui_save(cx); // terminalVisible (§1.2)
+            },
+        ))
+        .child(icon_btn(
+            "tgl-flow",
+            "corner-down-right",
+            theme,
+            app.flow_visible,
+            cx,
+            |a, _| a.action_toggle_flow(),
+        ))
+        .child(icon_btn(
+            "tgl-runtime",
+            "gauge",
+            theme,
+            app.runtime_visible,
+            cx,
+            |a, cx| a.action_toggle_runtime(cx),
+        ))
+        .child(icon_btn(
+            "tgl-md",
+            "file-text",
+            theme,
+            app.md_visible,
+            cx,
+            |a, cx| {
+                a.toggle_md_preview(cx) // markdownVisible
+            },
+        ));
 
     // Diagnostic pills (always visible, zero included — screenshot center-left).
     // Each one opens the popup listing that severity, and every row in it jumps
@@ -8450,11 +8956,19 @@ fn software_action_bar(
     let right_group = div()
         .flex()
         .items_center()
-        .gap(scale::SPACE_2)
+        .gap(scale::SPACE_1)
         // ASM viewer (§6, ⌘⇧A): plain icon+label, no box.
-        .child(flat_btn("chip-asm", "code", "ASM", theme.muted, theme, app.asm_visible, false, cx, |a, cx| {
-            a.toggle_asm(cx)
-        }))
+        .child(flat_btn(
+            "chip-asm",
+            "code",
+            "ASM",
+            theme.muted,
+            theme,
+            app.asm_visible,
+            false,
+            cx,
+            |a, cx| a.toggle_asm(cx),
+        ))
         // Hand-off to CLion at the caret line (⌘⇧C): Jade analyzes, CLion edits.
         .child(flat_btn(
             "chip-clion",
@@ -8467,40 +8981,83 @@ fn software_action_bar(
             cx,
             |a, _| a.action_open_in_clion(),
         ))
-        // Build / Run: outlined accent pills (screenshot ref).
+        // Build / Run: the old `.action-build` / `.action-run` colored
+        // outlines — emerald for Build, periwinkle for Run.
         .child(pill_btn(
             "btn-build",
             "hammer",
             build_label,
-            ButtonVariant::Secondary,
+            theme.kumo.success,
             theme,
             app.building,
             cx,
             |a, _| a.action_build(),
         ))
-        .child(pill_btn(
-            "btn-run",
-            "play",
-            run_label,
-            ButtonVariant::Primary,
+        // Run is a split button, the way VS Code's is: the main half launches
+        // now, the chevron half opens a menu with the "with tracking" flows
+        // that go through the pre-run panel.
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(1.))
+                .child(pill_btn(
+                    "btn-run",
+                    "play",
+                    run_label,
+                    theme.kumo.text_link,
+                    theme,
+                    app.running || !can_run,
+                    cx,
+                    |a, _| a.action_run(),
+                ))
+                .child(pill_chevron(
+                    "btn-run-menu",
+                    theme.kumo.text_link,
+                    theme,
+                    app.running || !can_run,
+                    app.run_menu_open,
+                    cx,
+                    |a, _| a.toggle_run_menu(),
+                ))
+                // Record the pair's bottom-left so the menu hangs under it
+                // wherever the bar lays it out.
+                .child(anchor_canvas(app.run_anchor.clone())),
+        )
+        .child(flat_btn(
+            "btn-debug",
+            "bug",
+            "Debug",
+            theme.amber,
             theme,
-            app.running || !can_run,
+            app.debugging,
+            app.building,
             cx,
-            |a, _| a.action_run(),
+            |a, _| a.action_debug(),
         ))
-        .child(flat_btn("btn-debug", "bug", "Debug", theme.amber, theme, app.debugging, app.building, cx, |a, _| {
-            a.action_debug()
-        }))
-        .child(flat_btn("btn-stop", "square", "Stop", theme.red, theme, false, false, cx, |a, _| {
-            a.action_stop()
-        }))
+        .child(flat_btn(
+            "btn-stop",
+            "square",
+            "Stop",
+            theme.red,
+            theme,
+            false,
+            false,
+            cx,
+            |a, _| a.action_stop(),
+        ))
         // Trailing icon-only cluster: AI settings menu · theme · open-folder.
         // The former standalone AI toggles (ghost/eye, multiline/layers) plus the
         // model selector now live in the sparkle popover (see `ai_menu`), matching
         // the old Jade's single AI menu.
-        .child(icon_btn("btn-ai", "sparkles", theme, ai_active || app.ai_menu_open, cx, |a, _| {
-            a.toggle_ai_menu()
-        }))
+        .child(icon_btn(
+            "btn-ai",
+            "sparkles",
+            theme,
+            ai_active || app.ai_menu_open,
+            cx,
+            |a, _| a.toggle_ai_menu(),
+        ))
         .child(icon_btn(
             "btn-theme",
             if theme.is_light { "sun" } else { "moon" },
@@ -8510,9 +9067,14 @@ fn software_action_bar(
             |a, _| a.action_theme(),
         ))
         // Open Folder (inventory §2, ⌘⇧O): native directory picker.
-        .child(icon_btn("btn-open-folder", "folder-open", theme, false, cx, |a, cx| {
-            a.prompt_open_project(cx)
-        }));
+        .child(icon_btn(
+            "btn-open-folder",
+            "folder-open",
+            theme,
+            false,
+            cx,
+            |a, cx| a.prompt_open_project(cx),
+        ));
 
     // The bar rides on the elevated layer with a single Kumo hairline under it
     // and no other chrome, so the controls are the only marks on the strip.
@@ -8543,7 +9105,7 @@ fn toast_overlay(app: &JadeApp, theme: &Theme) -> gpui::AnyElement {
     let now = app.now_ms();
     let mut col = div()
         .absolute()
-        .bottom(px(52.)) // clear the status strip + memory bar
+        .bottom(px(36.)) // clear the status bar
         .right(px(16.))
         .flex()
         .flex_col()
@@ -8581,12 +9143,14 @@ fn toast_overlay(app: &JadeApp, theme: &Theme) -> gpui::AnyElement {
             .child(kumo::icon(icon, 15., accent))
             .child(div().child(t.message.clone()))
             .opacity(fade);
-        col = col.child(card.with_animation(
-            ("toast", t.created_ms as usize),
-            Animation::new(std::time::Duration::from_millis(180))
-                .with_easing(gpui::ease_out_quint()),
-            move |el, p| el.opacity(fade * p),
-        ));
+        col = col.child(
+            card.with_animation(
+                ("toast", t.created_ms as usize),
+                Animation::new(std::time::Duration::from_millis(180))
+                    .with_easing(gpui::ease_out_quint()),
+                move |el, p| el.opacity(fade * p),
+            ),
+        );
     }
     col.into_any_element()
 }
@@ -8608,12 +9172,15 @@ fn ai_menu(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> gpui::Any
     // A 14px checkbox: accent-filled when on, hollow-bordered when off.
     let checkbox = |on: bool| {
         let mut b = div()
-            .w(px(14.))
-            .h(px(14.))
+            .w(px(12.))
+            .h(px(12.))
             .flex_none()
-            .rounded_sm()
             .border_1()
-            .border_color(rgb(if on { theme.accent } else { theme.muted }));
+            .border_color(if on {
+                theme.kumo.brand
+            } else {
+                theme.kumo.interact
+            });
         if on {
             b = b.bg(rgb(theme.accent));
         }
@@ -8627,7 +9194,11 @@ fn ai_menu(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> gpui::Any
             .flex_none()
             .rounded_full()
             .border_1()
-            .border_color(rgb(if on { theme.accent } else { theme.muted }));
+            .border_color(if on {
+                theme.kumo.brand
+            } else {
+                theme.kumo.interact
+            });
         if on {
             d = d.bg(rgb(theme.accent));
         }
@@ -8635,7 +9206,7 @@ fn ai_menu(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> gpui::Any
     };
 
     // Toggle rows.
-    let hover_bg = theme.border;
+    let hover_bg = kumo::pack(theme.kumo.tint);
     let row_enabled = div()
         .id("ai-opt-enabled")
         .flex()
@@ -8644,7 +9215,6 @@ fn ai_menu(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> gpui::Any
         .gap_2()
         .px_1()
         .py(px(4.))
-        .rounded_sm()
         .cursor_pointer()
         .hover(move |s| s.bg(rgb(hover_bg)))
         .on_click(cx.listener(|a: &mut JadeApp, _e, _w, cx| {
@@ -8663,7 +9233,6 @@ fn ai_menu(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> gpui::Any
         .gap_2()
         .px_1()
         .py(px(4.))
-        .rounded_sm()
         .cursor_pointer()
         .hover(move |s| s.bg(rgb(hover_bg)))
         .on_click(cx.listener(|a: &mut JadeApp, _e, _w, cx| {
@@ -8697,7 +9266,6 @@ fn ai_menu(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> gpui::Any
             .gap_2()
             .px_1()
             .py(px(4.))
-            .rounded_sm()
             .child(radio(sel))
             .child(
                 div()
@@ -8723,7 +9291,7 @@ fn ai_menu(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> gpui::Any
         model_list = model_list.child(row);
     }
 
-    let divider = || div().h(px(1.)).bg(rgb(theme.border)).my(px(2.));
+    let divider = || div().h(px(1.)).bg(theme.kumo.hairline).my(px(2.));
     let state_label = match app.ai_status.state {
         AiState::Disabled => "off",
         AiState::Starting => "starting",
@@ -8736,21 +9304,16 @@ fn ai_menu(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> gpui::Any
         format!("{state_label} — {}", app.ai_status.detail)
     };
 
-    let panel = div()
+    let panel = kumo::Surface::overlay(&theme.kumo)
         .id("ai-menu")
         .absolute()
-        .top(px(46.))
-        .right(px(12.))
+        .top(px(40.))
+        .right(px(8.))
         .w(px(268.))
         .flex()
         .flex_col()
         .gap_1()
         .p_2()
-        .bg(rgb(theme.panel))
-        .border_1()
-        .border_color(rgb(theme.border))
-        .rounded_lg()
-        .shadow(card_shadow())
         .text_xs()
         // Swallow inside-clicks so a row toggle doesn't hit the backdrop
         // (`app.ts:551` `ev.stopPropagation()`).
@@ -8758,7 +9321,14 @@ fn ai_menu(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> gpui::Any
         .child(row_enabled)
         .child(row_multiline)
         .child(divider())
-        .child(div().text_color(rgb(theme.muted)).child("MODEL"))
+        .child(
+            div()
+                .text_color(rgb(theme.muted))
+                .text_size(px(10.))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .px_1()
+                .child("MODEL"),
+        )
         .child(model_list)
         .child(divider())
         .child(div().text_color(rgb(theme.muted)).child(status));
@@ -8845,22 +9415,22 @@ fn flat_btn(
     }
 }
 
-/// The Build / Run pair. Kumo's `variant="primary"` is the one solid fill on
-/// the bar — exactly one committing action per screen — and Build sits beside
-/// it as `variant="secondary"`.
+/// The Build / Run pair: a colored outline in `color`, the way the old bar
+/// drew `.action-build` (emerald) and `.action-run` (periwinkle).
 #[allow(clippy::too_many_arguments)]
 fn pill_btn(
     id: &'static str,
     icon: &'static str,
     label: String,
-    variant: ButtonVariant,
+    color: gpui::Rgba,
     theme: &Theme,
     busy: bool,
     cx: &mut Context<JadeApp>,
     f: impl Fn(&mut JadeApp, &mut Context<JadeApp>) + 'static,
 ) -> impl IntoElement {
     let el = Button::new(id, label)
-        .variant(variant)
+        .variant(ButtonVariant::Tinted)
+        .ink(color)
         .size(KumoSize::Sm)
         .icon(icon)
         .disabled(busy)
@@ -8874,6 +9444,173 @@ fn pill_btn(
             cx.notify();
         }))
     }
+}
+
+/// The chevron half of a split pill: an icon-only Tinted button in the same
+/// ink as its main half. `open` keeps the hover wash while the menu shows.
+fn pill_chevron(
+    id: &'static str,
+    color: gpui::Rgba,
+    theme: &Theme,
+    busy: bool,
+    open: bool,
+    cx: &mut Context<JadeApp>,
+    f: impl Fn(&mut JadeApp, &mut Context<JadeApp>) + 'static,
+) -> impl IntoElement {
+    let wash = kumo::KumoTokens::alpha(color, 0.12);
+    let mut el = Button::icon_only(id, "chevron-down")
+        .variant(ButtonVariant::Tinted)
+        .ink(color)
+        .size(KumoSize::Sm)
+        .disabled(busy)
+        .render(&theme.kumo)
+        .debug_selector(|| id.to_string());
+    if open {
+        el = el.bg(wash);
+    }
+    if busy {
+        el
+    } else {
+        el.on_click(cx.listener(move |a, _ev, _win, cx| {
+            f(a, cx);
+            cx.notify();
+        }))
+    }
+}
+
+/// The Run split button's menu: launch now, or go through the pre-run
+/// tracking panel first — for Run and for Debug. Same overlay shape as
+/// [`ai_menu`]: a backdrop that closes it, a Kumo overlay surface, and rows
+/// that swallow their clicks.
+fn run_menu(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> gpui::AnyElement {
+    let packed = app.run_anchor.load(std::sync::atomic::Ordering::Relaxed);
+    let (ax, ay) = (
+        f32::from_bits((packed >> 32) as u32),
+        f32::from_bits(packed as u32),
+    );
+    let hover_bg = kumo::pack(theme.kumo.tint);
+    let can_debug = app.active_file.is_some() && !app.building && !app.debugging;
+
+    // One menu row: icon · label · dim hint. `f` runs after the menu closes.
+    let row = |id: &'static str,
+               icon_name: &'static str,
+               label: &'static str,
+               hint: &'static str,
+               ink: gpui::Rgba,
+               enabled: bool,
+               f: Box<dyn Fn(&mut JadeApp)>| {
+        let text = if enabled {
+            theme.kumo.text_default
+        } else {
+            theme.kumo.text_subtle
+        };
+        let mut r = div()
+            .id(id)
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_1()
+            .py(px(4.))
+            .child(kumo::icon(
+                icon_name,
+                13.0,
+                if enabled { ink } else { theme.kumo.text_subtle },
+            ))
+            .child(div().text_color(text).child(label))
+            .child(div().flex_1())
+            .child(
+                div()
+                    .text_color(theme.kumo.text_subtle)
+                    .text_size(px(10.))
+                    .child(hint),
+            );
+        if enabled {
+            r = r
+                .cursor_pointer()
+                .hover(move |s| s.bg(rgb(hover_bg)))
+                .on_click(cx.listener(move |a: &mut JadeApp, _e, _w, cx| {
+                    a.close_run_menu();
+                    f(a);
+                    cx.notify();
+                }));
+        }
+        r
+    };
+
+    let divider = || div().h(px(1.)).bg(theme.kumo.hairline).my(px(2.));
+    let run_ink = theme.kumo.text_link;
+    let debug_ink = rgb(theme.amber);
+
+    let panel = kumo::Surface::overlay(&theme.kumo)
+        .id("run-menu")
+        .absolute()
+        .left(px(ax))
+        .top(px(ay + 6.))
+        .w(px(236.))
+        .flex()
+        .flex_col()
+        .gap(px(1.))
+        .p_1()
+        .text_xs()
+        .on_click(cx.listener(|_a: &mut JadeApp, _e, _w, cx| cx.stop_propagation()))
+        .child(row(
+            "run-menu-run",
+            "play",
+            "Run",
+            "launch now",
+            run_ink,
+            true,
+            Box::new(|a| a.action_run()),
+        ))
+        .child(row(
+            "run-menu-run-tracked",
+            "play",
+            "Run with tracking…",
+            "pick timers/buffers",
+            run_ink,
+            true,
+            Box::new(|a| a.action_run_tracked()),
+        ))
+        .child(divider())
+        .child(row(
+            "run-menu-debug",
+            "bug",
+            "Debug",
+            "LLDB, -O0",
+            debug_ink,
+            can_debug,
+            Box::new(|a| a.action_debug_direct()),
+        ))
+        .child(row(
+            "run-menu-debug-tracked",
+            "bug",
+            "Debug with tracking…",
+            "pick timers/buffers",
+            debug_ink,
+            can_debug,
+            Box::new(|a| a.action_debug()),
+        ));
+
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+        .child(
+            div()
+                .id("run-menu-backdrop")
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .on_click(cx.listener(|a: &mut JadeApp, _e, _w, cx| {
+                    a.close_run_menu();
+                    cx.notify();
+                })),
+        )
+        .child(panel)
+        .into_any_element()
 }
 
 /// One always-visible diagnostic count — a Kumo Badge on the matching status
@@ -8891,25 +9628,43 @@ fn diag_pill(
     theme: &Theme,
     cx: &mut Context<JadeApp>,
 ) -> impl IntoElement {
+    // The old bar drew these as bare `icon count` text in the severity color
+    // (`.diag-count`), with no fill. A zero count drops to the subtle ink so
+    // the live counts are the only marks that carry color.
+    let t = &theme.kumo;
+    let ink = if count == 0 {
+        t.text_subtle
+    } else {
+        match variant {
+            BadgeVariant::Error => t.text_danger,
+            BadgeVariant::Warning => t.text_warning,
+            _ => t.text_info,
+        }
+    };
+    let tint = t.tint;
     let mut el = div()
         .id(id)
         .debug_selector(|| id.to_string())
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(scale::SPACE_1)
+        .h(px(22.))
+        .px(scale::SPACE_1_5)
         .cursor_pointer()
-        .rounded(scale::RADIUS_MD)
-        .child(
-            Badge::new(format!("{count}"))
-                .variant(variant)
-                .icon(icon)
-                .tabular(true)
-                .render(&theme.kumo),
-        )
+        .text_size(scale::TEXT_XS)
+        .text_color(ink)
+        .font_family(crate::fonts::mono_family())
+        .hover(move |s| s.bg(tint))
+        .child(kumo::icon(icon, 12., ink))
+        .child(format!("{count}"))
         .on_click(cx.listener(move |a: &mut JadeApp, _ev, _w, cx| {
             cx.stop_propagation();
             a.set_diag_popup(kind, open);
             cx.notify();
         }));
     if open {
-        el = el.border_1().border_color(theme.kumo.focus);
+        el = el.bg(tint);
     }
     el
 }
@@ -8963,7 +9718,12 @@ fn left_panel_inner(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> 
     // Collapsed: a 28px strip with a vertical "FILES" label (GPUI has no cheap
     // text-rotation, so the letters are stacked); clicking anywhere reopens it.
     if app.sidebar_collapsed {
-        let mut label = div().flex().flex_col().items_center().gap(px(1.)).pt(px(12.));
+        let mut label = div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(1.))
+            .pt(px(12.));
         for ch in "FILES".chars() {
             label = label.child(
                 div()
@@ -9008,25 +9768,24 @@ fn left_panel_inner(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> 
         .flex()
         .flex_col()
         .flex_none()
-        .gap(scale::SPACE_2)
         .w(px(260.))
         .h_full()
-        .p(scale::SPACE_2_5)
         .bg(theme.kumo.elevated);
     if app.mode == AppMode::Software {
         card = card.child(structure_panel::tab_switcher(app, cx, theme));
     }
     card.child(
-            // The tree/outline scrolls inside the card (min_h(0) so the flex
-            // child can shrink instead of growing the card past the row).
-            div()
-                .id("left-panel-body")
-                .flex_1()
-                .min_h(px(0.))
-                .overflow_y_scroll()
-                .child(body),
-        )
-        .into_any_element()
+        // The tree/outline scrolls inside the card (min_h(0) so the flex
+        // child can shrink instead of growing the card past the row).
+        div()
+            .id("left-panel-body")
+            .flex_1()
+            .min_h(px(0.))
+            .py(scale::SPACE_1)
+            .overflow_y_scroll()
+            .child(body),
+    )
+    .into_any_element()
 }
 
 /// Center: the tab strip + read-only code viewer (deliverables §3, §5), replacing
@@ -9047,15 +9806,131 @@ fn center_content(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> im
         return base.child(welcome_overlay(app, cx, theme));
     }
 
-    let mut center = base
-        .child(code_view::tab_strip(app, cx, theme))
-        .child(code_view::render(app, cx));
-    // §6 ASM viewer: right-half overlay over the editor when toggled on.
-    // Software mode only — there is no clang ASM for Verilog.
-    if app.asm_visible && app.mode == AppMode::Software {
-        center = center.child(asm_view::overlay(app, cx));
+    let asm_on = app.asm_visible && app.mode == AppMode::Software;
+    if !app.split_mode() {
+        let mut center = base
+            .child(code_view::pane_strip(app, 0, cx, theme))
+            .child(code_view::render(app, cx));
+        // §6 ASM viewer: right-half overlay over the editor when toggled on.
+        // Software mode only — there is no clang ASM for Verilog.
+        if asm_on {
+            center = center.child(asm_view::overlay(app, cx));
+        }
+        // Tab drag in flight: the drop zones (split right) over the body.
+        if let Some(zones) = code_view::drop_zones(app, 0, cx, theme) {
+            center = center.child(zones);
+        }
+        return center;
     }
-    center
+
+    // Split panes (window management): one column per pane at equal widths,
+    // a hairline between. Each column is its own tab strip over its body;
+    // the ASM overlay stays with the focused pane.
+    let focused = app.focused_pane();
+    // The row's width, captured at paint, turns divider travel into share.
+    let row_w = app.pane_row_w.clone();
+    let measure = gpui::canvas(
+        move |_b, _w, _cx| {},
+        move |b: gpui::Bounds<gpui::Pixels>, _, _w, _cx| {
+            row_w.store(f32::from(b.size.width).to_bits(), Ordering::Relaxed);
+        },
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full();
+    let mut row = base.flex_row().child(measure);
+    for idx in 0..app.pane_count() {
+        if idx > 0 {
+            row = row.child(pane_divider(app, idx - 1, cx, theme));
+        }
+        let mut col = div()
+            .id(("pane", idx))
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_basis(px(0.))
+            .flex_grow(app.panes[idx].weight.max(0.05))
+            .flex_shrink(1.)
+            .min_w(px(0.))
+            .h_full()
+            .child(code_view::pane_strip(app, idx, cx, theme))
+            .child(pane_body(app, idx, cx, theme));
+        if idx == focused && asm_on {
+            col = col.child(asm_view::overlay(app, cx));
+        }
+        if let Some(zones) = code_view::drop_zones(app, idx, cx, theme) {
+            col = col.child(zones);
+        }
+        row = row.child(col);
+    }
+    row
+}
+
+/// The 6px grab strip between pane `left` and its right neighbor: drag to
+/// move width between the two (completes at the app root); double-click
+/// gives every pane the same width. Drawn as a hairline in the strip's
+/// middle so the panes read as separate surfaces.
+fn pane_divider(
+    app: &JadeApp,
+    left: usize,
+    cx: &mut Context<JadeApp>,
+    theme: &Theme,
+) -> impl IntoElement {
+    let t = &theme.kumo;
+    let (w0, w1) = (
+        app.panes[left].weight,
+        app.panes.get(left + 1).map(|p| p.weight).unwrap_or(1.0),
+    );
+    let held = app.pane_resize.is_some_and(|(l, ..)| l == left);
+    let tint = t.tint;
+    div()
+        .id(("pane-divider", left))
+        .w(px(6.))
+        .h_full()
+        .flex_none()
+        .flex()
+        .justify_center()
+        .cursor(gpui::CursorStyle::ResizeLeftRight)
+        .hover(move |s| s.bg(tint))
+        .when(held, |s| s.bg(tint))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |app: &mut JadeApp, ev: &gpui::MouseDownEvent, _w, cx| {
+                if ev.click_count >= 2 {
+                    app.equalize_panes();
+                    app.pane_resize = None;
+                    app.schedule_ui_save(cx);
+                } else {
+                    app.pane_resize = Some((left, f32::from(ev.position.x), w0, w1));
+                }
+                cx.notify();
+            }),
+        )
+        .child(div().w(px(1.)).h_full().bg(t.hairline))
+}
+
+/// The body of pane `idx`: the live editor (or its formatted Markdown view)
+/// for the focused pane; a read-only code list (or formatted blocks) for a
+/// background pane. A click in a background pane gives it the keyboard.
+fn pane_body(
+    app: &JadeApp,
+    idx: usize,
+    cx: &mut Context<JadeApp>,
+    theme: &Theme,
+) -> gpui::AnyElement {
+    let formatted = app.pane_shows_md(idx);
+    if idx == app.focused_pane() {
+        if formatted {
+            crate::panels::md_view::pane_body(app, cx, theme)
+        } else {
+            code_view::render(app, cx)
+        }
+    } else if formatted {
+        crate::panels::md_view::background_body(app, idx, cx, theme)
+    } else {
+        code_view::render_background(app, idx, cx)
+    }
 }
 
 /// Welcome overlay shown when no workspace is open (inventory §2, rewritten
@@ -9063,11 +9938,7 @@ fn center_content(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> im
 /// Software (the C++ IDE) and Hardware (Verilog + the live board). Each card
 /// carries its own primary "Open Folder" button; keys 1/s and 2/h pick a mode
 /// from the keyboard (see the root `on_key_down`).
-fn welcome_overlay(
-    app: &JadeApp,
-    cx: &mut Context<JadeApp>,
-    theme: &Theme,
-) -> gpui::AnyElement {
+fn welcome_overlay(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> gpui::AnyElement {
     let t = &theme.kumo;
     let hint = |s: &str| {
         KumoText::new(s.to_string())
@@ -9108,7 +9979,8 @@ fn welcome_overlay(
             .child(
                 div().mt(scale::SPACE_2).child(
                     Button::new(btn_id, "Open Folder")
-                        .variant(ButtonVariant::Primary)
+                        .variant(ButtonVariant::Tinted)
+                        .ink(t.brand)
                         .size(KumoSize::Base)
                         .icon("folder-open")
                         .render(t)
@@ -9126,57 +9998,57 @@ fn welcome_overlay(
             )
     };
     let inner = div()
+        .flex()
+        .flex_col()
+        .items_center()
+        // welcome-title — Kumo `heading1` (`text-3xl font-semibold`).
+        .child(Heading::new(HeadingLevel::One, "Jade").render(t))
+        .child(
+            div().mt(scale::SPACE_2).child(
+                KumoText::new("Pick a side, then open a folder")
+                    .tone(TextTone::Secondary)
+                    .size(KumoSize::Base)
+                    .render(t),
+            ),
+        )
+        .child(
+            div()
+                .mt(scale::SPACE_6)
                 .flex()
-                .flex_col()
-                .items_center()
-                // welcome-title — Kumo `heading1` (`text-3xl font-semibold`).
-                .child(Heading::new(HeadingLevel::One, "Jade").render(t))
-                .child(
-                    div().mt(scale::SPACE_2).child(
-                        KumoText::new("Pick a side, then open a folder")
-                            .tone(TextTone::Secondary)
-                            .size(KumoSize::Base)
-                            .render(t),
-                    ),
-                )
-                .child(
-                    div()
-                        .mt(scale::SPACE_6)
-                        .flex()
-                        .flex_row()
-                        .gap(scale::SPACE_4)
-                        .child(mode_card(
-                            "welcome-software",
-                            "open-folder-btn",
-                            "code",
-                            "Software",
-                            "C++ and Metal with live telemetry, memory, and GPU training views.",
-                            "Press 1 or S",
-                            AppMode::Software,
-                            cx,
-                        ))
-                        .child(mode_card(
-                            "welcome-hardware",
-                            "open-folder-hw-btn",
-                            "cpu",
-                            "Hardware",
-                            "Verilog for the MAX 10 board with a live 1:1 simulation on every save.",
-                            "Press 2 or H",
-                            AppMode::Hardware,
-                            cx,
-                        )),
-                )
-                // welcome-shortcuts hint row.
-                .child(
-                    div()
-                        .mt(px(32.))
-                        .flex()
-                        .gap(px(20.))
-                        .child(hint("⌘B File tree"))
-                        .child(hint("⌘` Terminal"))
-                        .child(hint("⌘O Open folder"))
-                        .child(hint("⌘S Save")),
-                );
+                .flex_row()
+                .gap(scale::SPACE_4)
+                .child(mode_card(
+                    "welcome-software",
+                    "open-folder-btn",
+                    "code",
+                    "Software",
+                    "C++ and Metal with live telemetry, memory, and GPU training views.",
+                    "Press 1 or S",
+                    AppMode::Software,
+                    cx,
+                ))
+                .child(mode_card(
+                    "welcome-hardware",
+                    "open-folder-hw-btn",
+                    "cpu",
+                    "Hardware",
+                    "Verilog for the MAX 10 board with a live 1:1 simulation on every save.",
+                    "Press 2 or H",
+                    AppMode::Hardware,
+                    cx,
+                )),
+        )
+        // welcome-shortcuts hint row.
+        .child(
+            div()
+                .mt(px(32.))
+                .flex()
+                .gap(px(20.))
+                .child(hint("⌘B File tree"))
+                .child(hint("⌘` Terminal"))
+                .child(hint("⌘O Open folder"))
+                .child(hint("⌘S Save")),
+        );
     let frame = div().flex_1().flex().items_center().justify_center();
     // Keep keyboard dispatch alive on the welcome screen: the mode keys
     // (1/2/s/h) need a focused node in the tree to bubble from.
@@ -9232,7 +10104,11 @@ fn runtime_sidebar(
             Animation::new(std::time::Duration::from_millis(SIDEBAR_SLIDE_MS))
                 .with_easing(gpui::ease_out_quint()),
             move |el, t| {
-                let w = if closing { 280.0 * (1.0 - t) } else { 280.0 * t };
+                let w = if closing {
+                    280.0 * (1.0 - t)
+                } else {
+                    280.0 * t
+                };
                 el.w(px(w))
             },
         )
@@ -9259,16 +10135,47 @@ fn bottom_panel(
     };
     let is_term = view == BottomView::Terminal;
 
-    // View-toggle tabs: TERMINAL | OUTPUT (| SCHEMATIC in hardware mode). A Kumo segmented Tabs at `size="sm"`
-    // — a raised pill riding in a recessed trough.
-    let bar = TabBar::new(TabsAppearance::Segmented).size(KumoSize::Sm);
+    // View-toggle tabs: TERMINAL | OUTPUT (| SCHEMATIC in hardware mode) — the
+    // same underline triggers the sidebar switcher and the editor tabs use, so
+    // the whole window has one tab.
+    let t = &theme.kumo;
     let view_tab = |id: &'static str, label: &'static str, active: bool, view: BottomView| {
-        bar.trigger(TabItem::new(id, label, active), &theme.kumo).on_click(
-            cx.listener(move |a: &mut JadeApp, _ev, _win, cx| {
+        let ink = if active {
+            t.text_default
+        } else {
+            t.text_subtle
+        };
+        let hover_ink = t.text_default;
+        let mut cell = div()
+            .id(id)
+            .relative()
+            .flex()
+            .items_center()
+            .h_full()
+            .px(scale::SPACE_2)
+            .text_size(scale::TEXT_XS)
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(ink)
+            .cursor_pointer()
+            .on_click(cx.listener(move |a: &mut JadeApp, _ev, _win, cx| {
                 a.set_bottom_view(view);
                 cx.notify();
-            }),
-        )
+            }))
+            .child(label);
+        if active {
+            cell = cell.child(
+                div()
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(2.))
+                    .bg(t.brand),
+            );
+        } else {
+            cell = cell.hover(move |s| s.text_color(hover_ink));
+        }
+        cell
     };
 
     // The terminal bar: one colored segment per open shell, filling the header
@@ -9278,8 +10185,9 @@ fn bottom_panel(
     //
     // Color carries the whole thing — there are no labels. The active segment
     // shows its hue at full strength; a background one is washed most of the
-    // way into the header, and comes back up when its shell writes.
-    let term_bar = (is_term && !app.terms.is_empty()).then(|| {
+    // way into the header, and comes back up when its shell writes. With one
+    // shell there is nothing to pick between, so the bar stays empty.
+    let term_bar = (is_term && app.terms.len() > 1).then(|| {
         // The surface the segments sit on, which a background segment washes
         // into (the header card paints `kumo.base`; `panel` is its u32 twin).
         let track = theme.panel;
@@ -9329,11 +10237,10 @@ fn bottom_panel(
                     .child(
                         div()
                             .w_full()
-                            .h(px(3.))
-                            .rounded_full()
+                            .h(px(2.))
                             .bg(rgb(fill))
                             // Hovering anywhere in the segment's hit area lights
-                            // its own 3px line, so the whole strip reads as
+                            // its own line, so the whole strip reads as
                             // clickable without any chrome.
                             .group_hover(group, move |st| st.bg(rgb(hue))),
                     ),
@@ -9342,64 +10249,68 @@ fn bottom_panel(
         bar
     });
 
+    let mut tabs = div()
+        .flex()
+        .flex_row()
+        .items_stretch()
+        .h_full()
+        .child(view_tab(
+            "bv-terminal",
+            "Terminal",
+            is_term,
+            BottomView::Terminal,
+        ))
+        .child(view_tab(
+            "bv-output",
+            "Output",
+            view == BottomView::Output,
+            BottomView::Output,
+        ));
+    if app.mode == AppMode::Hardware {
+        tabs = tabs.child(view_tab(
+            "bv-schematic",
+            "Schematic",
+            view == BottomView::Schematic,
+            BottomView::Schematic,
+        ));
+    }
+
     let header = div()
         .flex()
         .flex_row()
         .items_center()
         .justify_between()
-        .h(px(34.))
-        .px(scale::SPACE_2)
+        .h(px(28.))
+        .pl(scale::SPACE_1)
+        .pr(scale::SPACE_1)
         .border_b_1()
-        .border_color(theme.kumo.hairline)
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(scale::SPACE_2)
-                .child(kumo::icon("terminal", 13., theme.kumo.text_subtle))
-                .child({
-                    let mut tabs = TabBar::new(TabsAppearance::Segmented)
-                        .size(KumoSize::Sm)
-                        .push(view_tab("bv-terminal", "Terminal", is_term, BottomView::Terminal))
-                        .push(view_tab(
-                            "bv-output",
-                            "Output",
-                            view == BottomView::Output,
-                            BottomView::Output,
-                        ));
-                    if app.mode == AppMode::Hardware {
-                        tabs = tabs.push(view_tab(
-                            "bv-schematic",
-                            "Schematic",
-                            view == BottomView::Schematic,
-                            BottomView::Schematic,
-                        ));
-                    }
-                    tabs.render(&theme.kumo)
-                }),
-        )
+        .border_color(t.hairline)
+        .child(tabs)
         .children(term_bar)
         .child(
             div()
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap_2()
+                .gap(scale::SPACE_0_5)
                 // New-terminal.
-                .child(kumo::button::icon_button("term-new", "plus", false, &theme.kumo).on_click(
-                    cx.listener(|a: &mut JadeApp, _ev, _win, cx| {
-                        a.action_new_terminal();
-                        cx.notify();
-                    }),
-                ))
+                .child(
+                    kumo::button::icon_button("term-new", "plus", false, t).on_click(cx.listener(
+                        |a: &mut JadeApp, _ev, _win, cx| {
+                            a.action_new_terminal();
+                            cx.notify();
+                        },
+                    )),
+                )
                 // Minimize (hide the strip).
-                .child(kumo::button::icon_button("term-min", "minus", false, &theme.kumo).on_click(
-                    cx.listener(|a: &mut JadeApp, _ev, _win, cx| {
-                        a.action_toggle_output(cx);
-                        cx.notify();
-                    }),
-                )),
+                .child(
+                    kumo::button::icon_button("term-min", "minus", false, t).on_click(cx.listener(
+                        |a: &mut JadeApp, _ev, _win, cx| {
+                            a.action_toggle_output(cx);
+                            cx.notify();
+                        },
+                    )),
+                ),
         );
 
     let body = match view {
@@ -9415,9 +10326,9 @@ fn bottom_panel(
             theme,
             cx,
             // The card fills the window minus the 6px gutters and its border;
-            // the header row takes 34px of the strip.
+            // the header row takes 28px of the strip.
             viewport_w - 14.0,
-            app.bottom_height - 36.0,
+            app.bottom_height - 30.0,
         ),
     };
 
@@ -9468,7 +10379,11 @@ fn output_view(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> impl 
     let start = app.output.len().saturating_sub(200);
     let mut list = div().flex().flex_col();
     for (n, line) in app.output[start..].iter().enumerate() {
-        let text = if line.is_empty() { " ".to_string() } else { line.clone() };
+        let text = if line.is_empty() {
+            " ".to_string()
+        } else {
+            line.clone()
+        };
         let color = if line.contains(" error: ") {
             theme.red
         } else if line.contains(" warning: ") {
@@ -9507,6 +10422,7 @@ fn output_view(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> impl 
         .flex_1()
         .w_full()
         .p(px(8.))
+        .font_family(crate::fonts::mono_family())
         .overflow_y_scroll()
         .track_scroll(&app.output_scroll)
         .on_scroll_wheel(cx.listener(move |_app, _ev, window, cx| {
@@ -9557,15 +10473,11 @@ fn diag_popup_panel(
                 .child("No file open — open one from the tree."),
         );
     } else if indexes.is_empty() {
-        list = list.child(
-            div()
-                .text_color(rgb(theme.muted))
-                .child(match kind {
-                    DiagKind::Error => "No errors in this file.",
-                    DiagKind::Warning => "No warnings in this file.",
-                    DiagKind::Info => "No notes in this file.",
-                }),
-        );
+        list = list.child(div().text_color(rgb(theme.muted)).child(match kind {
+            DiagKind::Error => "No errors in this file.",
+            DiagKind::Warning => "No warnings in this file.",
+            DiagKind::Info => "No notes in this file.",
+        }));
     }
     let diagnostics = app
         .editor
@@ -9591,7 +10503,6 @@ fn diag_popup_panel(
                 .gap(scale::SPACE_2)
                 .px(scale::SPACE_1_5)
                 .py(px(3.))
-                .rounded(scale::RADIUS_SM)
                 .cursor_pointer()
                 .hover(move |st| st.bg(rgb(hover_bg)))
                 .on_click(cx.listener(move |a: &mut JadeApp, _ev, _w, cx| {
@@ -9611,7 +10522,7 @@ fn diag_popup_panel(
         );
     }
 
-    let panel = div()
+    let panel = kumo::Surface::overlay(&theme.kumo)
         .id("diag-popup")
         .absolute()
         .left(px(ax))
@@ -9623,11 +10534,6 @@ fn diag_popup_panel(
         .flex_col()
         .gap_1()
         .p_2()
-        .bg(rgb(theme.panel))
-        .border_1()
-        .border_color(rgb(theme.border))
-        .rounded_lg()
-        .shadow(card_shadow())
         .text_xs()
         // Swallow inside-clicks so a row does not also hit the backdrop.
         .on_click(cx.listener(|_a: &mut JadeApp, _e, _w, cx| cx.stop_propagation()))
@@ -9703,41 +10609,90 @@ fn parse_jump_target(line: &str) -> Option<(PathBuf, u32)> {
     (lineno > 0).then_some((path, lineno))
 }
 
-/// Bottom memory-bar strip (deliverable §6): SYS MEM · HEAP · PEAK · PRESSURE ·
-/// CPU · GPU, colored by threshold classification.
-fn memory_bar(app: &JadeApp, theme: &Theme) -> impl IntoElement {
-    let v = project(&app.mem, &app.sys_stats);
+/// The bottom strip (deliverable §6): probe status on the left, then SYS MEM
+/// · HEAP · PEAK · PRESSURE colored by threshold; CPU · GPU on the right, with
+/// the telemetry counts once the probe has spoken. One 24px row, the height
+/// of the old `.memory-bar`.
+fn status_bar(app: &JadeApp, theme: &Theme) -> impl IntoElement {
+    let t = &theme.kumo;
+    let live = app.scalars_seen + app.timings_seen + app.tensors_seen > 0;
+    let software = app.mode == AppMode::Software;
+
+    let status = div()
+        .flex()
+        .items_center()
+        .gap(scale::SPACE_1_5)
+        .child(kumo::button::dot(if live {
+            t.success
+        } else {
+            t.badge_neutral
+        }))
+        .child(
+            KumoText::new(if live { "Live" } else { "Idle" })
+                .tone(TextTone::Secondary)
+                .size(KumoSize::Xs)
+                .render(t),
+        );
+
+    let mut left = div()
+        .flex()
+        .items_center()
+        .gap(scale::SPACE_4)
+        .child(status);
+    if software {
+        let v = project(&app.mem, &app.sys_stats);
+        left = left
+            .child(metric("Sys mem", v.sys_mem, Level::Normal, theme))
+            .child(metric("Heap", v.heap, v.heap_level, theme))
+            .child(metric("Peak", v.peak, v.peak_level, theme))
+            .child(metric("Pressure", v.pressure_dots, v.pressure_level, theme));
+    }
+
+    let mut right = div().flex().items_center().gap(scale::SPACE_4);
+    if live {
+        right = right.child(
+            KumoText::new(format!(
+                "scalars {} · timings {} · tensors {}",
+                app.scalars_seen, app.timings_seen, app.tensors_seen
+            ))
+            .tone(TextTone::MonoSecondary)
+            .size(KumoSize::Xs)
+            .render(t),
+        );
+    }
+    if let (true, Some(r)) = (software, &app.last_run) {
+        right = right.child(
+            KumoText::new(format!(
+                "last run · exit {} · {} ms · {} lines",
+                r.exit_code, r.duration_ms, r.executed_lines
+            ))
+            .tone(TextTone::MonoSecondary)
+            .size(KumoSize::Xs)
+            .render(t),
+        );
+    }
+    if software {
+        let v = project(&app.mem, &app.sys_stats);
+        right = right
+            .child(metric("CPU", v.cpu, v.cpu_level, theme))
+            .child(metric("GPU", v.gpu, v.gpu_level, theme));
+    }
+
     div()
         .flex()
         .flex_row()
         .items_center()
         .justify_between()
-        .h(px(26.))
+        .h(px(24.))
         .px(scale::SPACE_3)
-        .bg(theme.kumo.elevated)
+        .bg(t.elevated)
         .border_t_1()
-        .border_color(theme.kumo.hairline)
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(scale::SPACE_4)
-                .child(metric("Sys mem", v.sys_mem, Level::Normal, theme))
-                .child(metric("Heap", v.heap, v.heap_level, theme))
-                .child(metric("Peak", v.peak, v.peak_level, theme))
-                .child(metric("Pressure", v.pressure_dots, v.pressure_level, theme)),
-        )
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(scale::SPACE_4)
-                .child(metric("CPU", v.cpu, v.cpu_level, theme))
-                .child(metric("GPU", v.gpu, v.gpu_level, theme)),
-        )
+        .border_color(t.hairline)
+        .child(left)
+        .child(right)
 }
 
-/// One label/value pair on the memory bar. The value is monospaced, because a
+/// One label/value pair on the status bar. The value is monospaced, because a
 /// number that changes every frame must not shift the label beside it.
 fn metric(label: &str, value: String, level: Level, theme: &Theme) -> impl IntoElement {
     let vc = match level {
@@ -9758,53 +10713,9 @@ fn metric(label: &str, value: String, level: Level, theme: &Theme) -> impl IntoE
         )
         .child(
             div()
-                .font_family("JetBrains Mono")
+                .font_family(crate::fonts::mono_family())
                 .text_color(vc)
                 .child(value),
-        )
-}
-
-fn status_strip(app: &JadeApp, theme: &Theme) -> impl IntoElement {
-    // A Kumo dot Badge leads the strip: green once telemetry has arrived, a
-    // neutral dot while the socket is still quiet. One glance answers "is the
-    // probe talking to me", which is what the strip is for.
-    let live = app.scalars_seen + app.timings_seen + app.tensors_seen > 0;
-    let status = Badge::new(if live { "Live" } else { "Idle" })
-        .dot(if live {
-            DotColor::Success
-        } else {
-            DotColor::Neutral
-        })
-        .render(&theme.kumo);
-
-    let mut text = format!(
-        "socket {}   ·   scalars {}   timings {}   tensors {}",
-        app.server.socket_path().display(),
-        app.scalars_seen,
-        app.timings_seen,
-        app.tensors_seen
-    );
-    if let Some(r) = &app.last_run {
-        text.push_str(&format!(
-            "   ·   last run exit {} · {}ms · {} lines",
-            r.exit_code, r.duration_ms, r.executed_lines
-        ));
-    }
-    div()
-        .flex()
-        .items_center()
-        .gap(scale::SPACE_2_5)
-        .h(px(26.))
-        .px(scale::SPACE_3)
-        .bg(theme.kumo.elevated)
-        .border_t_1()
-        .border_color(theme.kumo.hairline)
-        .child(status)
-        .child(
-            KumoText::new(text)
-                .tone(TextTone::Secondary)
-                .size(KumoSize::Xs)
-                .render(&theme.kumo),
         )
 }
 
@@ -9829,17 +10740,33 @@ mod discovery_watchdog_tests {
         // compile freeze before the first command buffer. A fixed 5s window
         // reported "0 timers, 20 buffers"; the scan must keep waiting.
         assert!(!discovery_should_stop(s(30), None, true));
-        assert!(!discovery_should_stop(s(DISCOVERY_HARD_CAP_SECS - 1), None, true));
-        assert!(discovery_should_stop(s(DISCOVERY_HARD_CAP_SECS), None, true));
+        assert!(!discovery_should_stop(
+            s(DISCOVERY_HARD_CAP_SECS - 1),
+            None,
+            true
+        ));
+        assert!(discovery_should_stop(
+            s(DISCOVERY_HARD_CAP_SECS),
+            None,
+            true
+        ));
     }
 
     #[test]
     fn warm_app_gets_a_full_post_warm_window() {
         // Warmed at 26s: the scan still runs DISCOVERY_SECS past that point.
         assert!(!discovery_should_stop(s(28), Some(s(2)), true));
-        assert!(discovery_should_stop(s(26 + DISCOVERY_SECS), Some(s(DISCOVERY_SECS)), true));
+        assert!(discovery_should_stop(
+            s(26 + DISCOVERY_SECS),
+            Some(s(DISCOVERY_SECS)),
+            true
+        ));
         // Fast app (warm at 2s) ends on the same post-warm schedule.
-        assert!(discovery_should_stop(s(2 + DISCOVERY_SECS), Some(s(DISCOVERY_SECS)), true));
+        assert!(discovery_should_stop(
+            s(2 + DISCOVERY_SECS),
+            Some(s(DISCOVERY_SECS)),
+            true
+        ));
     }
 }
 
@@ -9896,7 +10823,10 @@ mod output_jump_tests {
     #[test]
     fn rejects_non_diagnostic_lines() {
         assert_eq!(parse_jump_target("[jade] Build failed (5 error(s))"), None);
-        assert_eq!(parse_jump_target("main.cpp:1:1: error: relative path"), None);
+        assert_eq!(
+            parse_jump_target("main.cpp:1:1: error: relative path"),
+            None
+        );
         assert_eq!(parse_jump_target("/Users/x/notes.txt: no numbers"), None);
         assert_eq!(parse_jump_target("/Users/x/a.cpp:0:1: zero line"), None);
     }
@@ -9936,7 +10866,10 @@ mod terminal_cwd_tests {
         let f = fixture("file");
         let file = f.0.join("proj").join("src").join("main.cpp");
         let root = f.0.join("proj");
-        assert_eq!(terminal_cwd_for(Some(&file), None, &root), file.parent().unwrap());
+        assert_eq!(
+            terminal_cwd_for(Some(&file), None, &root),
+            file.parent().unwrap()
+        );
     }
 
     #[test]
@@ -9944,7 +10877,10 @@ mod terminal_cwd_tests {
         let f = fixture("fallback");
         let file = f.0.join("proj").join("src").join("main.cpp");
         let root = f.0.join("proj");
-        assert_eq!(terminal_cwd_for(None, Some(&file), &root), file.parent().unwrap());
+        assert_eq!(
+            terminal_cwd_for(None, Some(&file), &root),
+            file.parent().unwrap()
+        );
         assert_eq!(terminal_cwd_for(None, None, &root), root);
     }
 
@@ -9955,6 +10891,9 @@ mod terminal_cwd_tests {
         let root = f.0.join("proj");
         let gone = f.0.join("proj").join("deleted-dir");
         assert_eq!(terminal_cwd_for(Some(&gone), None, &root), root);
-        assert_eq!(terminal_cwd_for(Some(Path::new("/nope/x.cpp")), None, &root), root);
+        assert_eq!(
+            terminal_cwd_for(Some(Path::new("/nope/x.cpp")), None, &root),
+            root
+        );
     }
 }

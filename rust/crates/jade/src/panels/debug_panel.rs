@@ -27,7 +27,7 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> impl IntoElement {
         .w_full()
         .bg(rgb(theme.bg))
         .border_t_1()
-        .border_color(rgb(theme.border))
+        .border_color(theme.kumo.hairline)
         .child(header(app, &theme, cx))
         .child(
             div()
@@ -70,27 +70,18 @@ fn header(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> impl IntoE
         status = status.italic();
     }
 
-    // Icon-only control button; `icon` is a bundled lucide glyph name.
+    // Icon-only control button; `icon` is a bundled lucide glyph name. The
+    // same ghost icon button the action bar uses.
     let btn = |id: &'static str,
                icon: &'static str,
                action: fn(&mut JadeApp, &mut Context<JadeApp>),
                cx: &mut Context<JadeApp>| {
-        div()
-            .id(id)
-            .flex()
-            .items_center()
-            .px_2()
-            .py(px(2.))
-            .rounded_md()
-            .text_xs()
-            .bg(rgb(theme.panel))
-            .text_color(rgb(theme.text))
-            .cursor_pointer()
-            .on_click(cx.listener(move |a: &mut JadeApp, _e, _w, cx| {
+        crate::kumo::button::icon_button(id, icon, false, &theme.kumo).on_click(cx.listener(
+            move |a: &mut JadeApp, _e, _w, cx| {
                 action(a, cx);
                 cx.notify();
-            }))
-            .child(crate::assets::ui_icon(icon, 13., theme.text))
+            },
+        ))
     };
 
     div()
@@ -98,11 +89,12 @@ fn header(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> impl IntoE
         .flex_row()
         .items_center()
         .justify_between()
-        .h(px(26.))
-        .px(px(8.))
+        .h(px(28.))
+        .pl(px(10.))
+        .pr(px(4.))
         .bg(rgb(theme.panel))
         .border_b_1()
-        .border_color(rgb(theme.border))
+        .border_color(theme.kumo.hairline)
         .child(
             div()
                 .flex()
@@ -113,10 +105,15 @@ fn header(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> impl IntoE
                     div()
                         .flex()
                         .items_center()
-                        .text_color(rgb(theme.accent))
-                        .child(crate::assets::ui_icon("bug", 13., theme.accent)),
+                        .child(crate::assets::ui_icon("bug", 13., theme.muted)),
                 )
-                .child(div().text_color(rgb(theme.accent)).text_xs().child("DEBUG"))
+                .child(
+                    div()
+                        .text_color(rgb(theme.muted))
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("DEBUG"),
+                )
                 .child(status),
         )
         .child(
@@ -130,29 +127,19 @@ fn header(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> impl IntoE
                 .child(btn("dbg-into", "arrow-down-to-line", |a, _| a.debug_step_into(), cx))
                 .child(btn("dbg-out", "arrow-up-from-line", |a, _| a.debug_step_out(), cx))
                 .child(btn("dbg-stop", "square", |a, _| a.action_stop(), cx))
-                .child(
-                    div()
-                        .id("dbg-close")
-                        .flex()
-                        .items_center()
-                        .px_1()
-                        .text_color(rgb(theme.muted))
-                        .cursor_pointer()
-                        .on_click(cx.listener(|a: &mut JadeApp, _e, _w, cx| {
-                            a.hide_debug();
-                            cx.notify();
-                        }))
-                        .child(crate::assets::ui_icon("x", 12., theme.muted)),
-                ),
+                .child(btn("dbg-close", "x", |a, _| a.hide_debug(), cx)),
         )
 }
 
 fn col_label(text: &str, theme: &Theme) -> impl IntoElement {
     div()
         .text_color(rgb(theme.muted))
-        .text_size(px(9.))
-        .px(px(6.))
-        .py(px(2.))
+        .text_size(px(10.))
+        .font_weight(FontWeight::MEDIUM)
+        .px(px(10.))
+        .py(px(4.))
+        .border_b_1()
+        .border_color(theme.kumo.hairline)
         .child(text.to_string())
 }
 
@@ -166,7 +153,7 @@ fn frames_col(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> impl I
         .h_full()
         .overflow_y_scroll()
         .border_r_1()
-        .border_color(rgb(theme.border))
+        .border_color(theme.kumo.hairline)
         .child(col_label("FRAMES", theme));
 
     for (i, f) in app.debug.frames.iter().enumerate() {
@@ -175,9 +162,10 @@ fn frames_col(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> impl I
             .id(("frame", i))
             .flex()
             .flex_col()
-            .px(px(6.))
-            .py(px(1.))
+            .px(px(10.))
+            .py(px(2.))
             .cursor_pointer()
+            .hover(|s| s.bg(theme.kumo.fill_hover))
             .on_click(cx.listener(move |a: &mut JadeApp, _e, _w, cx| {
                 a.debug_select_frame(i);
                 cx.notify();
@@ -197,7 +185,7 @@ fn frames_col(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> impl I
                     .child(format!("{}:{}", short(&f.file), f.line)),
             );
         if active {
-            row = row.bg(rgb(theme.panel));
+            row = row.bg(theme.kumo.recessed);
         }
         col = col.child(row);
     }
@@ -217,11 +205,11 @@ fn variables_col(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> imp
         .h_full()
         .overflow_y_scroll()
         .border_r_1()
-        .border_color(rgb(theme.border))
+        .border_color(theme.kumo.hairline)
         .child(col_label("VARIABLES", theme));
 
     for row in flatten_vars(&app.debug) {
-        let indent = 6.0 + row.depth as f32 * 12.0;
+        let indent = 10.0 + row.depth as f32 * 12.0;
         let marker = if row.expandable {
             if row.expanded {
                 "▾"
@@ -315,7 +303,7 @@ fn console_col(app: &JadeApp, theme: &Theme) -> impl IntoElement {
         .h_full()
         .overflow_y_scroll()
         .child(col_label("CONSOLE", theme))
-        .child(div().px(px(6.)).font_family(crate::fonts::mono_family()).child(list))
+        .child(div().px(px(10.)).py(px(4.)).font_family(crate::fonts::mono_family()).child(list))
 }
 
 /// Shorten a path to its basename for the compact frame/status readouts.

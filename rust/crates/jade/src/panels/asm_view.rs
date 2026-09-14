@@ -37,38 +37,35 @@ pub fn overlay(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
         .flex_row()
         .items_center()
         .justify_between()
-        .h(px(24.))
-        .px(px(8.))
+        .h(px(28.))
+        .pl(px(10.))
+        .pr(px(4.))
         .bg(rgb(theme.panel))
         .border_b_1()
-        .border_color(rgb(theme.border))
+        .border_color(theme.kumo.hairline)
         .child(
             div()
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap_2()
+                .child(crate::assets::ui_icon("code", 13., theme.muted))
                 .child(
                     div()
-                        .flex()
-                        .items_center()
-                        .text_color(rgb(theme.accent))
-                        .child(crate::assets::ui_icon("code", 13., theme.accent)),
+                        .text_color(rgb(theme.muted))
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .child("ASM"),
                 )
-                .child(div().text_color(rgb(theme.accent)).text_xs().child("ASM"))
                 .child(div().text_color(rgb(theme.muted)).text_xs().child(file)),
         )
         .child(
-            div()
-                .id("asm-close")
-                .text_color(rgb(theme.muted))
-                .text_xs()
-                .cursor_pointer()
-                .on_click(cx.listener(|a: &mut JadeApp, _e, _w, cx| {
+            crate::kumo::button::icon_button("asm-close", "x", false, &theme.kumo).on_click(
+                cx.listener(|a: &mut JadeApp, _e, _w, cx| {
                     a.toggle_asm(cx);
                     cx.notify();
-                }))
-                .child("×"),
+                }),
+            ),
         );
 
     let body = match &app.asm {

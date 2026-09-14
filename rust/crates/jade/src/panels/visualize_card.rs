@@ -24,7 +24,7 @@ use gpui::{div, prelude::*, px, Context, MouseButton};
 
 use crate::app::JadeApp;
 use crate::beautiful::{
-    self, chip, icon_button, pixel_loader, radius, status_pill, stream, text, BeautifulTokens,
+    self, chip, icon_button, pixel_loader, status_pill, stream, text, BeautifulTokens,
     Card, LoaderPattern,
 };
 use crate::video::Transport;
@@ -250,13 +250,13 @@ fn transport_footer(
             div()
                 .w_full()
                 .h(px(4.))
-                .rounded(radius::PILL)
+                
                 .bg(t.field)
                 .child(
                     div()
                         .h_full()
                         .w(gpui::relative(frac))
-                        .rounded(radius::PILL)
+                        
                         .bg(t.accent),
                 ),
         )
@@ -359,7 +359,7 @@ fn consent_footer(t: &BeautifulTokens, cx: &mut Context<JadeApp>) -> impl IntoEl
         .items_center()
         .h(px(26.))
         .px(px(10.))
-        .rounded(radius::CONTROL)
+        
         .bg(t.accent_tint)
         .text_size(text::BODY)
         .font_weight(gpui::FontWeight::MEDIUM)
@@ -376,7 +376,7 @@ fn consent_footer(t: &BeautifulTokens, cx: &mut Context<JadeApp>) -> impl IntoEl
         .items_center()
         .h(px(26.))
         .px(px(10.))
-        .rounded(radius::CONTROL)
+        
         .text_size(text::BODY)
         .text_color(t.ink_3)
         .cursor_pointer()
@@ -572,7 +572,7 @@ pub fn render(
         .top(px(top))
         .w(px(CARD_W))
         .max_h(px(max_h))
-        .rounded(radius::CARD)
+        
         .occlude()
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .child(height_probe(app.visualize_card_h.clone()))

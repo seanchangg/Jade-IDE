@@ -163,7 +163,6 @@ impl Badge {
             .items_center()
             .border_1()
             .border_color(TRANSPARENT)
-            .rounded_full()
             .px(scale::SPACE_2)
             .py(scale::SPACE_0_5)
             .text_size(scale::TEXT_XS)
@@ -203,7 +202,7 @@ impl Badge {
             el = el.child(icon(name, 11., ink));
         }
         if self.tabular {
-            el = el.font_family("JetBrains Mono");
+            el = el.font_family(crate::fonts::mono_family());
         }
         el.child(self.label)
     }

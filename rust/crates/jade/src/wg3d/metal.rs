@@ -42,7 +42,9 @@ use super::camera::{OrbitCamera, HEIGHT_SCALE};
 use super::grid::BarGrid;
 
 /// Backdrop clear color — the overlay's near-opaque `#111214` (render.rs).
-const CLEAR: (f64, f64, f64) = (0x11 as f64 / 255.0, 0x12 as f64 / 255.0, 0x14 as f64 / 255.0);
+/// The scene clear — the jade-dark canvas (#1E1F22), so the GPU frame and
+/// the GPUI backdrop around it are one surface.
+const CLEAR: (f64, f64, f64) = (0x1E as f64 / 255.0, 0x1F as f64 / 255.0, 0x22 as f64 / 255.0);
 
 /// How many pixel buffers rotate (gpui may sample frame N while N+1 renders).
 const POOL: usize = 3;

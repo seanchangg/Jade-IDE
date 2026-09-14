@@ -47,6 +47,10 @@ pub fn flatten(tree: &FileTree) -> Vec<FileEntry> {
 
 fn flatten_nodes(nodes: &[FileNode], out: &mut Vec<FileEntry>) {
     for n in nodes {
+        // The per-workspace state dir is Jade's own, never something to open.
+        if n.is_dir && n.name == ".jade" {
+            continue;
+        }
         if n.is_dir {
             if let Some(children) = &n.children {
                 flatten_nodes(children, out);

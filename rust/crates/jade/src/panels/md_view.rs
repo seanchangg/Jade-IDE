@@ -474,74 +474,8 @@ pub fn panel(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> AnyElem
     }
 
     let t = &theme.kumo;
-    let text = tab.buffer.to_string();
-    let blocks = parse_blocks(&text);
-    let caret = tab.caret_point();
     let w = app.md_width;
-
-    // Preview-edit mode: the block under the caret shows its raw source. A
-    // caret on a blank row between blocks gets a synthetic one-row region.
-    let active: Option<Range<usize>> = if app.md_edit {
-        Some(
-            blocks
-                .iter()
-                .find(|b| b.rows().contains(&caret.row))
-                .map(|b| b.rows())
-                .unwrap_or(caret.row..caret.row + 1),
-        )
-    } else {
-        None
-    };
-
-    // The scroll container's direct children are the blocks, in order —
-    // `child_index_for_row` + `ScrollHandle::scroll_to_item` depend on that.
-    let mut body = div()
-        .id("md-scroll")
-        .flex_1()
-        .min_h(px(0.))
-        .flex()
-        .flex_col()
-        .gap(px(10.))
-        .overflow_y_scroll()
-        .track_scroll(&app.md_scroll);
-    let mut raw_done = false;
-    for b in &blocks {
-        if let Some(a) = &active {
-            // A synthetic blank-row region sits between blocks: emit it in
-            // source order, before the first block that follows it.
-            if !raw_done && a.end <= b.rows().start {
-                body = body.child(raw_region(app, tab, a.clone(), &caret, theme, cx));
-                raw_done = true;
-            }
-            if !raw_done && b.rows().contains(&a.start) {
-                body = body.child(raw_region(app, tab, a.clone(), &caret, theme, cx));
-                raw_done = true;
-                continue;
-            }
-        }
-        body = body.child(render_block(b, theme, cx));
-    }
-    if let Some(a) = &active {
-        if !raw_done {
-            body = body.child(raw_region(app, tab, a.clone(), &caret, theme, cx));
-        }
-    }
-    if blocks.is_empty() && active.is_none() {
-        body = body.child(
-            div()
-                .id("md-empty")
-                .text_size(px(12.))
-                .text_color(t.text_placeholder)
-                .cursor(gpui::CursorStyle::IBeam)
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|app, _ev: &gpui::MouseDownEvent, _w, cx| {
-                        app.md_preview_click(0, 0, cx);
-                    }),
-                )
-                .child("Empty file — click to write"),
-        );
-    }
+    let body = focused_body(app, tab, theme, cx);
 
     let hint = if app.md_edit {
         "esc — done editing"
@@ -597,6 +531,149 @@ pub fn panel(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> AnyElem
         .into_any_element()
 }
 
+/// The focused pane's formatted view of its Markdown tab (split mode). The
+/// same block list as the docked preview, with preview edits, wrapped in the
+/// editor's keyboard plumbing so keystrokes still reach the buffer.
+pub fn pane_body(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> AnyElement {
+    let Some(tab) = app.editor.active_tab() else {
+        return div().into_any_element();
+    };
+    let body = focused_body(app, tab, theme, cx)
+        .px(scale::SPACE_4)
+        .py(scale::SPACE_3);
+    crate::panels::code_view::focus_shell(app, cx, body.into_any_element())
+}
+
+/// A background pane's formatted view of its Markdown tab: the rendered
+/// blocks, read-only. A block click gives the pane the keyboard and starts
+/// a preview edit at that block.
+pub fn background_body(
+    app: &JadeApp,
+    pane: usize,
+    cx: &mut Context<JadeApp>,
+    theme: &Theme,
+) -> AnyElement {
+    let t = &theme.kumo;
+    let Some(p) = app.panes.get(pane) else {
+        return div().into_any_element();
+    };
+    let Some(tab) = p.active_tab() else {
+        return div().into_any_element();
+    };
+    let blocks = parse_blocks(&tab.buffer.to_string());
+    let mut body = div()
+        .id(("md-scroll-bg", pane))
+        .flex_1()
+        .min_h(px(0.))
+        .flex()
+        .flex_col()
+        .gap(px(10.))
+        .px(scale::SPACE_4)
+        .py(scale::SPACE_3)
+        .overflow_y_scroll()
+        .track_scroll(&p.md_scroll)
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |app, _ev: &gpui::MouseDownEvent, _w, cx| {
+                app.focus_pane(pane);
+                cx.notify();
+            }),
+        );
+    for b in &blocks {
+        body = body.child(render_block(b, theme, Some(pane), cx));
+    }
+    if blocks.is_empty() {
+        body = body.child(
+            div()
+                .text_size(px(12.))
+                .text_color(t.text_placeholder)
+                .child("Empty file"),
+        );
+    }
+    body.into_any_element()
+}
+
+/// The block list of the active Markdown tab with preview edits: the direct
+/// children are the blocks in order, plus the raw region of the block under
+/// the caret in edit mode. `child_index_for_row` + `scroll_to_item` on
+/// `md_scroll` depend on that order.
+fn focused_body(
+    app: &JadeApp,
+    tab: &OpenTab,
+    theme: &Theme,
+    cx: &mut Context<JadeApp>,
+) -> gpui::Stateful<Div> {
+    let t = &theme.kumo;
+    let text = tab.buffer.to_string();
+    let blocks = parse_blocks(&text);
+    let caret = tab.caret_point();
+
+    // Preview-edit mode: the block under the caret shows its raw source. A
+    // caret on a blank row between blocks gets a synthetic one-row region.
+    let active: Option<Range<usize>> = if app.md_edit {
+        Some(
+            blocks
+                .iter()
+                .find(|b| b.rows().contains(&caret.row))
+                .map(|b| b.rows())
+                .unwrap_or(caret.row..caret.row + 1),
+        )
+    } else {
+        None
+    };
+
+    // The scroll container's direct children are the blocks, in order —
+    // `child_index_for_row` + `ScrollHandle::scroll_to_item` depend on that.
+    let mut body = div()
+        .id("md-scroll")
+        .flex_1()
+        .min_h(px(0.))
+        .flex()
+        .flex_col()
+        .gap(px(10.))
+        .overflow_y_scroll()
+        .track_scroll(&app.md_scroll);
+    let mut raw_done = false;
+    for b in &blocks {
+        if let Some(a) = &active {
+            // A synthetic blank-row region sits between blocks: emit it in
+            // source order, before the first block that follows it.
+            if !raw_done && a.end <= b.rows().start {
+                body = body.child(raw_region(app, tab, a.clone(), &caret, theme, cx));
+                raw_done = true;
+            }
+            if !raw_done && b.rows().contains(&a.start) {
+                body = body.child(raw_region(app, tab, a.clone(), &caret, theme, cx));
+                raw_done = true;
+                continue;
+            }
+        }
+        body = body.child(render_block(b, theme, None, cx));
+    }
+    if let Some(a) = &active {
+        if !raw_done {
+            body = body.child(raw_region(app, tab, a.clone(), &caret, theme, cx));
+        }
+    }
+    if blocks.is_empty() && active.is_none() {
+        body = body.child(
+            div()
+                .id("md-empty")
+                .text_size(px(12.))
+                .text_color(t.text_placeholder)
+                .cursor(gpui::CursorStyle::IBeam)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|app, _ev: &gpui::MouseDownEvent, _w, cx| {
+                        app.md_preview_click(0, 0, cx);
+                    }),
+                )
+                .child("Empty file — click to write"),
+        );
+    }
+    body
+}
+
 /// The 6px left-edge grab strip (drag to resize; completes at the app root).
 fn resize_handle(cx: &mut Context<JadeApp>, theme: &Theme) -> impl IntoElement {
     div()
@@ -618,8 +695,14 @@ fn resize_handle(cx: &mut Context<JadeApp>, theme: &Theme) -> impl IntoElement {
 // ── Rendered blocks ───────────────────────────────────────────────────────────
 
 /// One rendered block. A click moves the caret to the block's first row and
-/// enters preview-edit mode.
-fn render_block(b: &MdBlock, theme: &Theme, cx: &mut Context<JadeApp>) -> AnyElement {
+/// enters preview-edit mode. `pane` is the background pane that shows the
+/// block, which the click focuses first.
+fn render_block(
+    b: &MdBlock,
+    theme: &Theme,
+    pane: Option<usize>,
+    cx: &mut Context<JadeApp>,
+) -> AnyElement {
     let t = &theme.kumo;
     let start = b.rows().start;
     let inner = match b {
@@ -676,11 +759,11 @@ fn render_block(b: &MdBlock, theme: &Theme, cx: &mut Context<JadeApp>) -> AnyEle
         }
         MdBlock::Code { text, .. } => div()
             .w_full()
-            .rounded(scale::RADIUS_MD)
             .bg(t.recessed)
             .border_1()
             .border_color(t.hairline)
             .p(px(8.))
+            .font_family(crate::fonts::mono_family())
             .text_size(px(11.5))
             .line_height(px(16.))
             .text_color(t.text_default)
@@ -701,7 +784,7 @@ fn render_block(b: &MdBlock, theme: &Theme, cx: &mut Context<JadeApp>) -> AnyEle
             .child(div().h(px(1.)).w_full().bg(t.hairline)),
     };
     div()
-        .id(("md-block", start))
+        .id(("md-block", pane.map_or(0, |p| (p + 1) << 20) + start))
         .debug_selector(move || format!("md-block-{start}"))
         .w_full()
         .flex_none()
@@ -709,6 +792,9 @@ fn render_block(b: &MdBlock, theme: &Theme, cx: &mut Context<JadeApp>) -> AnyEle
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |app, _ev: &gpui::MouseDownEvent, _w, cx| {
+                if let Some(p) = pane {
+                    app.focus_pane(p);
+                }
                 app.md_preview_click(start, 0, cx);
             }),
         )
@@ -753,7 +839,7 @@ fn table_el(
         .w_full()
         .flex()
         .flex_col()
-        .rounded(scale::RADIUS_MD)
+        
         .border_1()
         .border_color(t.hairline)
         .overflow_hidden()
@@ -804,10 +890,10 @@ fn word(
     let mut d = div().child(text.to_string());
     if style.code {
         d = d
+            .font_family(crate::fonts::mono_family())
             .text_size(px(11.5))
             .text_color(t.text_strong)
             .bg(t.recessed)
-            .rounded(px(4.))
             .px(px(3.));
     }
     if style.bold {
@@ -878,7 +964,7 @@ fn raw_region(
         .flex_none()
         .flex_col()
         .w_full()
-        .rounded(scale::RADIUS_MD)
+        
         .bg(t.recessed)
         .border_1()
         .border_color(t.focus)

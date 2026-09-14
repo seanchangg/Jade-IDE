@@ -80,6 +80,37 @@ pub struct WorkspaceUi {
     /// Markdown preview panel width in px.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub markdown_width: Option<f64>,
+    /// Split editor panes in display order (window management). Absent or
+    /// shorter than two = one pane, which `open_tabs` describes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub panes: Vec<PaneState>,
+    /// Index into `panes` of the pane that has the keyboard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focused_pane: Option<i64>,
+}
+
+/// One split pane: its tab set, active tab, and Markdown view mode.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaneState {
+    #[serde(default)]
+    pub open_tabs: Vec<TabState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_tab_index: Option<i64>,
+    /// A Markdown tab shows as formatted blocks (true) or raw source (false).
+    #[serde(default = "default_true")]
+    pub md_rendered: bool,
+    /// Width share of the pane row (flex grow); 1.0 = an equal share.
+    #[serde(default = "default_weight")]
+    pub weight: f64,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_weight() -> f64 {
+    1.0
 }
 
 /// The keys Jade writes into the `ui` object (everything except `stickyNotes`,
@@ -100,6 +131,8 @@ const OWNED_KEYS: &[&str] = &[
     "boardWidth",
     "markdownVisible",
     "markdownWidth",
+    "panes",
+    "focusedPane",
 ];
 
 /// Load Jade's UI state for a workspace (`ui` key), or the default on any error.
@@ -212,6 +245,27 @@ mod tests {
             board_width: Some(440.0),
             markdown_visible: Some(true),
             markdown_width: Some(420.0),
+            panes: vec![
+                PaneState {
+                    open_tabs: vec![TabState {
+                        path: "/p/a.cpp".into(),
+                        is_dirty: false,
+                    }],
+                    active_tab_index: Some(0),
+                    md_rendered: true,
+                    weight: 1.5,
+                },
+                PaneState {
+                    open_tabs: vec![TabState {
+                        path: "/p/README.md".into(),
+                        is_dirty: true,
+                    }],
+                    active_tab_index: Some(0),
+                    md_rendered: false,
+                    weight: 0.5,
+                },
+            ],
+            focused_pane: Some(1),
         };
         save_to(&path, &ui);
         assert_eq!(load_from(&path), ui);

@@ -53,7 +53,7 @@ fn item_row(
         .py(px(3.))
         .text_xs()
         .cursor_pointer()
-        .hover(|s| s.bg(rgb(theme.bg)))
+        .hover(|s| s.bg(theme.kumo.tint))
         .on_click(cx.listener(move |app, _e, _w, cx| {
             app.toggle_enabled(kind, &toggle_name);
             cx.notify();
@@ -80,7 +80,7 @@ fn item_row(
             div()
                 .id(gpui::ElementId::Name(format!("prerun-stage-{name}").into()))
                 .px_1()
-                .rounded_sm()
+                
                 .text_color(rgb(if is_staged { theme.periwinkle } else { theme.muted }))
                 .hover(|s| s.text_color(rgb(theme.periwinkle)))
                 .on_click(cx.listener(move |app, _e, _w, cx| {
@@ -110,8 +110,9 @@ fn timers_section(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> gp
             .px(px(10.))
             .pt(px(8.))
             .pb(px(2.))
-            .text_xs()
-            .text_color(rgb(theme.accent))
+            .text_size(px(10.))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(rgb(theme.muted))
             .child(format!("TIMERS ({})", timers.len())),
     );
 
@@ -169,8 +170,9 @@ fn bundles_card(
             .px(px(10.))
             .pt(px(8.))
             .pb(px(2.))
-            .text_xs()
-            .text_color(rgb(theme.accent))
+            .text_size(px(10.))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(rgb(theme.muted))
             .child(header_text),
     );
 
@@ -192,7 +194,7 @@ fn bundles_card(
                 .py(px(3.))
                 .text_xs()
                 .cursor_pointer()
-                .hover(|s| s.bg(rgb(theme.bg)))
+                .hover(|s| s.bg(theme.kumo.tint))
                 .on_click(cx.listener(move |app, _e, _w, cx| {
                     app.toggle_timer_group(&toggle);
                     cx.notify();
@@ -216,7 +218,7 @@ fn bundles_card(
                             format!("prerun-group-del-{gname}").into(),
                         ))
                         .px_1()
-                        .rounded_sm()
+                        
                         .text_color(rgb(theme.muted))
                         .hover(|s| s.text_color(rgb(theme.red)))
                         .on_click(cx.listener(move |app, _e, _w, cx| {
@@ -240,7 +242,7 @@ fn bundles_card(
                 .mt(px(6.))
                 .px(px(8.))
                 .py(px(6.))
-                .rounded_md()
+                
                 .bg(rgb(theme.bg))
                 .text_xs()
                 // Title row: NEW BUNDLE ……… "7 timers"
@@ -266,7 +268,7 @@ fn bundles_card(
                     div()
                         .px(px(6.))
                         .py(px(3.))
-                        .rounded_md()
+                        
                         .bg(rgb(theme.panel))
                         .border_1()
                         .border_color(rgb(theme.border))
@@ -290,15 +292,11 @@ fn bundles_card(
     }
 
     Some(
-        div()
+        crate::kumo::Surface::overlay(&theme.kumo)
             .w(px(230.))
             .max_h(px(440.))
             .flex()
             .flex_col()
-            .rounded_lg()
-            .bg(rgb(theme.panel))
-            .border_1()
-            .border_color(rgb(theme.border))
             .overflow_hidden()
             .occlude() // same backdrop-fallthrough guard as the main panel
             .child(col)
@@ -345,8 +343,9 @@ fn section(
             .px(px(10.))
             .pt(px(8.))
             .pb(px(2.))
-            .text_xs()
-            .text_color(rgb(theme.accent))
+            .text_size(px(10.))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(rgb(theme.muted))
             .child(count),
     );
 
@@ -364,7 +363,7 @@ fn section(
                 .my(px(2.))
                 .px(px(6.))
                 .py(px(2.))
-                .rounded_md()
+                
                 .bg(rgb(theme.bg))
                 .border_1()
                 .border_color(rgb(theme.border))
@@ -431,20 +430,15 @@ pub fn overlay(app: &JadeApp, focus: FocusHandle, cx: &mut Context<JadeApp>) -> 
             .child(label)
             .into_any_element()
     } else if app.can_run() {
-        div()
-            .id("prerun-rescan")
-            .px_2()
-            .py(px(2.))
-            .rounded_md()
-            .text_xs()
-            .text_color(rgb(theme.periwinkle))
-            .cursor_pointer()
-            .hover(|s| s.bg(rgb(theme.bg)))
+        crate::kumo::Button::new("prerun-rescan", "Rescan")
+            .variant(crate::kumo::ButtonVariant::Ghost)
+            .size(crate::kumo::Size::Sm)
+            .icon("refresh-cw")
+            .render(&theme.kumo)
             .on_click(cx.listener(|app, _e, _w, cx| {
                 app.start_discovery();
                 cx.notify();
             }))
-            .child("Rescan")
             .into_any_element()
     } else {
         div()
@@ -460,14 +454,16 @@ pub fn overlay(app: &JadeApp, focus: FocusHandle, cx: &mut Context<JadeApp>) -> 
         .items_center()
         .justify_between()
         .h(px(34.))
-        .px(px(10.))
+        .pl(px(10.))
+        .pr(px(6.))
         .border_b_1()
-        .border_color(rgb(theme.border))
+        .border_color(theme.kumo.hairline)
         .child(
             div()
                 .text_xs()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
                 .text_color(rgb(theme.text))
-                .child("TRACK TELEMETRY"),
+                .child("Track telemetry"),
         )
         .child(status);
 
@@ -477,10 +473,11 @@ pub fn overlay(app: &JadeApp, focus: FocusHandle, cx: &mut Context<JadeApp>) -> 
         .flex_row()
         .items_center()
         .justify_between()
-        .h(px(38.))
-        .px(px(10.))
+        .h(px(40.))
+        .pl(px(10.))
+        .pr(px(6.))
         .border_t_1()
-        .border_color(rgb(theme.border))
+        .border_color(theme.kumo.hairline)
         .child(
             div()
                 .text_xs()
@@ -491,39 +488,28 @@ pub fn overlay(app: &JadeApp, focus: FocusHandle, cx: &mut Context<JadeApp>) -> 
             div()
                 .flex()
                 .flex_row()
-                .gap_2()
+                .gap(px(4.))
                 .child(
-                    div()
-                        .id("prerun-cancel")
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .text_xs()
-                        .text_color(rgb(theme.muted))
-                        .cursor_pointer()
-                        .hover(|s| s.bg(rgb(theme.bg)))
+                    crate::kumo::Button::new("prerun-cancel", "Cancel")
+                        .variant(crate::kumo::ButtonVariant::Ghost)
+                        .size(crate::kumo::Size::Sm)
+                        .render(&theme.kumo)
                         .on_click(cx.listener(|app, _e, _w, cx| {
                             app.cancel_pre_run();
                             cx.notify();
-                        }))
-                        .child("Cancel"),
+                        })),
                 )
                 .child(
-                    div()
-                        .id("prerun-launch")
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .text_xs()
-                        .bg(rgb(theme.bg))
-                        .text_color(rgb(theme.accent))
-                        .cursor_pointer()
-                        .hover(|s| s.border_1().border_color(rgb(theme.accent)))
+                    crate::kumo::Button::new("prerun-launch", launch_label)
+                        .variant(crate::kumo::ButtonVariant::Tinted)
+                        .ink(theme.kumo.text_link)
+                        .icon("play")
+                        .size(crate::kumo::Size::Sm)
+                        .render(&theme.kumo)
                         .on_click(cx.listener(|app, _e, _w, cx| {
                             app.confirm_pre_run();
                             cx.notify();
-                        }))
-                        .child(launch_label),
+                        })),
                 ),
         );
 
@@ -534,15 +520,11 @@ pub fn overlay(app: &JadeApp, focus: FocusHandle, cx: &mut Context<JadeApp>) -> 
         .child(timers_section(app, &theme, cx))
         .child(section("BUFFERS", Kind::Buffer, app, &theme, cx));
 
-    let panel = div()
+    let panel = crate::kumo::Surface::overlay(&theme.kumo)
         .w(px(460.))
         .max_h(px(440.))
         .flex()
         .flex_col()
-        .rounded_lg()
-        .bg(rgb(theme.panel))
-        .border_1()
-        .border_color(rgb(theme.border))
         .overflow_hidden()
         // Clicks inside the panel must not fall through to the full-window
         // backdrop underneath (its handler cancels the panel — without this,
@@ -574,6 +556,7 @@ pub fn overlay(app: &JadeApp, focus: FocusHandle, cx: &mut Context<JadeApp>) -> 
         .flex_col()
         .items_center()
         .pt(px(120.))
+        .bg(gpui::rgba(0x00000066))
         .track_focus(&focus)
         // Swallow wheel events at the overlay root: the panel body (deeper, so
         // it handles first) scrolls its own list, and whatever is left must

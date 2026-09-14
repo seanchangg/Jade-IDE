@@ -10,18 +10,20 @@
 
 use std::collections::HashMap;
 
-use jade_buffer::Point;
 use gpui::{
     canvas, div, point, prelude::*, px, rgb, rgba, size, uniform_list, Bounds, ClickEvent, Context,
     ElementInputHandler, Entity, FocusHandle, HighlightStyle, KeyDownEvent,
-    ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent, Rgba, UnderlineStyle,
+    ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent, Rgba,
+    UnderlineStyle,
 };
+use jade_buffer::Point;
 
 use crate::app::{CompletionState, HoverState, JadeApp, SignatureState};
+use crate::panes::{TabDrag, TabDragPreview};
 use crate::decorations::flow::GlyphKind;
 use crate::decorations::{self, RuntimeAlloc};
 use crate::editor_view::{self, CellStyle};
-use crate::kumo::{scale, Badge, BadgeVariant, Meter, Size as KumoSize, Text as KumoText, TextTone};
+use crate::kumo::scale;
 use crate::theme::Theme;
 
 /// Editor metrics (§4.1 "editor look").
@@ -209,17 +211,14 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
 
                 // Merged end-of-line annotation (§4.5).
                 let size = tab.sizes.get(&line_no).map(String::as_str);
-                let exec = this
-                    .last_executed
-                    .get(&(line_no as u32))
-                    .and_then(|&c| {
-                        let prev = this
-                            .prev_executed
-                            .get(&(line_no as u32))
-                            .copied()
-                            .unwrap_or(0);
-                        decorations::exec_annotations::annotate_line(c, prev)
-                    });
+                let exec = this.last_executed.get(&(line_no as u32)).and_then(|&c| {
+                    let prev = this
+                        .prev_executed
+                        .get(&(line_no as u32))
+                        .copied()
+                        .unwrap_or(0);
+                    decorations::exec_annotations::annotate_line(c, prev)
+                });
                 let rt: Option<RuntimeAlloc> = runtime.get(&(line_no as u32)).copied();
                 let annotation = decorations::merge_annotation(size, exec.as_deref(), rt.as_ref());
 
@@ -404,7 +403,11 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
                     .items_center()
                     .justify_center();
                 if foldable {
-                    let chev = if folded { "chevron-right" } else { "chevron-down" };
+                    let chev = if folded {
+                        "chevron-right"
+                    } else {
+                        "chevron-down"
+                    };
                     let ccol = if folded { theme.accent } else { theme.muted };
                     fold_cell = fold_cell
                         .cursor_pointer()
@@ -583,10 +586,7 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
     // Find / replace bar (⌘F / Ctrl+F): anchored top-right of the editor, over
     // the code. Its own focus handle captures keystrokes (see `app.find_key`).
     if app.find.is_some() {
-        let focus = app
-            .find_focus
-            .clone()
-            .unwrap_or_else(|| cx.focus_handle());
+        let focus = app.find_focus.clone().unwrap_or_else(|| cx.focus_handle());
         container = container.child(find_bar(app, focus, cx));
     }
 
@@ -618,6 +618,252 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
     container.into_any_element()
 }
 
+/// A background split pane: the active tab of pane `idx` as a read-only,
+/// syntax-colored line list (no caret, selection, or popups). Its own scroll
+/// handle lives on the pane. A click gives the pane the keyboard and puts the
+/// caret on the clicked row.
+pub fn render_background(
+    app: &JadeApp,
+    idx: usize,
+    cx: &mut Context<JadeApp>,
+) -> gpui::AnyElement {
+    let theme = app.theme.clone();
+    let focus_click = cx.listener(move |app: &mut JadeApp, _ev: &MouseDownEvent, _w, cx| {
+        app.focus_pane(idx);
+        cx.notify();
+    });
+    let Some(pane) = app.panes.get(idx) else {
+        return div().into_any_element();
+    };
+    let Some(tab) = pane.active_tab() else {
+        return div()
+            .id(("pane-bg", idx))
+            .flex()
+            .flex_1()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(MouseButton::Left, focus_click)
+            .child(
+                div()
+                    .text_color(rgb(theme.muted))
+                    .child("No file open — pick one from the tree"),
+            )
+            .into_any_element();
+    };
+
+    let visible_count = tab.visible_rows().len();
+    let default_color = theme.text;
+    let list = uniform_list(
+        ("code-lines-bg", idx),
+        visible_count,
+        cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
+            let mut rows = Vec::with_capacity(range.len());
+            let theme = this.theme.clone();
+            let char_w = this.char_w();
+            let Some(tab) = this.panes.get(idx).and_then(|p| p.active_tab()) else {
+                return rows;
+            };
+            let code_w = tab.max_cols as f32 * char_w + 48.0;
+            let visible = tab.visible_rows();
+            for di in range {
+                let Some(&i) = visible.get(di) else { break };
+                let text = tab.line(i);
+                let syntax = tab.highlights.get(i).map(Vec::as_slice).unwrap_or(&[]);
+                let cells =
+                    editor_view::merge_line_styles(text.len(), syntax, None, &[], None, &[]);
+                let display = editor_view::DisplayLine::new(text);
+                let highlights = cells
+                    .into_iter()
+                    .map(|(r, s)| (display.map_range(r), cell_to_style(&s, &theme)))
+                    .collect::<Vec<_>>();
+                let styled =
+                    gpui::StyledText::new(display.text.clone()).with_highlights(highlights);
+                let folded = tab.fold_map.contains_key(&i) && tab.folds.contains(&i);
+
+                let mut cell = div()
+                    .id(("bg-code-cell", i))
+                    .flex_none()
+                    .min_w(px(code_w))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |app: &mut JadeApp, _ev: &MouseDownEvent, _w, cx| {
+                            app.focus_pane(idx);
+                            if let Some(tab) = app.editor.active_tab_mut() {
+                                let row = i.min(tab.line_count().saturating_sub(1));
+                                let off = tab.buffer.point_to_offset(Point::new(row, 0));
+                                tab.buffer.set_caret(off);
+                            }
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .whitespace_nowrap()
+                            .flex_none()
+                            .text_color(rgb(default_color))
+                            .child(styled),
+                    );
+                if folded {
+                    cell = cell.child(
+                        div()
+                            .flex_none()
+                            .px_1()
+                            .text_color(rgba_a(theme.muted, 0.7))
+                            .child("…"),
+                    );
+                }
+                let row = div()
+                    .flex()
+                    .flex_row()
+                    .h(px(LINE_H))
+                    .items_center()
+                    .border_l_2()
+                    .border_color(rgba_a(0, 0.0))
+                    .child(
+                        div()
+                            .w(px(GUTTER_W))
+                            .flex_none()
+                            .pr(px(8.))
+                            .text_right()
+                            .text_color(rgb(theme.muted))
+                            .child((i + 1).to_string()),
+                    )
+                    .child(div().w(px(FOLD_W)).flex_none())
+                    .child(cell);
+                rows.push(row);
+            }
+            rows
+        }),
+    )
+    .track_scroll(&pane.scroll)
+    .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
+    .flex_1()
+    .size_full()
+    .pt(px(PAD_TOP))
+    .px(px(8.))
+    .text_size(px(FONT_PX))
+    .line_height(px(LINE_H))
+    .font_family(crate::fonts::mono_family());
+
+    div()
+        .id(("pane-bg", idx))
+        .relative()
+        .flex()
+        .flex_1()
+        .size_full()
+        .on_mouse_down(MouseButton::Left, focus_click)
+        .child(list)
+        .into_any_element()
+}
+
+/// Drop zones over pane `idx`'s body, shown only while a tab drag is live:
+/// the left part moves the tab into this pane, the right part opens a new
+/// pane to the right with it. Returns `None` when nothing is dragged.
+pub fn drop_zones(
+    app: &JadeApp,
+    idx: usize,
+    cx: &mut Context<JadeApp>,
+    theme: &Theme,
+) -> Option<gpui::AnyElement> {
+    if !cx.has_active_drag() {
+        return None;
+    }
+    let t = &theme.kumo;
+    let tint = t.tint;
+    let brand = t.brand;
+    let zone = |id: &'static str, label: &'static str| {
+        div()
+            .id((id, idx))
+            .flex()
+            .items_center()
+            .justify_center()
+            .h_full()
+            .text_size(scale::TEXT_XS)
+            .text_color(t.text_subtle)
+            .drag_over::<TabDrag>(move |st, _, _, _| {
+                st.bg(tint).border_1().border_color(brand)
+            })
+            .child(label)
+    };
+    let mut zones = div()
+        .absolute()
+        .top(px(32.)) // below the tab strip
+        .left_0()
+        .right_0()
+        .bottom_0()
+        .flex()
+        .flex_row();
+    if app.split_mode() {
+        zones = zones.child(
+            zone("pane-drop-move", "Move here")
+                .flex_1()
+                .on_drop(cx.listener(move |app, d: &TabDrag, _win, cx| {
+                    app.move_tab(d.pane, d.index, idx, None);
+                    app.schedule_ui_save(cx);
+                    cx.notify();
+                })),
+        );
+    } else {
+        zones = zones.child(div().flex_1());
+    }
+    if app.pane_count() < crate::panes::MAX_PANES {
+        zones = zones.child(
+            zone("pane-drop-split", "Split right")
+                .w(gpui::relative(0.35))
+                .on_drop(cx.listener(move |app, d: &TabDrag, _win, cx| {
+                    app.split_with_tab(d.pane, d.index, idx);
+                    app.schedule_ui_save(cx);
+                    cx.notify();
+                })),
+        );
+    }
+    Some(zones.into_any_element())
+}
+
+/// Wrap `body` with the editor's keyboard plumbing: the focus handle, the
+/// key path ([`JadeApp::editor_key`]), and the IME input handler. The
+/// focused pane's formatted Markdown view uses it so preview edits still
+/// type into the buffer while the code list is off screen.
+pub fn focus_shell(
+    app: &JadeApp,
+    cx: &mut Context<JadeApp>,
+    body: gpui::AnyElement,
+) -> gpui::AnyElement {
+    let handle = app
+        .editor_focus
+        .clone()
+        .unwrap_or_else(|| cx.focus_handle());
+    let entity = cx.entity();
+    div()
+        .relative()
+        .flex()
+        .flex_1()
+        .size_full()
+        .min_h(px(0.))
+        .track_focus(&handle)
+        .on_key_down(cx.listener(|app: &mut JadeApp, ev: &KeyDownEvent, _w, cx| {
+            if app.editor_key(&ev.keystroke, cx) {
+                cx.stop_propagation();
+                cx.notify();
+            }
+        }))
+        .child(body)
+        .child(ime_geometry_canvas(
+            app.flow_visible,
+            app.editor_text_left.clone(),
+            app.editor_rows.clone(),
+            app.editor_char_w.clone(),
+            (app.editor_w.clone(), app.editor_h.clone()),
+            handle,
+            entity,
+        ))
+        .into_any_element()
+}
+
 /// True when a keystroke should type a character into a find field: a printable
 /// `key_char` with no command/control/alt/function modifier.
 fn find_is_printable(ev: &KeyDownEvent) -> bool {
@@ -646,7 +892,6 @@ fn find_btn(
         .h(scale::H_6_5)
         .min_w(px(24.))
         .px(scale::SPACE_2)
-        .rounded(scale::RADIUS_MD)
         .text_size(scale::TEXT_XS)
         .font_weight(gpui::FontWeight::MEDIUM)
         .cursor_pointer()
@@ -686,9 +931,16 @@ fn find_field(
     use std::sync::atomic::Ordering;
     // Shared fake-input line: caret before the placeholder when empty, at the
     // cursor while typing; blinks via `caret_on` (530ms editor phase).
-    let inner =
-        crate::panels::input_line(value, placeholder, focused, caret_on, theme.accent, theme, cursor)
-            .text_xs();
+    let inner = crate::panels::input_line(
+        value,
+        placeholder,
+        focused,
+        caret_on,
+        theme.accent,
+        theme,
+        cursor,
+    )
+    .text_xs();
 
     // Zero-width canvas as the FIRST flex child: its painted origin is exactly
     // where the text starts (past padding), and the inherited text style gives
@@ -726,7 +978,6 @@ fn find_field(
         .h(px(22.))
         .min_w(px(200.))
         .px(px(6.))
-        .rounded_md()
         .bg(rgb(theme.bg))
         .border_1()
         .border_color(rgb(if focused { theme.accent } else { theme.border }))
@@ -736,8 +987,7 @@ fn find_field(
             cx.listener(move |app: &mut JadeApp, ev: &MouseDownEvent, _w, cx| {
                 let left = f32::from_bits(text_left.load(Ordering::Relaxed));
                 let cw = f32::from_bits(char_w_store.load(Ordering::Relaxed));
-                let col =
-                    editor_view::px_to_col(f32::from(ev.position.x) - left, cw, max_col);
+                let col = editor_view::px_to_col(f32::from(ev.position.x) - left, cw, max_col);
                 app.find_click_field(field, col);
                 cx.notify();
             }),
@@ -766,7 +1016,6 @@ fn sync_banner(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
         .gap(px(8.))
         .h(px(28.))
         .px(px(10.))
-        .rounded_md()
         .bg(rgb(theme.panel))
         .border_1()
         .border_color(rgba_a(theme.accent, 0.6))
@@ -790,12 +1039,26 @@ fn sync_banner(app: &JadeApp, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
                 )
             },
         )
-        .child(find_btn("sync-apply", "apply ⌘⏎", true, &theme, cx, |app, cx| {
-            app.sync_apply(cx);
-        }))
-        .child(find_btn("sync-dismiss", "esc", false, &theme, cx, |app, _cx| {
-            app.sync_suggestion = None;
-        }))
+        .child(find_btn(
+            "sync-apply",
+            "apply ⌘⏎",
+            true,
+            &theme,
+            cx,
+            |app, cx| {
+                app.sync_apply(cx);
+            },
+        ))
+        .child(find_btn(
+            "sync-dismiss",
+            "esc",
+            false,
+            &theme,
+            cx,
+            |app, _cx| {
+                app.sync_suggestion = None;
+            },
+        ))
         .into_any_element()
 }
 
@@ -823,7 +1086,11 @@ fn find_bar(app: &JadeApp, focus: FocusHandle, cx: &mut Context<JadeApp>) -> gpu
     };
 
     // Left chevron: the dropdown toggle that shows / hides the replace row.
-    let chevron = if replace_visible { "chevron-down" } else { "chevron-right" };
+    let chevron = if replace_visible {
+        "chevron-down"
+    } else {
+        "chevron-right"
+    };
     let chevron_btn = div()
         .id("find-chevron")
         .flex()
@@ -864,7 +1131,11 @@ fn find_bar(app: &JadeApp, focus: FocusHandle, cx: &mut Context<JadeApp>) -> gpu
             "Find",
             find_focused,
             blink,
-            if find_focused { state.cursor } else { state.query.len() },
+            if find_focused {
+                state.cursor
+            } else {
+                state.query.len()
+            },
             app,
             &theme,
             cx,
@@ -872,23 +1143,51 @@ fn find_bar(app: &JadeApp, focus: FocusHandle, cx: &mut Context<JadeApp>) -> gpu
         .child(
             div()
                 .min_w(px(62.))
-                .font_family("JetBrains Mono") // the count must not reflow the row
+                .font_family(crate::fonts::mono_family()) // the count must not reflow the row
                 .text_size(scale::TEXT_XS)
                 .text_color(theme.kumo.text_subtle)
                 .child(count_label),
         )
-        .child(find_btn("find-case", "Aa", state.case_sensitive, &theme, cx, |app, _cx| {
-            app.find_toggle_case();
-        }))
-        .child(find_btn("find-prev", "‹", false, &theme, cx, |app, _cx| {
-            app.find_prev();
-        }))
-        .child(find_btn("find-next", "›", false, &theme, cx, |app, _cx| {
-            app.find_next();
-        }))
-        .child(find_btn("find-close", "×", false, &theme, cx, |app, _cx| {
-            app.close_find();
-        }));
+        .child(find_btn(
+            "find-case",
+            "Aa",
+            state.case_sensitive,
+            &theme,
+            cx,
+            |app, _cx| {
+                app.find_toggle_case();
+            },
+        ))
+        .child(find_btn(
+            "find-prev",
+            "‹",
+            false,
+            &theme,
+            cx,
+            |app, _cx| {
+                app.find_prev();
+            },
+        ))
+        .child(find_btn(
+            "find-next",
+            "›",
+            false,
+            &theme,
+            cx,
+            |app, _cx| {
+                app.find_next();
+            },
+        ))
+        .child(find_btn(
+            "find-close",
+            "×",
+            false,
+            &theme,
+            cx,
+            |app, _cx| {
+                app.close_find();
+            },
+        ));
 
     let mut bar = div().flex().flex_col().gap(px(4.)).child(find_row);
 
@@ -908,17 +1207,35 @@ fn find_bar(app: &JadeApp, focus: FocusHandle, cx: &mut Context<JadeApp>) -> gpu
                 "Replace",
                 !find_focused,
                 blink,
-                if find_focused { state.replace.len() } else { state.cursor },
+                if find_focused {
+                    state.replace.len()
+                } else {
+                    state.cursor
+                },
                 app,
                 &theme,
                 cx,
             ))
-            .child(find_btn("find-replace-one", "Replace", false, &theme, cx, |app, cx| {
-                app.find_replace_current(cx);
-            }))
-            .child(find_btn("find-replace-all", "All", false, &theme, cx, |app, cx| {
-                app.find_replace_all(cx);
-            }));
+            .child(find_btn(
+                "find-replace-one",
+                "Replace",
+                false,
+                &theme,
+                cx,
+                |app, cx| {
+                    app.find_replace_current(cx);
+                },
+            ))
+            .child(find_btn(
+                "find-replace-all",
+                "All",
+                false,
+                &theme,
+                cx,
+                |app, cx| {
+                    app.find_replace_all(cx);
+                },
+            ));
         bar = bar.child(replace_row);
     }
 
@@ -1051,13 +1368,19 @@ fn ime_geometry_canvas(
             // The editor's own box, so a floating card can clamp itself to it
             // (`panels::explain_card::clamp_card`). Same capture-per-frame
             // trick as `text_left` above — layout is only known at paint.
-            size_store.0.store(f32::from(bounds.size.width).to_bits(), Ordering::Relaxed);
+            size_store
+                .0
+                .store(f32::from(bounds.size.width).to_bits(), Ordering::Relaxed);
             size_store.1.store(h.to_bits(), Ordering::Relaxed);
             let region = Bounds::new(
                 point(px(left), bounds.origin.y + px(PAD_TOP)),
                 size(bounds.size.width, bounds.size.height),
             );
-            window.handle_input(&handle, ElementInputHandler::new(region, entity.clone()), cx);
+            window.handle_input(
+                &handle,
+                ElementInputHandler::new(region, entity.clone()),
+                cx,
+            );
         },
     )
     .absolute()
@@ -1112,15 +1435,20 @@ fn completion_popup(
     let theme = app.theme.clone();
     let (row, col) = c.anchor;
     let col = display_col(app, row, col);
-    let row = app.editor.active_tab().map(|t| t.display_row(row)).unwrap_or(row);
+    let row = app
+        .editor
+        .active_tab()
+        .map(|t| t.display_row(row))
+        .unwrap_or(row);
     let left = popup_x(col, flow_visible, app.char_w(), app.editor_h_scroll());
     let top = popup_y(row, scroll_top);
 
     // Window of up to 8 items centered on the selection.
     let visible = 8usize;
-    let start = c.selected.saturating_sub(visible - 1).min(
-        c.filtered.len().saturating_sub(visible),
-    );
+    let start = c
+        .selected
+        .saturating_sub(visible - 1)
+        .min(c.filtered.len().saturating_sub(visible));
     let mut list = div().flex().flex_col().py_1();
     for slot in start..(start + visible).min(c.filtered.len()) {
         let item_ix = c.filtered[slot];
@@ -1169,7 +1497,6 @@ fn completion_popup(
             .max_h(px(8.0 * 20.0 + 8.0))
             .flex()
             .flex_col()
-            .rounded_md()
             .bg(rgb(theme.panel))
             .border_1()
             .border_color(rgb(theme.border))
@@ -1193,7 +1520,11 @@ fn signature_popup(
     let theme = app.theme.clone();
     let (row, col) = s.anchor;
     let col = display_col(app, row, col);
-    let row = app.editor.active_tab().map(|t| t.display_row(row)).unwrap_or(row);
+    let row = app
+        .editor
+        .active_tab()
+        .map(|t| t.display_row(row))
+        .unwrap_or(row);
     let left = popup_x(col, flow_visible, app.char_w(), app.editor_h_scroll());
     let rel = row.saturating_sub(scroll_top);
     // Sit the hint fully ABOVE the caret line: its bottom edge lands SIG_GAP px
@@ -1222,14 +1553,22 @@ fn signature_popup(
     match &s.active_param {
         Some(r) if r.end <= s.label.len() && r.start <= r.end => {
             hint = hint
-                .child(div().text_color(rgb(theme.muted)).child(s.label[..r.start].to_string()))
+                .child(
+                    div()
+                        .text_color(rgb(theme.muted))
+                        .child(s.label[..r.start].to_string()),
+                )
                 .child(
                     div()
                         .text_color(rgb(theme.accent))
                         .font_weight(gpui::FontWeight::BOLD)
                         .child(s.label[r.start..r.end].to_string()),
                 )
-                .child(div().text_color(rgb(theme.muted)).child(s.label[r.end..].to_string()));
+                .child(
+                    div()
+                        .text_color(rgb(theme.muted))
+                        .child(s.label[r.end..].to_string()),
+                );
         }
         _ => {
             hint = hint.child(div().text_color(rgb(theme.text)).child(s.label.clone()));
@@ -1245,7 +1584,6 @@ fn signature_popup(
             .max_w(px(560.))
             .px(px(8.))
             .py(px(3.))
-            .rounded_md()
             .bg(rgb(theme.panel))
             .border_1()
             .border_color(rgb(theme.border))
@@ -1256,41 +1594,203 @@ fn signature_popup(
 }
 
 /// The floating hover panel (plain text; markdown rendering deferred).
+/// One block of a hover card. clangd sends Markdown; the card shows the few
+/// forms clangd actually uses and never the raw fences or hashes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HoverBlock {
+    /// A `#` heading, with the hashes and any backticks stripped.
+    Heading(String),
+    /// The lines inside a ``` fence, verbatim.
+    Code(Vec<String>),
+    /// A horizontal rule (`---`).
+    Rule,
+    /// A run of plain lines, joined with spaces.
+    Text(String),
+}
+
+/// Split clangd's hover Markdown into [`HoverBlock`]s.
+pub fn hover_blocks(text: &str) -> Vec<HoverBlock> {
+    let mut out = Vec::new();
+    let mut code: Option<Vec<String>> = None;
+    let mut para: Vec<String> = Vec::new();
+    let flush_para = |para: &mut Vec<String>, out: &mut Vec<HoverBlock>| {
+        if !para.is_empty() {
+            out.push(HoverBlock::Text(para.join(" ")));
+            para.clear();
+        }
+    };
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(buf) = code.as_mut() {
+            if trimmed.starts_with("```") {
+                out.push(HoverBlock::Code(std::mem::take(buf)));
+                code = None;
+            } else {
+                buf.push(line.to_string());
+            }
+            continue;
+        }
+        if trimmed.starts_with("```") {
+            flush_para(&mut para, &mut out);
+            code = Some(Vec::new());
+        } else if trimmed == "---" || trimmed == "***" {
+            flush_para(&mut para, &mut out);
+            out.push(HoverBlock::Rule);
+        } else if let Some(rest) = trimmed.strip_prefix('#') {
+            flush_para(&mut para, &mut out);
+            let title = rest.trim_start_matches('#').trim().replace('`', "");
+            out.push(HoverBlock::Heading(title));
+        } else if trimmed.is_empty() {
+            flush_para(&mut para, &mut out);
+        } else {
+            para.push(trimmed.replace('`', ""));
+        }
+    }
+    if let Some(buf) = code {
+        out.push(HoverBlock::Code(buf));
+    }
+    flush_para(&mut para, &mut out);
+    // A rule that only separates a heading from a code block adds nothing.
+    out.retain(|b| *b != HoverBlock::Rule);
+    out
+}
+
 fn hover_popup(app: &JadeApp, flow_visible: bool, scroll_top: usize) -> Option<gpui::AnyElement> {
     let h: &HoverState = app.hover.as_ref()?;
     let theme = app.theme.clone();
+    let t = &theme.kumo;
     let col = display_col(app, h.row, h.col);
-    let row = app.editor.active_tab().map(|t| t.display_row(h.row)).unwrap_or(h.row);
+    let row = app
+        .editor
+        .active_tab()
+        .map(|t| t.display_row(h.row))
+        .unwrap_or(h.row);
     let left = popup_x(col, flow_visible, app.char_w(), app.editor_h_scroll());
     let top = popup_y(row, scroll_top);
+
+    let mut body = div().flex().flex_col().gap(scale::SPACE_1_5);
+    // Diagnostics first: a severity word in the squiggle's color, then the
+    // message in the default ink.
+    for (sev, message) in &h.diagnostics {
+        use jade_lsp::DiagnosticSeverity as S;
+        let label = match *sev {
+            Some(S::ERROR) => "error",
+            Some(S::WARNING) => "warning",
+            Some(S::HINT) => "hint",
+            _ => "note",
+        };
+        let color = editor_view::severity_color(*sev, theme.red, theme.amber, theme.periwinkle);
+        body = body.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_start()
+                .gap(scale::SPACE_2)
+                .text_size(scale::TEXT_XS)
+                .child(
+                    div()
+                        .flex_none()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(rgb(color))
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .whitespace_normal()
+                        .text_color(t.text_default)
+                        .child(message.clone()),
+                ),
+        );
+    }
+    if !h.diagnostics.is_empty() && !h.text.trim().is_empty() {
+        body = body.child(crate::kumo::separator_h(t));
+    }
+    for block in hover_blocks(&h.text) {
+        body = match block {
+            HoverBlock::Heading(s) => body.child(
+                div()
+                    .text_size(scale::TEXT_XS)
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(t.text_default)
+                    .child(s),
+            ),
+            HoverBlock::Code(lines) => {
+                let mut code = div()
+                    .flex()
+                    .flex_col()
+                    .px(scale::SPACE_2)
+                    .py(scale::SPACE_1)
+                    .bg(t.canvas)
+                    .font_family(crate::fonts::mono_family())
+                    .text_size(px(11.))
+                    .text_color(t.text_default);
+                for l in lines {
+                    code = code.child(div().whitespace_nowrap().child(l));
+                }
+                body.child(code)
+            }
+            HoverBlock::Rule => body.child(crate::kumo::separator_h(t)),
+            HoverBlock::Text(s) => body.child(
+                div()
+                    .text_size(scale::TEXT_XS)
+                    .text_color(t.text_subtle)
+                    .whitespace_normal()
+                    .child(s),
+            ),
+        };
+    }
+
     Some(
-        div()
+        crate::kumo::Surface::overlay(t)
             .absolute()
             .left(px(left))
             .top(px(top))
-            .max_w(px(480.))
-            .max_h(px(220.))
-            .p(px(8.))
-            .rounded_md()
-            .bg(rgb(theme.panel))
-            .border_1()
-            .border_color(rgb(theme.border))
+            .max_w(px(640.))
+            .max_h(px(240.))
+            .p(scale::SPACE_2)
             .overflow_hidden()
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(theme.text))
-                    .whitespace_normal()
-                    .child(h.text.clone()),
-            )
+            .child(body)
             .into_any_element(),
     )
+}
+
+#[cfg(test)]
+mod hover_block_tests {
+    use super::{hover_blocks, HoverBlock};
+
+    #[test]
+    fn clangd_include_hover_splits_into_heading_and_code() {
+        let md = "### `mps_gemm.h`  \n\n---\n```\n/Users/x/mps_gemm.h\n```";
+        assert_eq!(
+            hover_blocks(md),
+            vec![
+                HoverBlock::Heading("mps_gemm.h".into()),
+                HoverBlock::Code(vec!["/Users/x/mps_gemm.h".into()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn paragraphs_join_and_fences_stay_verbatim() {
+        let md = "### `int x`\n\nType: `int`\nSize: 4 bytes\n\n```cpp\n  int x = 1;\n```";
+        assert_eq!(
+            hover_blocks(md),
+            vec![
+                HoverBlock::Heading("int x".into()),
+                HoverBlock::Text("Type: int Size: 4 bytes".into()),
+                HoverBlock::Code(vec!["  int x = 1;".into()]),
+            ]
+        );
+    }
 }
 
 /// Build the `line → RuntimeAlloc` map for the active tab's file from the
 /// memory-bar per-`file:line` tracker (§4.5 system 3). Keys are matched by full
 /// path or basename, since the alloc event's `file` field form isn't fixed.
-fn runtime_allocs_for(app: &JadeApp, tab: &crate::editor_view::OpenTab) -> HashMap<u32, RuntimeAlloc> {
+fn runtime_allocs_for(
+    app: &JadeApp,
+    tab: &crate::editor_view::OpenTab,
+) -> HashMap<u32, RuntimeAlloc> {
     let mut out = HashMap::new();
     if app.mem.per_line.is_empty() {
         return out;
@@ -1311,7 +1811,8 @@ fn runtime_allocs_for(app: &JadeApp, tab: &crate::editor_view::OpenTab) -> HashM
         let base = std::path::Path::new(file)
             .file_name()
             .and_then(|n| n.to_str());
-        let matches = file == tab_disp || (tab_base.as_deref().is_some() && tab_base.as_deref() == base);
+        let matches =
+            file == tab_disp || (tab_base.as_deref().is_some() && tab_base.as_deref() == base);
         if matches {
             out.insert(
                 line,
@@ -1329,38 +1830,181 @@ fn runtime_allocs_for(app: &JadeApp, tab: &crate::editor_view::OpenTab) -> HashM
 /// The tab strip above the viewer (deliverable §3): one chip per open tab with a
 /// an `x` close icon, the active tab underlined. Middle-click also closes (GPUI exposes
 /// the mouse button on the down event).
-pub fn tab_strip(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl IntoElement {
+pub fn pane_strip(
+    app: &JadeApp,
+    pane: usize,
+    cx: &mut Context<JadeApp>,
+    theme: &Theme,
+) -> impl IntoElement {
+    let focused = pane == app.focused_pane();
+    // The focused slot's editor is the live one; a background slot owns its own.
+    let editor = app
+        .panes
+        .get(pane)
+        .and_then(|p| p.editor.as_ref())
+        .unwrap_or(&app.editor);
     // Kumo Tabs at `appearance="underline"`: flat triggers on the strip with a
     // 2px brand bar under the active one, and a hairline along the whole list.
+    let tint = theme.kumo.tint;
     let mut strip = div()
-        .id("tab-strip")
+        .id(("tab-strip", pane))
         .flex()
         .flex_row()
         .items_stretch()
-        .h(px(36.))
+        .h(px(32.))
         .w_full()
-        .px(scale::SPACE_1_5)
         .bg(theme.kumo.elevated)
         .border_b_1()
         .border_color(theme.kumo.hairline)
-        .overflow_x_hidden();
+        .overflow_x_hidden()
+        // A tab dropped on the strip's free space lands at the end.
+        .drag_over::<TabDrag>(move |st, _, _, _| st.bg(tint))
+        .on_drop(cx.listener(move |app, d: &TabDrag, _win, cx| {
+            app.move_tab(d.pane, d.index, pane, None);
+            app.schedule_ui_save(cx);
+            cx.notify();
+        }));
 
-    for (i, tab) in app.editor.tabs.iter().enumerate() {
-        let active = app.editor.active == Some(i);
+    for (i, tab) in editor.tabs.iter().enumerate() {
+        let active = editor.active == Some(i);
         strip = strip.child(tab_chip(
+            pane,
             i,
             &tab.name,
             active,
+            focused,
             tab.buffer.is_dirty(),
             tab.preview,
             theme,
             cx,
         ));
     }
-    // XP bar in the tab-bar right slot (§4.10): flex spacer pushes it to the edge.
-    strip
+    // Right slot: the pane controls, then the XP bar (§4.10) on the last
+    // pane. A flex spacer pushes both to the edge.
+    strip = strip
         .child(div().flex_1())
-        .child(xp_bar(app, theme))
+        .child(pane_controls(app, pane, cx, theme));
+    if pane + 1 == app.pane_count() {
+        strip = strip.child(xp_bar(app, theme));
+    }
+    strip
+}
+
+/// The pane's control cluster in the strip's right slot: the formatted/raw
+/// toggle for a Markdown tab (split mode only), the split-right button, and
+/// the close-pane button (split mode only).
+fn pane_controls(
+    app: &JadeApp,
+    pane: usize,
+    cx: &mut Context<JadeApp>,
+    theme: &Theme,
+) -> impl IntoElement {
+    let t = &theme.kumo;
+    let split = app.split_mode();
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .items_stretch()
+        .h_full()
+        .px(scale::SPACE_1)
+        .border_l_1()
+        .border_color(t.hairline);
+
+    let md_tab = app
+        .pane_active_tab(pane)
+        .is_some_and(|tab| super::md_view::is_markdown(&tab.path));
+    if split && md_tab {
+        let rendered = app.panes.get(pane).is_some_and(|p| p.md_rendered);
+        row = row
+            .child(view_toggle(pane, "Formatted", true, rendered, theme, cx))
+            .child(view_toggle(pane, "Raw", false, !rendered, theme, cx));
+    }
+    if app.pane_count() < crate::panes::MAX_PANES {
+        row = row.child(
+            strip_icon_button(("pane-split", pane), "columns-2", theme, cx, |app| {
+                app.split_pane();
+            }),
+        );
+    }
+    if split {
+        row = row.child(
+            strip_icon_button(("pane-close", pane), "x", theme, cx, move |app| {
+                app.close_pane(pane);
+            }),
+        );
+    }
+    row
+}
+
+/// One side of the formatted/raw toggle: an underline trigger in the same
+/// dress as a tab chip, at the strip's text size.
+fn view_toggle(
+    pane: usize,
+    label: &'static str,
+    rendered: bool,
+    on: bool,
+    theme: &Theme,
+    cx: &mut Context<JadeApp>,
+) -> impl IntoElement {
+    let t = &theme.kumo;
+    let hover_bg = t.tint;
+    let mut b = div()
+        .id(("pane-md-view", pane * 2 + usize::from(rendered)))
+        .relative()
+        .flex()
+        .items_center()
+        .h_full()
+        .px(scale::SPACE_2)
+        .text_size(scale::TEXT_XS)
+        .cursor_pointer()
+        .text_color(if on { t.text_default } else { t.text_subtle })
+        .on_click(cx.listener(move |app, _ev, _win, cx| {
+            app.set_pane_md(pane, rendered);
+            app.schedule_ui_save(cx);
+            cx.notify();
+        }))
+        .child(label);
+    if on {
+        b = b.font_weight(gpui::FontWeight::MEDIUM).child(
+            div()
+                .absolute()
+                .bottom_0()
+                .left_0()
+                .right_0()
+                .h(px(2.))
+                .bg(t.brand),
+        );
+    } else {
+        b = b.hover(move |st| st.bg(hover_bg));
+    }
+    b
+}
+
+/// A square icon button for the strip's right slot.
+fn strip_icon_button(
+    id: (&'static str, usize),
+    icon: &'static str,
+    theme: &Theme,
+    cx: &mut Context<JadeApp>,
+    on_click: impl Fn(&mut JadeApp) + 'static,
+) -> impl IntoElement {
+    let t = &theme.kumo;
+    let hover_bg = t.tint;
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(26.))
+        .h_full()
+        .cursor_pointer()
+        .hover(move |st| st.bg(hover_bg))
+        .on_click(cx.listener(move |app, _ev, _win, cx| {
+            on_click(app);
+            app.schedule_ui_save(cx);
+            cx.notify();
+        }))
+        .child(crate::kumo::icon(icon, 13., t.text_subtle))
 }
 
 /// The XP bar (§4.10): `L{n}` label · progress track · `×{streak}` badge (shown
@@ -1375,42 +2019,56 @@ fn xp_bar(app: &JadeApp, theme: &Theme) -> impl IntoElement {
     };
 
     let t = &theme.kumo;
-    // A Kumo Meter (`h-2 rounded-full bg-kumo-fill` with a brand bar) plus the
-    // level and streak as Badges.
+    // The old `.xp-bar`: a brand `L{n}` label, a 90×4 track, the count in
+    // mono, and the streak in amber only while it is live. No fills.
     let mut bar = div()
         .id("xp-bar")
         .flex()
         .flex_row()
         .items_center()
         .gap(scale::SPACE_2)
-        .px(scale::SPACE_2)
-        // Tooltip parity with the TS: progress / needed to next level · total.
+        .px(scale::SPACE_3)
+        .border_l_1()
+        .border_color(t.hairline)
+        .text_size(px(11.))
         .child(
-            Badge::new(format!("L{}", info.level))
-                .variant(BadgeVariant::Success)
-                .render(t),
+            div()
+                .text_color(t.brand)
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .child(format!("L{}", info.level)),
         )
-        .child(div().w(px(60.)).child(Meter::new(pct / 100.0).render(t)))
         .child(
-            KumoText::new(format!("{}/{}", info.progress, info.needed))
-                .tone(TextTone::MonoSecondary)
-                .size(KumoSize::Xs)
-                .render(t),
+            div()
+                .w(px(90.))
+                .h(px(4.))
+                .overflow_hidden()
+                .bg(t.fill)
+                .child(div().h_full().w(gpui::relative(pct / 100.0)).bg(t.brand)),
+        )
+        .child(
+            div()
+                .font_family(crate::fonts::mono_family())
+                .text_color(t.text_subtle)
+                .child(format!("{}/{}", info.progress, info.needed)),
         );
     if streak > 1 {
         bar = bar.child(
-            Badge::new(format!("×{streak}"))
-                .variant(BadgeVariant::Warning)
-                .render(t),
+            div()
+                .font_family(crate::fonts::mono_family())
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(t.text_warning)
+                .child(format!("×{streak}")),
         );
     }
     bar
 }
 
 fn tab_chip(
+    pane: usize,
     index: usize,
     name: &str,
     active: bool,
+    focused: bool,
     dirty: bool,
     preview: bool,
     theme: &Theme,
@@ -1419,25 +2077,58 @@ fn tab_chip(
     let t = &theme.kumo;
     // One Kumo underline trigger: `text-kumo-subtle` at rest,
     // `aria-selected:text-kumo-default` with the brand bar when active.
-    let fg = if active { t.text_default } else { t.text_subtle };
+    let fg = if active {
+        t.text_default
+    } else {
+        t.text_subtle
+    };
     let hover_bg = t.tint;
+    let group = gpui::SharedString::from(format!("tab-group-{pane}-{index}"));
+    // Element ids are per window: keep the chips of different panes apart.
+    let slot = pane * 4096 + index;
+    let drag = TabDrag {
+        pane,
+        index,
+        name: name.to_string(),
+    };
+    let (ghost_bg, ghost_fg, ghost_line) = (t.elevated, t.text_default, t.hairline);
 
     let mut chip = div()
-        .id(("tab", index))
+        .id(("tab", slot))
+        // Drag the chip to another pane (or its right edge to split); the
+        // ghost is the tab name. A drop on a chip inserts before it.
+        .on_drag(drag, move |d, _offset, _win, cx| {
+            cx.new(|_| TabDragPreview {
+                name: d.name.clone(),
+                bg: ghost_bg,
+                fg: ghost_fg,
+                line: ghost_line,
+            })
+        })
+        .drag_over::<TabDrag>(move |st, _, _, _| st.bg(hover_bg))
+        .on_drop(cx.listener(move |app, d: &TabDrag, _win, cx| {
+            app.move_tab(d.pane, d.index, pane, Some(index));
+            app.schedule_ui_save(cx);
+            cx.notify();
+        }))
+        .group(group.clone())
         .relative()
         .flex()
         .flex_row()
         .items_center()
-        .gap(scale::SPACE_1)
+        .gap(scale::SPACE_1_5)
         .h_full()
-        .px(scale::SPACE_3)
+        .pl(scale::SPACE_3)
+        .pr(scale::SPACE_2)
         .text_size(scale::TEXT_XS)
         .cursor_pointer()
         .text_color(fg)
-        // Middle-click closes (mouse-down carries the button).
+        // Middle-click closes (mouse-down carries the button). A chip of a
+        // background pane first gives that pane the keyboard.
         .on_mouse_down(
             gpui::MouseButton::Middle,
             cx.listener(move |app, _ev, _win, cx| {
+                app.focus_pane(pane);
                 app.close_tab(index);
                 app.schedule_ui_save(cx);
                 cx.notify();
@@ -1445,6 +2136,7 @@ fn tab_chip(
         )
         // Left-click switches to this tab.
         .on_click(cx.listener(move |app, _ev, _win, cx| {
+            app.focus_pane(pane);
             app.switch_tab(index);
             app.schedule_ui_save(cx);
             cx.notify();
@@ -1459,8 +2151,12 @@ fn tab_chip(
         });
 
     if active {
-        // `isUnderline && "absolute bottom-0 h-0.5 bg-kumo-brand"`.
+        // The old `.tab-active`: the editor canvas behind the label, so the
+        // tab reads as part of the page below it, plus the 2px brand rule.
+        // A background pane's active tab keeps the rule in the line ink, so
+        // the pane with the keyboard reads at a glance.
         chip = chip
+            .bg(t.canvas)
             .font_weight(gpui::FontWeight::MEDIUM)
             .child(
                 div()
@@ -1469,7 +2165,7 @@ fn tab_chip(
                     .left_0()
                     .right_0()
                     .h(px(2.))
-                    .bg(t.brand),
+                    .bg(if focused { t.brand } else { t.line }),
             );
     } else {
         chip = chip.hover(move |st| st.bg(hover_bg));
@@ -1480,17 +2176,27 @@ fn tab_chip(
         chip = chip.child(div().size(px(6.)).rounded_full().bg(t.brand));
     }
 
-    // Close button.
-    chip.child(
-        div()
-            .id(("tab-close", index))
-            .px(scale::SPACE_1)
-            .cursor_pointer()
-            .on_click(cx.listener(move |app, _ev, _win, cx| {
-                app.close_tab(index);
-                app.schedule_ui_save(cx);
-                cx.notify();
-            }))
-            .child(crate::kumo::icon("x", 12., t.text_subtle)),
-    )
+    // Close button: hidden until the tab is hovered (`.tab:hover .tab-close`),
+    // but always there on the active tab. It keeps its box either way so the
+    // label does not shift when it appears.
+    let mut close = div()
+        .id(("tab-close", slot))
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(16.))
+        .cursor_pointer()
+        .hover(move |s| s.bg(hover_bg))
+        .on_click(cx.listener(move |app, _ev, _win, cx| {
+            cx.stop_propagation();
+            app.focus_pane(pane);
+            app.close_tab(index);
+            app.schedule_ui_save(cx);
+            cx.notify();
+        }))
+        .child(crate::kumo::icon("x", 11., t.text_subtle));
+    if !active {
+        close = close.invisible().group_hover(group, |s| s.visible());
+    }
+    chip.child(close)
 }

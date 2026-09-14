@@ -58,6 +58,7 @@ mod interaction_tests;
 mod memory_bar;
 mod output;
 mod panels;
+mod panes;
 mod prefs;
 mod quick_open;
 mod registry;
@@ -69,6 +70,7 @@ mod timer_groups;
 mod training;
 mod video;
 mod visualize;
+mod wave;
 mod wg3d;
 mod workspace_state;
 mod workspace_tree;
@@ -389,7 +391,9 @@ fn main() {
                     titlebar: Some(TitlebarOptions {
                         title: Some("Jade".into()),
                         appears_transparent: true,
-                        traffic_light_position: Some(point(px(12.), px(12.))),
+                        // Centered on the 38px action bar: the lights are 12px
+                        // tall, so 13px down puts their middle at 19px.
+                        traffic_light_position: Some(point(px(12.), px(13.))),
                     }),
                     window_min_size: Some(size(px(800.), px(500.))),
                     window_background: WindowBackgroundAppearance::Opaque,

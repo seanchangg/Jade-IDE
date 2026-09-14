@@ -124,11 +124,11 @@ pub mod scale {
     pub const H_10: Pixels = px(40.0); // size lg
 
     // Tailwind v4 radii.
-    pub const RADIUS_XS: Pixels = px(2.0);
-    pub const RADIUS_SM: Pixels = px(4.0);
-    pub const RADIUS_MD: Pixels = px(6.0);
-    pub const RADIUS_LG: Pixels = px(8.0);
-    pub const RADIUS_XL: Pixels = px(12.0);
+    pub const RADIUS_XS: Pixels = px(0.0);
+    pub const RADIUS_SM: Pixels = px(0.0);
+    pub const RADIUS_MD: Pixels = px(0.0);
+    pub const RADIUS_LG: Pixels = px(0.0);
+    pub const RADIUS_XL: Pixels = px(0.0);
 
     // Kumo's `@theme` type scale.
     pub const TEXT_XS: Pixels = px(12.0);
@@ -172,13 +172,10 @@ impl Size {
         }
     }
 
-    /// The corner radius: `rounded-sm | rounded-md | rounded-lg | rounded-lg`.
+    /// The corner radius. Jade draws every control square, so every size
+    /// resolves to zero; the method stays so a size still owns its geometry.
     pub fn radius(self) -> Pixels {
-        match self {
-            Size::Xs => scale::RADIUS_SM,
-            Size::Sm => scale::RADIUS_MD,
-            Size::Base | Size::Lg => scale::RADIUS_LG,
-        }
+        px(0.)
     }
 
     /// The label size: `text-xs | text-xs | text-base | text-base`.
@@ -280,7 +277,7 @@ mod tests {
                 Size::Xs.radius(),
                 Size::Xs.text()
             ),
-            (px(20.), px(6.), px(4.), px(12.))
+            (px(20.), px(6.), px(0.), px(12.))
         );
         assert_eq!(
             (
@@ -289,7 +286,7 @@ mod tests {
                 Size::Sm.radius(),
                 Size::Sm.text()
             ),
-            (px(26.), px(8.), px(6.), px(12.))
+            (px(26.), px(8.), px(0.), px(12.))
         );
         assert_eq!(
             (
@@ -298,7 +295,7 @@ mod tests {
                 Size::Base.radius(),
                 Size::Base.text()
             ),
-            (px(36.), px(12.), px(8.), px(14.))
+            (px(36.), px(12.), px(0.), px(14.))
         );
         assert_eq!(
             (
@@ -307,7 +304,7 @@ mod tests {
                 Size::Lg.radius(),
                 Size::Lg.text()
             ),
-            (px(40.), px(16.), px(8.), px(14.))
+            (px(40.), px(16.), px(0.), px(14.))
         );
     }
 
@@ -320,14 +317,6 @@ mod tests {
         for size in [Size::Xs, Size::Sm, Size::Base, Size::Lg] {
             let slack = size.tab_bar_height() - size.tab_trigger_height();
             assert_eq!(slack, px(4.), "2px of trough above and below the pill");
-            // The trough's own radius must exceed the inset, or the corner
-            // still cuts into the pill.
-            let trough_radius = if matches!(size, Size::Xs | Size::Sm) {
-                scale::RADIUS_MD
-            } else {
-                scale::RADIUS_LG
-            };
-            assert!(trough_radius > px(2.), "radius must exceed the 2px inset");
         }
         // The trough keeps the standard control heights despite the margin.
         assert_eq!(Size::Sm.tab_bar_height(), Size::Sm.height());

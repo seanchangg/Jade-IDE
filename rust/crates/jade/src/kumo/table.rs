@@ -185,7 +185,7 @@ impl TableCell {
                 t.text_default
             });
         if self.numeric {
-            el = el.justify_end().font_family("JetBrains Mono");
+            el = el.justify_end().font_family(crate::fonts::mono_family());
         }
         if let Some(text) = self.text {
             el = el.child(text);

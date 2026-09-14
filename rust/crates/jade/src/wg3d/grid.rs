@@ -60,16 +60,29 @@ pub struct BarGrid {
 /// Diverging colormap centered at 0, normalized by `max_abs`
 /// (weight-grid-3d.ts:880-897; identical to the 2D heatmap convention).
 /// `t ≥ 0` → white→red, `t < 0` → white→blue.
+/// The colormap's three stops. Zero sits on the charcoal, so a cell near
+/// zero is quiet; magnitude moves toward a muted coral (positive) or a
+/// periwinkle (negative). Both ends are the hues mixed back toward the ink,
+/// so a full-magnitude sheet still reads as one drawing and not as a flag.
+pub const MAP_MID: [f32; 3] = [0.239, 0.251, 0.278]; // #3D4047
+pub const MAP_POS: [f32; 3] = [0.878, 0.478, 0.373]; // #E07A5F
+pub const MAP_NEG: [f32; 3] = [0.420, 0.580, 0.902]; // #6B94E6
+
+/// The diverging colormap for a value against the frame's max-abs.
 pub fn diverging(v: f32, inv_max: f32) -> [f32; 3] {
     if inv_max == 0.0 || !v.is_finite() {
-        return [1.0, 1.0, 1.0];
+        return MAP_MID;
     }
     let t = (v * inv_max).clamp(-1.0, 1.0);
-    if t >= 0.0 {
-        [1.0, 1.0 - t, 1.0 - t]
-    } else {
-        [1.0 + t, 1.0 + t, 1.0]
-    }
+    // A gentle curve lifts the small values a little, so a sheet of mostly
+    // small weights does not collapse into the midpoint.
+    let k = t.abs().powf(0.75);
+    let end = if t >= 0.0 { MAP_POS } else { MAP_NEG };
+    [
+        MAP_MID[0] + (end[0] - MAP_MID[0]) * k,
+        MAP_MID[1] + (end[1] - MAP_MID[1]) * k,
+        MAP_MID[2] + (end[2] - MAP_MID[2]) * k,
+    ]
 }
 
 /// Subsampled output dimensions + stride for a `rows × cols` frame under an
@@ -546,17 +559,19 @@ mod tests {
 
     #[test]
     fn colormap_diverges() {
-        // Positive → red dominates (green/blue drop).
-        let pos = diverging(1.0, 1.0);
-        assert_eq!(pos, [1.0, 0.0, 0.0]);
-        // Negative → blue dominates (red/green drop).
-        let neg = diverging(-1.0, 1.0);
-        assert_eq!(neg, [0.0, 0.0, 1.0]);
-        // Zero / no scale → white.
-        assert_eq!(diverging(0.0, 1.0), [1.0, 1.0, 1.0]);
-        assert_eq!(diverging(5.0, 0.0), [1.0, 1.0, 1.0]);
-        // Half magnitude → pastel.
-        assert_eq!(diverging(0.5, 1.0), [1.0, 0.5, 0.5]);
+        // Positive → the warm end; negative → the cool end.
+        assert_eq!(diverging(1.0, 1.0), MAP_POS);
+        assert_eq!(diverging(-1.0, 1.0), MAP_NEG);
+        // Zero / no scale → the charcoal midpoint.
+        assert_eq!(diverging(0.0, 1.0), MAP_MID);
+        assert_eq!(diverging(5.0, 0.0), MAP_MID);
+        // Half magnitude lands strictly between the midpoint and the warm
+        // end on every channel.
+        let half = diverging(0.5, 1.0);
+        for c in 0..3 {
+            let (lo, hi) = (MAP_MID[c].min(MAP_POS[c]), MAP_MID[c].max(MAP_POS[c]));
+            assert!(half[c] > lo && half[c] < hi, "channel {c}: {}", half[c]);
+        }
     }
 
     #[test]
@@ -566,15 +581,15 @@ mod tests {
         let g = build_bars(&f).unwrap();
         assert_eq!(g.bars.len(), 3);
         assert!((g.max_abs - 4.0).abs() < 1e-6);
-        // +4 → height +HEIGHT_SCALE, red.
+        // +4 → height +HEIGHT_SCALE, the warm end.
         assert!((g.bars[0].height - HEIGHT_SCALE).abs() < 1e-4);
-        assert_eq!([g.bars[0].g, g.bars[0].b], [0.0, 0.0]);
+        assert_eq!([g.bars[0].r, g.bars[0].g, g.bars[0].b], MAP_POS);
         // -2 → height -(0.5*HEIGHT_SCALE), extends below plane, blue.
         assert!((g.bars[1].height + HEIGHT_SCALE * 0.5).abs() < 1e-4);
         assert!(g.bars[1].height < 0.0);
-        // 0 → floored to MIN_BAR, white.
+        // 0 → floored to MIN_BAR, the midpoint.
         assert!((g.bars[2].height - MIN_BAR).abs() < 1e-6);
-        assert_eq!([g.bars[2].r, g.bars[2].g, g.bars[2].b], [1.0, 1.0, 1.0]);
+        assert_eq!([g.bars[2].r, g.bars[2].g, g.bars[2].b], MAP_MID);
     }
 
     #[test]

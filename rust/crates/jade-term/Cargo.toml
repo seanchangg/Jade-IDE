@@ -10,7 +10,10 @@ description = "Headless terminal engine (PTY + terminal state machine) for Jade.
 # 0.26 bundles a Unix PTY (rustix-openpty) and an event loop that reads the PTY,
 # drives the VTE parser, and reports child-exit race-free via SIGCHLD.
 alacritty_terminal = "0.26.0"
+# Signal escalation for the close path (`kill`, `killpg`, `tcgetpgrp`, `waitpid`).
+libc = "0.2"
 tokio = { workspace = true }
 
 [dev-dependencies]
+libc = "0.2"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }

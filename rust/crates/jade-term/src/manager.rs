@@ -8,10 +8,12 @@
 //! state machine, and reports child exit race-free via `SIGCHLD`.
 
 use std::collections::HashMap;
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, State};
@@ -37,6 +39,10 @@ pub const DEFAULT_SCROLLBACK: usize = 1000;
 /// Initial terminal geometry (ports `pty-manager.ts:30-31` `cols: 80, rows: 24`).
 const INIT_COLS: u16 = 80;
 const INIT_ROWS: u16 = 24;
+
+/// How long the reaper waits after each signal before it sends the next one.
+/// SIGHUP -> SIGTERM -> SIGKILL, so a close takes at most about three graces.
+const KILL_GRACE: Duration = Duration::from_millis(500);
 
 /// Cell pixel size reported to the kernel's winsize. Only affects `ws_xpixel`/
 /// `ws_ypixel`; the terminal is character-addressed so the exact values are
@@ -161,19 +167,87 @@ struct Instance {
     cols: usize,
     rows: usize,
     scrollback: usize,
+    /// The shell's pid. It called `setsid`, so it is also its session and
+    /// process-group id.
+    child_pid: libc::pid_t,
+    /// The PTY master fd. Valid while the `Pty` lives, which the reaper keeps
+    /// alive until the child is gone.
+    master_fd: RawFd,
 }
 
 impl Instance {
-    /// Ask the PTY thread to shut down, then join it so the child is reaped
-    /// (`Pty`'s `Drop` sends `SIGHUP` and waits). Ports `process.kill()`
-    /// (`pty-manager.ts:64`).
-    fn shutdown(&mut self) {
+    /// Ask the PTY thread to shut down and hand the child to a reaper thread.
+    /// Ports `process.kill()` (`pty-manager.ts:64`).
+    ///
+    /// This never blocks the caller. `Pty`'s `Drop` sends `SIGHUP` and then
+    /// waits for the shell, and that wait does not return while a foreground
+    /// program that ignores `SIGHUP` (Claude Code, for one) holds the terminal
+    /// open: the shell stays in the kernel's exit state until the program
+    /// goes. Done on the UI thread, that froze the app. The reaper thread
+    /// escalates to `SIGTERM` and `SIGKILL` so the wait is bounded.
+    fn shutdown(&mut self) -> Option<JoinHandle<()>> {
         // `send` also wakes the poller, so a thread blocked in `poll.wait`
         // returns and observes the shutdown.
         let _ = self.sender.send(Msg::Shutdown);
-        if let Some(handle) = self.io_thread.take() {
-            let _ = handle.join();
+        let handle = self.io_thread.take()?;
+        let pid = self.child_pid;
+        let fd = self.master_fd;
+        std::thread::Builder::new()
+            .name("PTY reaper".into())
+            .spawn(move || {
+                // The reader thread returns the loop, which owns the `Pty`.
+                // Keep it alive until the child is gone so `master_fd` stays
+                // valid and `Pty::drop`'s wait returns at once.
+                let owned = handle.join().ok();
+                reap(pid, fd);
+                drop(owned);
+            })
+            .ok()
+    }
+}
+
+/// Stop the shell `pid` and everything it runs on the terminal `master_fd`:
+/// `SIGHUP` first, then `SIGTERM` and `SIGKILL` to the shell and to the
+/// terminal's foreground process group, one [`KILL_GRACE`] apart. Returns once
+/// the shell is reaped or every signal was sent.
+fn reap(pid: libc::pid_t, master_fd: RawFd) {
+    // SAFETY: plain signal/wait syscalls on a pid this manager spawned.
+    unsafe {
+        libc::kill(pid, libc::SIGHUP);
+    }
+    if wait_exit(pid, KILL_GRACE) {
+        return;
+    }
+    // Whatever runs in the foreground is what keeps the shell from exiting.
+    let fg = unsafe { libc::tcgetpgrp(master_fd) };
+    for sig in [libc::SIGTERM, libc::SIGKILL] {
+        unsafe {
+            if fg > 0 && fg != pid {
+                libc::killpg(fg, sig);
+            }
+            libc::killpg(pid, sig);
+            libc::kill(pid, sig);
         }
+        if wait_exit(pid, KILL_GRACE) {
+            return;
+        }
+    }
+}
+
+/// Poll `waitpid(WNOHANG)` for up to `timeout`. True once the child is reaped
+/// (or was already reaped by someone else).
+fn wait_exit(pid: libc::pid_t, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut status = 0;
+        let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if r == pid || r == -1 {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -273,6 +347,9 @@ impl TermManager {
         let pty = tty::new(&options, window_size, id as u64)
             .map_err(TermError::PtyUnavailable)?;
 
+        let child_pid = pty.child().id() as libc::pid_t;
+        let master_fd = pty.file().as_raw_fd();
+
         let dirty = Arc::new(AtomicBool::new(false));
         let pty_tx = Arc::new(Mutex::new(None));
         let proxy = EventProxy {
@@ -307,6 +384,8 @@ impl TermManager {
                 cols: INIT_COLS as usize,
                 rows: INIT_ROWS as usize,
                 scrollback,
+                child_pid,
+                master_fd,
             },
         );
         inner.next_id += 1;
@@ -348,26 +427,33 @@ impl TermManager {
     }
 
     /// Kill and remove a terminal (`pty-manager.ts:61-67`).
+    ///
+    /// Returns at once. The id is gone from the manager immediately; the shell
+    /// and its foreground job are stopped by a background reaper thread that
+    /// escalates from `SIGHUP` to `SIGKILL` (see [`Instance::shutdown`]).
     pub fn destroy(&self, id: TermId) {
         let inst = {
             let mut inner = self.inner.lock().unwrap();
             inner.instances.remove(&id)
         };
-        // Drop the lock before joining the PTY thread to avoid holding the
-        // manager mutex across a join.
+        // The manager mutex is released before the shutdown starts.
         if let Some(mut inst) = inst {
-            inst.shutdown();
+            let _ = inst.shutdown();
         }
     }
 
-    /// Kill and remove every terminal (`pty-manager.ts:69-73`).
+    /// Kill and remove every terminal (`pty-manager.ts:69-73`). Unlike
+    /// [`destroy`](Self::destroy) this waits for the reapers, so every child
+    /// is gone when it returns (bounded by the signal escalation).
     pub fn destroy_all(&self) {
         let instances: Vec<Instance> = {
             let mut inner = self.inner.lock().unwrap();
             inner.instances.drain().map(|(_, v)| v).collect()
         };
-        for mut inst in instances {
-            inst.shutdown();
+        let reapers: Vec<JoinHandle<()>> =
+            instances.into_iter().filter_map(|mut inst| inst.shutdown()).collect();
+        for r in reapers {
+            let _ = r.join();
         }
     }
 
@@ -464,11 +550,16 @@ impl Default for TermManager {
 
 impl Drop for TermManager {
     fn drop(&mut self) {
-        // Best-effort: reap any still-running PTY threads/children.
-        if let Ok(mut inner) = self.inner.lock() {
-            for (_, mut inst) in inner.instances.drain() {
-                inst.shutdown();
-            }
+        // Best-effort: start a reaper for every still-running child and give
+        // them a bounded time to finish, so a quit does not leave orphans. A
+        // reaper that is still stuck after that must not hold the process.
+        let Ok(mut inner) = self.inner.lock() else { return };
+        let reapers: Vec<JoinHandle<()>> =
+            inner.instances.drain().filter_map(|(_, mut inst)| inst.shutdown()).collect();
+        drop(inner);
+        let deadline = Instant::now() + KILL_GRACE * 4;
+        while reapers.iter().any(|r| !r.is_finished()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 }

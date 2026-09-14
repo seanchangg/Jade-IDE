@@ -21,7 +21,7 @@ impl Card {
     pub fn new(t: &KumoTokens) -> Div {
         div()
             .overflow_hidden()
-            .rounded(scale::RADIUS_LG)
+            
             .bg(t.base)
             .border_1()
             .border_color(t.line)
@@ -36,7 +36,7 @@ impl Card {
             .flex_col()
             .w_full()
             .overflow_hidden()
-            .rounded(scale::RADIUS_LG)
+            
             .bg(t.elevated)
             .text_size(scale::TEXT_BASE)
             .border_1()
@@ -56,7 +56,7 @@ impl CardPrimary {
             .flex_col()
             .gap(scale::SPACE_2)
             .overflow_hidden()
-            .rounded(scale::RADIUS_LG)
+            
             .bg(t.base)
             .p(scale::SPACE_4)
             .pr(scale::SPACE_3)
@@ -113,7 +113,7 @@ impl Surface {
         div()
             .bg(t.overlay)
             .text_color(t.text_default)
-            .rounded(scale::RADIUS_LG)
+            
             .border_1()
             .border_color(t.line)
             .shadow(super::shadow_md())

@@ -21,17 +21,22 @@
 //! charts' technique); text labels ride on top as positioned divs, because
 //! GPUI paths carry no text.
 //!
-//! Wires are stroked orthogonal polylines with rounded bends; a bus (width
-//! > 1) draws thicker and in the brand accent, with its slice annotation at
-//! the target pin.
+//! The linework draws in one ink, with a strict weight hierarchy: wire <
+//! outline < bus. Hue enters only mixed back toward the ink — a tint on
+//! the port flags, a cast on the buses — so the sheet reads as one
+//! drawing. Wires are stroked orthogonal polylines with rounded bends; a
+//! bus (width > 1) draws thicker, with its slice annotation at the target
+//! pin. A fanout net marks each branch point with a filled junction dot.
 //!
 //! The sheet is hoverable. A wire under the pointer repaints its whole net —
 //! the driver, every sink, and every branch — in the focus color, on top of
 //! everything else, so a route stays readable where wires overlap. A node
 //! under the pointer repaints with every wire on it, and a tooltip lists its
-//! inputs and outputs. The hit test runs in sheet space: the canvas records
-//! its painted origin (Rc<Cell>, the wg3d scrubber's technique) and the
-//! mouse listener subtracts it.
+//! inputs and outputs. While a hover is active, everything outside the lit
+//! net fades to a ghost — strokes, wires, and labels drop to a fraction of
+//! their alpha — so the net reads alone. The hit test runs in sheet space:
+//! the canvas records its painted origin (Rc<Cell>, the wg3d scrubber's
+//! technique) and the mouse listener subtracts it.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -49,12 +54,17 @@ use crate::kumo::scale;
 use crate::theme::Theme;
 
 const MARGIN: f32 = 24.0;
-const SLOT_W: f32 = 104.0;
-const CHAN_W: f32 = 80.0;
-const ROW_GAP: f32 = 24.0;
-const WIRE: f32 = 1.5;
-const BUS: f32 = 2.5;
-const BEND_R: f32 = 6.0;
+const SLOT_W: f32 = 96.0;
+const CHAN_W: f32 = 72.0;
+const ROW_GAP: f32 = 20.0;
+/// Stroke weights, in a strict hierarchy: wire < outline < bus. One weight
+/// for one role keeps the sheet reading as drafted linework.
+const WIRE: f32 = 1.0;
+const BUS: f32 = 2.0;
+const OUTLINE: f32 = 1.25;
+const BEND_R: f32 = 4.0;
+/// The junction dot radius, where a fanout net branches.
+const JUNCTION_R: f32 = 2.25;
 /// A quarter arc's Bézier control offset, as a fraction of the radius.
 const KAPPA: f32 = 0.552_284_8;
 /// sin(60°) = √3/2. An OR shield is this much longer than it is tall.
@@ -121,18 +131,18 @@ fn glyph_size(g: Glyph) -> (f32, f32) {
     match g {
         // A gate's box spans pin to pin, not edge to edge of the silhouette:
         // it also holds the lead stubs, and the bubble of an inverting gate.
-        Glyph::And | Glyph::Or | Glyph::Xor => (60.0, 40.0),
-        Glyph::Xnor => (68.0, 40.0),
-        Glyph::Not => (52.0, 32.0),
-        Glyph::Mux => (40.0, 56.0),
-        Glyph::Arith => (42.0, 42.0),
-        Glyph::Cmp => (56.0, 40.0),
-        Glyph::Shift => (54.0, 34.0),
-        Glyph::Concat => (42.0, 52.0),
-        Glyph::Reg => (92.0, 52.0),
-        Glyph::InPort | Glyph::OutPort => (84.0, 30.0),
-        Glyph::Box_ => (84.0, 32.0),
-        Glyph::Const => (64.0, 20.0),
+        Glyph::And | Glyph::Or | Glyph::Xor => (56.0, 36.0),
+        Glyph::Xnor => (62.0, 36.0),
+        Glyph::Not => (48.0, 28.0),
+        Glyph::Mux => (36.0, 50.0),
+        Glyph::Arith => (38.0, 38.0),
+        Glyph::Cmp => (52.0, 36.0),
+        Glyph::Shift => (50.0, 30.0),
+        Glyph::Concat => (38.0, 46.0),
+        Glyph::Reg => (84.0, 46.0),
+        Glyph::InPort | Glyph::OutPort => (76.0, 24.0),
+        Glyph::Box_ => (76.0, 26.0),
+        Glyph::Const => (56.0, 18.0),
     }
 }
 
@@ -236,10 +246,23 @@ struct NodeBox {
     glyph: Glyph,
 }
 
+/// A linear blend of two colors. The sheet draws in one ink; hue enters
+/// only mixed back toward that ink, so meaning shows without shouting.
+fn mix(a: Rgba, b: Rgba, t: f32) -> Rgba {
+    Rgba {
+        r: a.r + (b.r - a.r) * t,
+        g: a.g + (b.g - a.g) * t,
+        b: a.b + (b.b - a.b) * t,
+        a: a.a + (b.a - a.a) * t,
+    }
+}
+
 /// One painted primitive, resolved before the canvas closure runs.
 enum Draw {
     /// A stroked polyline with rounded bends.
     Wire { pts: Vec<(f32, f32)>, width: f32, color: Rgba },
+    /// A filled junction dot, where a fanout net branches.
+    Dot { x: f32, y: f32, color: Rgba },
     /// A filled + outlined closed shape. `pins` holds the y of every input
     /// pin, so a gate can stub a lead out to each one.
     Shape {
@@ -537,7 +560,7 @@ fn paint_shape(
 
     if matches!(glyph, Glyph::Xor | Glyph::Xnor) {
         // The second back, one gap left of the shield's own.
-        let mut b = PathBuilder::stroke(px(1.5));
+        let mut b = PathBuilder::stroke(px(OUTLINE));
         b.move_to(p(bx, y + h, ox, oy));
         back_arc(&mut b, bx, y, h, ox, oy);
         if let Ok(path) = b.build() {
@@ -551,7 +574,7 @@ fn paint_shape(
         if let Ok(path) = f.build() {
             window.paint_path(path, fill);
         }
-        let mut b = PathBuilder::stroke(px(1.5));
+        let mut b = PathBuilder::stroke(px(OUTLINE));
         circle(&mut b, cx, mid, BUBBLE, ox, oy);
         if let Ok(path) = b.build() {
             window.paint_path(path, stroke);
@@ -585,7 +608,7 @@ fn paint_shape(
     if glyph == Glyph::Reg {
         // Clock-edge notch on the lower left edge.
         let ny = y + h - 12.0;
-        let mut b = PathBuilder::stroke(px(1.5));
+        let mut b = PathBuilder::stroke(px(OUTLINE));
         b.move_to(p(x, ny - 5.0, ox, oy));
         b.line_to(p(x + 8.0, ny, ox, oy));
         b.line_to(p(x, ny + 5.0, ox, oy));
@@ -599,7 +622,7 @@ fn paint_shape(
 /// construction, so the outline replays the same geometry into a stroke
 /// builder.
 fn stroked(glyph: Glyph, x: f32, y: f32, w: f32, h: f32, ox: f32, oy: f32) -> PathBuilder {
-    let mut b = PathBuilder::stroke(px(1.5));
+    let mut b = PathBuilder::stroke(px(OUTLINE));
     replay_shape(&mut b, glyph, x, y, w, h, ox, oy);
     b
 }
@@ -697,7 +720,7 @@ fn mode_eyebrow(
             .px(px(5.))
             .flex()
             .items_center()
-            .rounded(px(3.))
+            
             .cursor_pointer()
             .text_color(if active { t.text_default } else { t.text_subtle })
             .child(label);
@@ -722,7 +745,7 @@ fn mode_eyebrow(
         .flex()
         .items_center()
         .gap(px(6.))
-        .rounded(px(4.))
+        
         .bg(t.elevated)
         .border_1()
         .border_color(t.hairline)
@@ -809,11 +832,66 @@ pub fn render(
         *pin = (*pin).max(e.to_pin + 1);
     }
 
+    // ── Hover, resolved first: the base pass needs to know what stays lit ──
+    let hover = app
+        .hw
+        .as_ref()
+        .and_then(|h| h.schematic_hover)
+        .filter(|h| match h {
+            SchematicHover::Node(id) => *id < nl.nodes.len(),
+            SchematicHover::Edge(ei) => *ei < nl.edges.len(),
+        });
+    // The lit set: the hovered element plus everything on its net. While a
+    // hover is active, everything outside the set fades, so the net reads
+    // alone against a ghost of the sheet.
+    let mut lit_nodes = vec![false; nl.nodes.len()];
+    let mut lit_edges = vec![false; nl.edges.len()];
+    match hover {
+        Some(SchematicHover::Edge(ei)) => {
+            let driver = nl.edges[ei].from;
+            lit_nodes[driver] = true;
+            for (i, e) in nl.edges.iter().enumerate() {
+                if e.from == driver {
+                    lit_edges[i] = true;
+                    lit_nodes[e.to] = true;
+                }
+            }
+        }
+        Some(SchematicHover::Node(id)) => {
+            lit_nodes[id] = true;
+            for (i, e) in nl.edges.iter().enumerate() {
+                if e.from == id || e.to == id {
+                    lit_edges[i] = true;
+                    lit_nodes[e.from] = true;
+                    lit_nodes[e.to] = true;
+                }
+            }
+        }
+        None => {}
+    }
+    let fade_rest = hover.is_some();
+    let dim = |mut c: Rgba| {
+        c.a *= 0.22;
+        c
+    };
+
     // ── Resolve every primitive up front ──
     let mut draws: Vec<Draw> = Vec::new();
     let mut labels: Vec<AnyElement> = Vec::new();
-    let wire_color = t.text_subtle;
-    let bus_color = t.brand;
+    // One drafting ink for all the linework. Hue enters only mixed back
+    // toward the ink — a tint on a port flag, a cast on a bus — so the
+    // sheet reads as one drawing, not as a legend.
+    let ink = {
+        let mut c = t.text_default;
+        c.a *= 0.80;
+        c
+    };
+    let wire_color = {
+        let mut c = t.text_subtle;
+        c.a *= 0.90;
+        c
+    };
+    let bus_color = mix(wire_color, t.brand, 0.45);
     let mut channel_use: HashMap<u32, f32> = HashMap::new();
     let mut feedback_lanes = 0usize;
     let mut max_wire_y = 0.0f32;
@@ -844,7 +922,7 @@ pub fn render(
         }
     };
 
-    for e in &nl.edges {
+    for (ei, e) in nl.edges.iter().enumerate() {
         let from = boxes[e.from];
         let to = boxes[e.to];
         let n_pins = pins.get(&e.to).copied().unwrap_or(1).max(1) as f32;
@@ -852,11 +930,15 @@ pub fn render(
         let ty = to.y + to.h * (e.to_pin as f32 + 1.0) / (n_pins + 1.0);
         let sx = from.x + from.w;
         let tx = to.x;
-        let (width, color) = if e.width > 1 {
+        let faded = fade_rest && !lit_edges[ei];
+        let (width, mut color) = if e.width > 1 {
             (BUS, bus_color)
         } else {
             (WIRE, wire_color)
         };
+        if faded {
+            color = dim(color);
+        }
         if sx <= tx {
             // Forward: across the channel, staggered per channel.
             let col = nl.nodes[e.to].layer;
@@ -899,58 +981,107 @@ pub fn render(
         // Slice annotation: a chip ON the wire, haloed by the panel surface
         // so the stroke never runs through the text.
         if let Some(note) = e.label.clone() {
+            let note_ink = if faded { dim(t.text_subtle) } else { t.text_subtle };
             labels.push(
                 div()
                     .absolute()
                     .left(px((tx - CHAN_W * 0.72).max(2.0)))
-                    .top(px(ty - 8.0))
-                    .h(px(16.0))
+                    .top(px(ty - 7.5))
+                    .h(px(15.0))
                     .px(px(4.0))
                     .flex()
                     .items_center()
-                    .rounded(px(3.0))
+                    
                     .bg(t.elevated)
+                    .border_1()
+                    .border_color(t.hairline)
                     .text_size(px(9.0))
                     .font_family(crate::fonts::mono_family())
-                    .text_color(t.text_subtle)
+                    .text_color(note_ink)
                     .child(note)
                     .into_any_element(),
             );
         }
     }
 
+    // Junction dots: where a fanout net branches off its shared run, a
+    // filled dot marks the T, the way a drafted schematic does.
+    let mut fanout: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (i, e) in nl.edges.iter().enumerate() {
+        fanout.entry(e.from).or_default().push(i);
+    }
+    let mut junctions: Vec<(f32, f32, usize, Rgba)> = Vec::new();
+    for (&drv, eis) in &fanout {
+        if eis.len() < 2 {
+            continue;
+        }
+        let jy = boxes[drv].y + boxes[drv].h / 2.0;
+        let net_color = if nl.edges[eis[0]].width > 1 { bus_color } else { wire_color };
+        // Each forward branch turns at its first bend; every bend short of
+        // the furthest one sits on another branch's run.
+        let mut bends: Vec<f32> = eis
+            .iter()
+            .filter(|&&i| wire_pts[i].len() == 4)
+            .map(|&i| wire_pts[i][1].0)
+            .collect();
+        bends.sort_by(f32::total_cmp);
+        bends.pop();
+        for jx in bends {
+            junctions.push((jx, jy, drv, net_color));
+        }
+    }
+    for &(x, y, drv, c) in &junctions {
+        let color = if fade_rest && !lit_nodes[drv] { dim(c) } else { c };
+        draws.push(Draw::Dot { x, y, color });
+    }
+
     for n in &nl.nodes {
         let b = boxes[n.id];
-        let (stroke, ink) = match n.kind {
-            NodeKind::Input => (t.success, t.success),
-            NodeKind::Output => (t.brand, t.brand),
-            NodeKind::Reg => (t.warning, t.text_default),
+        let faded = fade_rest && !lit_nodes[n.id];
+        let (mut stroke, mut label_ink) = match n.kind {
+            NodeKind::Input => (mix(ink, t.success, 0.40), t.text_default),
+            NodeKind::Output => (mix(ink, t.brand, 0.40), t.text_default),
             NodeKind::Const => (t.hairline, t.text_subtle),
-            _ => (t.text_subtle, t.text_default),
+            _ => (ink, t.text_default),
         };
+        // A faded node keeps its opaque fill (it still covers the grid) but
+        // its stroke and its text drop to a ghost.
+        let subtle_ink = if faded { dim(t.text_subtle) } else { t.text_subtle };
+        if faded {
+            stroke = dim(stroke);
+            label_ink = dim(label_ink);
+        }
         draws.push(shape_for(n.id, stroke, t.elevated));
 
         // ── Text overlay per glyph ──
         let mono = crate::fonts::mono_family();
         match b.glyph {
             Glyph::InPort | Glyph::OutPort | Glyph::Box_ => {
-                let tag = if n.width > 1 { format!("  {}b", n.width) } else { String::new() };
-                labels.push(
-                    div()
-                        .absolute()
-                        .left(px(b.x))
-                        .top(px(b.y))
-                        .w(px(b.w))
-                        .h(px(b.h))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_size(px(11.0))
-                        .font_family(mono.clone())
-                        .text_color(ink)
-                        .child(format!("{}{}", n.label, tag))
-                        .into_any_element(),
-                );
+                // The name carries the weight; the width tag steps back a
+                // size and a shade, like a dimension note.
+                let mut row = div()
+                    .absolute()
+                    .left(px(b.x))
+                    .top(px(b.y))
+                    .w(px(b.w))
+                    .h(px(b.h))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(4.0))
+                    .text_size(px(10.5))
+                    .font_family(mono.clone())
+                    .text_color(label_ink)
+                    .child(n.label.clone());
+                if n.width > 1 {
+                    row = row.child(
+                        div()
+                            .text_size(px(8.5))
+                            .text_color(subtle_ink)
+                            .child(format!("{}b", n.width)),
+                    );
+                }
+                labels.push(row.into_any_element());
             }
             Glyph::Reg => {
                 labels.push(
@@ -962,14 +1093,14 @@ pub fn render(
                         .flex()
                         .flex_col()
                         .items_center()
-                        .text_size(px(11.0))
+                        .text_size(px(10.5))
                         .font_family(mono.clone())
-                        .text_color(ink)
+                        .text_color(label_ink)
                         .child(n.label.clone())
                         .child(
                             div()
                                 .text_size(px(8.5))
-                                .text_color(t.warning)
+                                .text_color(subtle_ink)
                                 .child(format!(
                                     "{}b · {}",
                                     n.width,
@@ -992,15 +1123,17 @@ pub fn render(
                         .justify_end()
                         .child(
                             div()
-                                .h(px(16.0))
+                                .h(px(15.0))
                                 .px(px(4.0))
                                 .flex()
                                 .items_center()
-                                .rounded(px(3.0))
+                                
                                 .bg(t.elevated)
-                                .text_size(px(10.0))
+                                .border_1()
+                                .border_color(t.hairline)
+                                .text_size(px(9.5))
                                 .font_family(mono.clone())
-                                .text_color(t.text_subtle)
+                                .text_color(subtle_ink)
                                 .child(n.label.clone()),
                         )
                         .into_any_element(),
@@ -1017,9 +1150,9 @@ pub fn render(
                         .flex()
                         .items_center()
                         .justify_center()
-                        .text_size(px(13.0))
+                        .text_size(px(12.0))
                         .font_family(mono.clone())
-                        .text_color(ink)
+                        .text_color(label_ink)
                         .child(n.label.clone())
                         .into_any_element(),
                 );
@@ -1036,7 +1169,7 @@ pub fn render(
                             .top(px(py2 - 7.0))
                             .text_size(px(9.0))
                             .font_family(mono.clone())
-                            .text_color(t.text_subtle)
+                            .text_color(subtle_ink)
                             .child(mark.to_string())
                             .into_any_element(),
                     );
@@ -1056,7 +1189,7 @@ pub fn render(
                             .justify_center()
                             .text_size(px(10.0))
                             .font_family(mono.clone())
-                            .text_color(ink)
+                            .text_color(label_ink)
                             .child("{}")
                             .into_any_element(),
                     );
@@ -1066,17 +1199,10 @@ pub fn render(
     }
 
     // ── Hover: repaint the pointed-at net or node on top, in focus color ──
-    let hover = app
-        .hw
-        .as_ref()
-        .and_then(|h| h.schematic_hover)
-        .filter(|h| match h {
-            SchematicHover::Node(id) => *id < nl.nodes.len(),
-            SchematicHover::Edge(ei) => *ei < nl.edges.len(),
-        });
+    // The fade carries most of the emphasis, so the halo stays a whisper.
     let halo = {
         let mut c = t.focus;
-        c.a = 0.20;
+        c.a = 0.15;
         c
     };
     let wire_w = |ei: usize| if nl.edges[ei].width > 1 { BUS } else { WIRE };
@@ -1091,10 +1217,11 @@ pub fn render(
             .gap(px(2.0))
             .px(px(8.0))
             .py(px(6.0))
-            .rounded(px(4.0))
+            
             .bg(t.elevated)
             .border_1()
-            .border_color(t.focus)
+            .border_color(t.hairline)
+            .shadow(crate::kumo::shadow_md())
             .text_size(px(10.0))
             .font_family(mono.clone())
     };
@@ -1114,7 +1241,7 @@ pub fn render(
             for &i in &net {
                 draws.push(Draw::Wire {
                     pts: wire_pts[i].clone(),
-                    width: wire_w(i) + 5.0,
+                    width: wire_w(i) + 4.0,
                     color: halo,
                 });
             }
@@ -1124,6 +1251,11 @@ pub fn render(
                     width: wire_w(i) + 1.0,
                     color: t.focus,
                 });
+            }
+            for &(x, y, d, _) in &junctions {
+                if d == driver {
+                    draws.push(Draw::Dot { x, y, color: t.focus });
+                }
             }
             // The route chip, at the hovered wire's middle segment.
             let e = &nl.edges[ei];
@@ -1158,7 +1290,7 @@ pub fn render(
                 if e.from == id || e.to == id {
                     draws.push(Draw::Wire {
                         pts: wire_pts[i].clone(),
-                        width: wire_w(i) + 5.0,
+                        width: wire_w(i) + 4.0,
                         color: halo,
                     });
                 }
@@ -1170,6 +1302,11 @@ pub fn render(
                         width: wire_w(i) + 1.0,
                         color: t.focus,
                     });
+                }
+            }
+            for &(x, y, d, _) in &junctions {
+                if d == id {
+                    draws.push(Draw::Dot { x, y, color: t.focus });
                 }
             }
             draws.push(shape_for(id, t.focus, t.elevated));
@@ -1264,7 +1401,7 @@ pub fn render(
     // ── One canvas paints the grid paper, every wire, and every silhouette ──
     let grid_color = {
         let mut c = t.text_subtle;
-        c.a = 0.13;
+        c.a = if fade_rest { 0.04 } else { 0.08 };
         c
     };
     let (grid_w, grid_h) = (sheet_w, sheet_h);
@@ -1290,7 +1427,7 @@ pub fn render(
                     window.paint_quad(gpui::fill(
                         gpui::Bounds {
                             origin: point(px(gx + ox), px(gy + oy)),
-                            size: gpui::size(px(1.5), px(1.5)),
+                            size: gpui::size(px(1.25), px(1.25)),
                         },
                         grid_color,
                     ));
@@ -1302,6 +1439,13 @@ pub fn render(
                 match d {
                     Draw::Wire { pts, width, color } => {
                         paint_wire(window, pts, ox, oy, *width, *color)
+                    }
+                    Draw::Dot { x, y, color } => {
+                        let mut f = PathBuilder::fill();
+                        circle(&mut f, *x, *y, JUNCTION_R, ox, oy);
+                        if let Ok(path) = f.build() {
+                            window.paint_path(path, *color);
+                        }
                     }
                     Draw::Shape { glyph, x, y, w, h, pins, stroke, fill } => {
                         paint_shape(window, *glyph, *x, *y, *w, *h, pins, ox, oy, *stroke, *fill)

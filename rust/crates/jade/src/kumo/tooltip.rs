@@ -18,7 +18,7 @@ pub fn tooltip_panel(text: impl Into<SharedString>, t: &KumoTokens) -> Div {
     div()
         .flex()
         .flex_col()
-        .rounded(scale::RADIUS_MD)
+        
         .bg(t.base)
         .px(scale::SPACE_2_5)
         .py(scale::SPACE_1_5)

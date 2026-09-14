@@ -100,8 +100,9 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> impl IntoElement {
 
 fn section_header(text: &str, theme: &Theme) -> impl IntoElement {
     div()
-        .text_color(rgb(theme.accent))
-        .text_xs()
+        .text_color(rgb(theme.muted))
+        .text_size(px(10.))
+        .font_weight(gpui::FontWeight::MEDIUM)
         .child(text.to_string())
 }
 
@@ -121,20 +122,25 @@ fn training_header(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> i
                 .flex_row()
                 .items_center()
                 .gap_1()
-                .text_color(rgb(theme.accent))
+                .text_color(rgb(theme.muted))
                 .text_xs()
-                .child(crate::assets::ui_icon("box", 13., theme.accent))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .child(crate::assets::ui_icon("box", 13., theme.muted))
                 .child("TRAINING"),
         )
         .child(
             div()
                 .id("wg3d-open")
+                .h(px(20.))
                 .px_2()
-                .py_1()
-                .rounded_md()
+                .flex()
+                .items_center()
                 .text_xs()
-                .bg(rgb(theme.bg))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .border_1()
+                .border_color(theme.kumo.line)
                 .text_color(rgb(if has_buffers { theme.accent } else { theme.muted }))
+                .hover(|s| s.bg(theme.kumo.tint))
                 .cursor_pointer()
                 .on_click(cx.listener(|app, _e, _w, cx| {
                     app.wg3d.open(None);
@@ -147,7 +153,8 @@ fn training_header(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> i
 fn section_label(text: &str, theme: &Theme) -> impl IntoElement {
     div()
         .text_color(rgb(theme.muted))
-        .text_xs()
+        .text_size(px(10.))
+        .font_weight(gpui::FontWeight::MEDIUM)
         .child(text.to_string())
 }
 
@@ -237,7 +244,7 @@ fn runs_section(
             .items_center()
             .gap_1()
             .px_1()
-            .rounded_sm()
+            
             .text_xs()
             .cursor_pointer()
             .hover(|s| s.bg(rgb(theme.bg)))
@@ -267,7 +274,7 @@ fn runs_section(
                 div()
                     .id(("run-del", id as u64))
                     .px_1()
-                    .rounded_sm()
+                    
                     .text_color(rgb(theme.muted))
                     .hover(|s| s.text_color(rgb(theme.red)))
                     .on_click(cx.listener(move |app, _e, _w, cx| {
@@ -337,12 +344,27 @@ fn chart_section(
     grid: Rgba,
     cx: &mut Context<JadeApp>,
 ) -> impl IntoElement {
-    div()
+    let col = div()
         .flex()
         .flex_col()
         .gap_1()
-        .child(section_label_row(title, section, theme, cx))
-        .child(chart_box(theme, series, labels, grid, CHART_H))
+        .child(section_label_row(title, section, theme, cx));
+    // Nothing to plot: one quiet line instead of a 120px empty box, so an
+    // app that emits no scalars does not fill the sidebar with blank charts.
+    if series.is_empty() {
+        let note = match section {
+            MetricSection::Loss => "no scalars yet",
+            MetricSection::Memory => "no memory samples yet",
+            _ => "nothing to plot yet",
+        };
+        return col.child(
+            div()
+                .text_size(px(10.))
+                .text_color(rgb(theme.muted))
+                .child(note),
+        );
+    }
+    col.child(chart_box(theme, series, labels, grid, CHART_H))
 }
 
 /// One chart body (no section label): the canvas in a rounded box with the
@@ -357,12 +379,16 @@ fn chart_box_sized(
     height: Option<f32>,
 ) -> impl IntoElement {
     let label_px = if height.is_some() { 10. } else { 13. };
+    // The readouts sit top-right, where a falling loss curve leaves room;
+    // top-left is where every curve starts.
     let mut overlay = div()
         .absolute()
         .top(px(2.))
-        .left(px(4.))
+        .right(px(4.))
         .flex()
-        .flex_col();
+        .flex_col()
+        .items_end()
+        .font_family(crate::fonts::mono_family());
     for l in labels {
         overlay = overlay.child(
             div()
@@ -372,7 +398,7 @@ fn chart_box_sized(
         );
     }
 
-    let mut card = div().relative().w_full().rounded_md().bg(rgb(theme.bg));
+    let mut card = div().relative().w_full().bg(rgb(theme.bg));
     card = match height {
         Some(h) => card.h(px(h)),
         None => card.flex_1().min_h(px(80.)),
@@ -652,7 +678,7 @@ pub(crate) fn memory_data(app: &JadeApp) -> (Vec<Series>, Vec<Label>) {
         (
             cur,
             cs.max(1.0),
-            format!("{}: {}", name, format_bytes(last)),
+            format!("{}: {}", name, memory_scalar_label(name, last)),
         )
     } else {
         let cur: Vec<f32> = app
@@ -739,6 +765,18 @@ pub(crate) fn memory_data(app: &JadeApp) -> (Vec<Series>, Vec<Label>) {
         color: accent,
     });
     (series, labels)
+}
+
+/// The readout for a memory-named scalar. A name that carries its own unit
+/// (`memory_mb`, `heap_gb`) is printed in that unit; a bare name is bytes.
+pub(crate) fn memory_scalar_label(name: &str, value: f64) -> String {
+    let lower = name.to_lowercase();
+    for (suffix, unit) in [("_kb", "KB"), ("_mb", "MB"), ("_gb", "GB")] {
+        if lower.ends_with(suffix) {
+            return format!("{}{unit}", fmt_val(value));
+        }
+    }
+    format_bytes(value)
 }
 
 /// One kernel mini-chart's prepared data (shared with the pop-out window).
@@ -899,13 +937,13 @@ fn timing_breakdown(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> 
                     div()
                         .w(px(TRACK_W))
                         .h(px(6.))
-                        .rounded_sm()
+                        
                         .bg(rgb(theme.panel))
                         .child(
                             div()
                                 .h_full()
                                 .w(px(TRACK_W * row.frac))
-                                .rounded_sm()
+                                
                                 .bg(rgb(theme.accent)),
                         ),
                 )
@@ -1032,7 +1070,7 @@ fn tensor_previews(
                     div()
                         .w_full()
                         .h(px(box_h))
-                        .rounded_md()
+                        
                         .bg(rgb(theme.bg))
                         .overflow_hidden()
                         .child(
@@ -1130,25 +1168,10 @@ pub fn build_preview_image(frame: &crate::training::TensorFrame) -> PreviewImage
     }
 }
 
+/// The preview shares the 3D grid's colormap, so a cell reads the same
+/// color in the sidebar and in the overlay.
 fn diverging(value: f32, max_abs: f32) -> Rgba {
-    let t = if max_abs > 0.0 {
-        (value / max_abs).clamp(-1.0, 1.0)
-    } else {
-        0.0
-    };
-    if t >= 0.0 {
-        Rgba {
-            r: 1.0,
-            g: 1.0 - t,
-            b: 1.0 - t,
-            a: 1.0,
-        }
-    } else {
-        Rgba {
-            r: 1.0 + t,
-            g: 1.0 + t,
-            b: 1.0,
-            a: 1.0,
-        }
-    }
+    let inv = if max_abs > 0.0 { 1.0 / max_abs } else { 0.0 };
+    let [r, g, b] = crate::wg3d::grid::diverging(value, inv);
+    Rgba { r, g, b, a: 1.0 }
 }

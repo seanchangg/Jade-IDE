@@ -33,9 +33,10 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> impl IntoElement {
                 .flex_row()
                 .items_center()
                 .gap_1()
-                .text_color(rgb(theme.accent))
+                .text_color(rgb(theme.muted))
                 .text_xs()
-                .child(crate::assets::ui_icon("activity", 13., theme.accent))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .child(crate::assets::ui_icon("activity", 13., theme.muted))
                 .child("TELEMETRY"),
         );
 
@@ -96,7 +97,8 @@ fn section(
         .child(
             div()
                 .text_color(rgb(theme.muted))
-                .text_size(px(9.))
+                .text_size(px(10.))
+                .font_weight(gpui::FontWeight::MEDIUM)
                 .child(title.to_string()),
         )
         .child(body)
@@ -117,7 +119,7 @@ fn row(
     let mut checkbox = div()
         .w(px(12.))
         .h(px(12.))
-        .rounded_sm()
+        
         .border_1()
         .border_color(rgb(theme.accent));
     if enabled {
@@ -141,7 +143,10 @@ fn row(
         .child(
             div()
                 .flex_1()
+                .min_w(px(0.))
                 .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
                 // Seeded = remembered from a previous session, not yet
                 // declared by the probe this session — dimmed until confirmed.
                 .text_color(rgb(if item.seeded { theme.muted } else { theme.text }))
@@ -272,7 +277,7 @@ fn dim_field(
         )))
         .px_1()
         .min_w(px(14.))
-        .rounded_sm()
+        
         .cursor_pointer()
         .text_color(rgb(if is_placeholder { theme.muted } else { theme.text }))
         .on_click(cx.listener(move |app: &mut JadeApp, _e, _w, cx| {

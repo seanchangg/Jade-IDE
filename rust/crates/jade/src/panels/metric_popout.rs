@@ -145,13 +145,13 @@ impl Render for MetricPopout {
                                     div()
                                         .flex_1()
                                         .h(px(10.))
-                                        .rounded_sm()
+                                        
                                         .bg(rgb(theme.panel))
                                         .child(
                                             div()
                                                 .h_full()
                                                 .w(relative(row.frac))
-                                                .rounded_sm()
+                                                
                                                 .bg(rgb(theme.accent)),
                                         ),
                                 )
@@ -205,7 +205,7 @@ impl Render for MetricPopout {
                                     div()
                                         .w(px(w))
                                         .h(px(h))
-                                        .rounded_md()
+                                        
                                         .overflow_hidden()
                                         .child(
                                             gpui::img(p.image)

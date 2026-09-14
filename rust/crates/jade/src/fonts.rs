@@ -25,6 +25,17 @@ const PREFERRED_MONO: &str = "JetBrains Mono";
 /// Set by [`register_bundled_fonts`] when JetBrains Mono TTFs were loaded.
 static JETBRAINS_REGISTERED: AtomicBool = AtomicBool::new(false);
 
+/// The chrome family: labels, buttons, tabs, and panel text. GPUI resolves
+/// the special name to the platform UI font (SF Pro on macOS), which is what
+/// the Electron shell used through `-apple-system`.
+pub const UI_FAMILY: &str = ".SystemUIFont";
+
+/// The family every chrome surface renders in. Code, terminals, and numbers
+/// opt back into [`mono_family`].
+pub fn ui_family() -> &'static str {
+    UI_FAMILY
+}
+
 /// The monospace family name every `.font_family(..)` code/terminal call site
 /// resolves through. Returns "JetBrains Mono" once the bundled TTFs are
 /// registered, otherwise "Menlo".

@@ -90,11 +90,6 @@ impl TabItem {
                         scale::SPACE_2
                     } else {
                         scale::SPACE_2_5
-                    })
-                    .rounded(if is_sm {
-                        scale::RADIUS_SM
-                    } else {
-                        scale::RADIUS_MD
                     });
                 if self.selected {
                     // The sliding indicator: `bg-kumo-base shadow-sm ring
@@ -122,7 +117,7 @@ impl TabItem {
                     } else {
                         scale::SPACE_3
                     })
-                    .rounded(scale::RADIUS_SM);
+                    ;
                 if self.selected {
                     e.font_weight(gpui::FontWeight::MEDIUM).child(
                         // `absolute bottom-0 h-0.5 bg-kumo-brand`
@@ -190,7 +185,6 @@ impl TabBar {
     }
 
     pub fn render(self, t: &KumoTokens) -> Div {
-        let is_sm = matches!(self.size, Size::Xs | Size::Sm);
         let mut el = div().flex().flex_row();
 
         el = match self.appearance {
@@ -208,11 +202,6 @@ impl TabBar {
                 .gap(px(2.))
                 .h(self.size.tab_bar_height())
                 .px(px(2.))
-                .rounded(if is_sm {
-                    scale::RADIUS_MD
-                } else {
-                    scale::RADIUS_LG
-                })
                 .bg(t.recessed),
             // `isUnderline` — the bar itself is flat; only the hairline under
             // the whole list separates it from the content. This one scrolls,

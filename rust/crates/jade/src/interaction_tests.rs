@@ -810,10 +810,11 @@ fn test_deps_driven(
     (deps, app_rx)
 }
 
-/// Pre-run tracking panel, headless: Run opens the panel (not the program),
-/// an empty registry triggers a discovery run that auto-finishes, and
-/// confirming launches the real run. Uses `/bin/sleep` (exits instantly with
-/// a usage error) as the "program" so no build is needed.
+/// Pre-run tracking panel, headless: "Run with tracking…" opens the panel
+/// (not the program), an empty registry triggers a discovery run that
+/// auto-finishes, and confirming launches the real run. The plain Run button
+/// launches at once with no panel. Uses `/bin/sleep` (exits instantly with a
+/// usage error) as the "program" so no build is needed.
 #[test]
 fn pre_run_panel_discovers_then_launches() {
     use crate::app::{AppEvent, PreRunLaunch};
@@ -837,8 +838,10 @@ fn pre_run_panel_discovers_then_launches() {
         assert!(done(app), "drain timed out");
     };
 
-    // Without a build, Run prompts instead of opening the panel.
+    // Without a build, neither Run entry does anything.
     app.action_run();
+    assert!(!app.running, "no build → no run");
+    app.action_run_tracked();
     assert!(app.pre_run.is_none(), "no build → no panel");
 
     // Fake a successful build of a real (instant-exit) binary.
@@ -850,8 +853,16 @@ fn pre_run_panel_discovers_then_launches() {
         project_root: Some(dir.clone()),
     });
 
-    // Run now opens the panel; the empty registry starts a discovery run.
+    // The plain Run button launches now, with no panel and no scan.
     app.action_run();
+    assert!(app.pre_run.is_none(), "direct Run opens no panel");
+    assert!(!app.discovery_active, "direct Run starts no scan");
+    assert!(app.running, "direct Run launched");
+    drain(&mut app, &mut rx, &|a| !a.running);
+
+    // "Run with tracking…" opens the panel; the empty registry starts a
+    // discovery run.
+    app.action_run_tracked();
     assert!(app.pre_run.is_some(), "panel open");
     assert!(app.discovery_active, "discovery started (registry empty)");
     assert!(!app.running, "discovery is not a real run");
@@ -870,7 +881,7 @@ fn pre_run_panel_discovers_then_launches() {
     assert!(app.stored_runs.is_empty(), "no telemetry → still nothing stored");
 
     // Cancel path: reopen and Esc out without launching.
-    app.action_run();
+    app.action_run_tracked();
     assert!(app.pre_run.is_some());
     app.cancel_pre_run();
     assert!(app.pre_run.is_none());
@@ -1197,6 +1208,26 @@ fn ai_menu_toggle_and_model_selection() {
 
     app.close_ai_menu();
     assert!(!app.ai_menu_open, "outside click / choice closes the menu");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The Run split button's chevron opens the run menu; Esc, an outside click,
+/// or a choice closes it.
+#[test]
+fn run_menu_toggles_and_closes() {
+    let (dir, _file) = test_workspace();
+    let (deps, _rx) = test_deps(dir.clone());
+    let mut app = JadeApp::assemble(deps);
+
+    assert!(!app.run_menu_open, "menu starts closed");
+    app.toggle_run_menu();
+    assert!(app.run_menu_open, "chevron opens the menu");
+    app.toggle_run_menu();
+    assert!(!app.run_menu_open, "chevron again closes it");
+
+    app.toggle_run_menu();
+    app.close_run_menu();
+    assert!(!app.run_menu_open, "Esc / backdrop / a choice closes the menu");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3449,10 +3480,10 @@ async fn welcome_keys_choose_mode_without_scanning_a_tree(cx: &mut TestAppContex
     });
 }
 
-/// Hardware mode swaps the runtime sidebar for the board panel and drops the
+/// Hardware mode swaps the runtime sidebar for the wave panel and drops the
 /// C++ build/run/debug cluster from the action bar.
 #[gpui::test]
-async fn hardware_mode_swaps_board_for_runtime_sidebar(cx: &mut TestAppContext) {
+async fn hardware_mode_swaps_wave_panel_for_runtime_sidebar(cx: &mut TestAppContext) {
     let (dir, file) = test_hw_workspace();
     let (deps, app_rx, _hw_rx) = test_deps_hw(dir);
     let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
@@ -3462,82 +3493,13 @@ async fn hardware_mode_swaps_board_for_runtime_sidebar(cx: &mut TestAppContext) 
     });
     cx.run_until_parked();
 
-    assert!(cx.debug_bounds("board-panel").is_some(), "board panel must render");
-    assert!(cx.debug_bounds("hw-run").is_some(), "board Run/Pause must render");
+    assert!(cx.debug_bounds("wave-panel").is_some(), "wave panel must render");
+    assert!(cx.debug_bounds("wave-run-tb").is_some(), "Run testbench must render");
+    assert!(cx.debug_bounds("hw-run").is_some(), "the sim Run/Pause must render");
     assert!(cx.debug_bounds("runtime-sidebar").is_none(), "no runtime sidebar");
     assert!(cx.debug_bounds("btn-build").is_none(), "no Build button");
     assert!(cx.debug_bounds("btn-run").is_none(), "no Run button");
     assert!(cx.debug_bounds("btn-debug").is_none(), "no Debug button");
-}
-
-/// A pointer press on PB0 holds the board button down; release lets it up.
-/// Both transitions reach the engine channel as SetPb commands.
-#[gpui::test]
-async fn board_button_press_and_release(cx: &mut TestAppContext) {
-    use gpui::MouseButton;
-    use jade_hw::HwCommand;
-
-    let (dir, file) = test_hw_workspace();
-    let (deps, app_rx, mut hw_rx) = test_deps_hw(dir);
-    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
-    app.update_in(cx, |app, _w, cx| {
-        app.open_file(file.clone());
-        cx.notify();
-    });
-    cx.run_until_parked();
-    while hw_rx.try_recv().is_ok() {} // drop any startup replay commands
-
-    let pb = cx.debug_bounds("pb-0").expect("PB0 painted");
-    cx.simulate_mouse_down(pb.center(), MouseButton::Left, Modifiers::default());
-    app.update_in(cx, |app, _w, _cx| {
-        assert!(app.hw.as_ref().unwrap().pb[0], "PB0 held after mouse down");
-    });
-    cx.simulate_mouse_up(pb.center(), MouseButton::Left, Modifiers::default());
-    app.update_in(cx, |app, _w, _cx| {
-        assert!(!app.hw.as_ref().unwrap().pb[0], "PB0 released after mouse up");
-    });
-
-    let mut cmds = Vec::new();
-    while let Ok(c) = hw_rx.try_recv() {
-        cmds.push(c);
-    }
-    assert_eq!(
-        cmds,
-        vec![HwCommand::SetPb(0, true), HwCommand::SetPb(0, false)],
-        "both transitions reach the engine"
-    );
-}
-
-/// A click toggles DIP2; the position survives a hot swap (CompileDone).
-#[gpui::test]
-async fn dip_click_toggles_and_survives_hot_swap(cx: &mut TestAppContext) {
-    use crate::app::AppEvent;
-    use jade_hw::{HwCommand, HwEvent};
-
-    let (dir, file) = test_hw_workspace();
-    let (deps, app_rx, mut hw_rx) = test_deps_hw(dir);
-    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
-    app.update_in(cx, |app, _w, cx| {
-        app.open_file(file.clone());
-        cx.notify();
-    });
-    cx.run_until_parked();
-    while hw_rx.try_recv().is_ok() {}
-
-    let dip = cx.debug_bounds("dip-2").expect("DIP2 painted");
-    cx.simulate_click(dip.center(), Modifiers::default());
-    app.update_in(cx, |app, _w, _cx| {
-        assert!(app.hw.as_ref().unwrap().dip[2], "DIP2 is ON after the click");
-    });
-    assert_eq!(hw_rx.try_recv(), Ok(HwCommand::SetDip(2, true)));
-
-    // A hot swap must keep the DIP position (the session replays it into the
-    // fresh sim; the UI state is the source of truth).
-    app.update_in(cx, |app, _w, cx| {
-        app.apply_app_event(AppEvent::Hw(HwEvent::CompileDone { ok: true }));
-        assert!(app.hw.as_ref().unwrap().dip[2], "DIP2 survives the hot swap");
-        cx.notify();
-    });
 }
 
 /// LED frames update the render model's mask and per-LED duty.
@@ -3566,42 +3528,103 @@ async fn led_frame_updates_duty(cx: &mut TestAppContext) {
     });
 }
 
-/// Plain keys drive the board only while the board has focus; with the
-/// editor focused, `1` stays an ordinary keystroke.
+/// A loaded dump lists the testbench's signals as rows; a click on the
+/// canvas places the cursor, and the value column reads at it.
 #[gpui::test]
-async fn board_keys_only_when_board_focused(cx: &mut TestAppContext) {
-    use gpui::MouseButton;
+async fn wave_panel_lists_rows_and_a_click_sets_the_cursor(cx: &mut TestAppContext) {
+    use crate::app::AppEvent;
+    use crate::wave::WaveEvent;
+    use std::sync::Arc;
 
     let (dir, file) = test_hw_workspace();
+    let vcd = dir.join("t.vcd");
+    std::fs::write(
+        &vcd,
+        "$timescale 1ns $end\n$scope module tb $end\n$var wire 1 ! clk $end\n$var wire 4 \" cnt [3:0] $end\n$upscope $end\n$enddefinitions $end\n#0\n0!\nb0000 \"\n#10\n1!\nb0101 \"\n#20\n0!\n",
+    )
+    .unwrap();
     let (deps, app_rx, _hw_rx) = test_deps_hw(dir);
     let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
     app.update_in(cx, |app, _w, cx| {
         app.open_file(file.clone());
+        let loaded = jade_hw::wave::WaveFile::load(&vcd).expect("vcd loads");
+        let generation = app.hw.as_ref().unwrap().wave.generation;
+        app.apply_app_event(AppEvent::Wave(WaveEvent::Loaded {
+            generation,
+            result: Ok(Arc::new(loaded)),
+        }));
         cx.notify();
     });
     cx.run_until_parked();
 
-    // Editor focused (open_file focuses it): `1` must NOT press PB0.
-    cx.simulate_keystrokes("1");
     app.update_in(cx, |app, _w, _cx| {
-        assert!(!app.hw.as_ref().unwrap().pb[0], "editor keystroke must not press PB0");
+        let wave = &app.hw.as_ref().unwrap().wave;
+        assert_eq!(wave.rows, vec![0, 1], "the testbench scope's signals are the rows");
+        assert!(wave.cursor.is_none());
+        assert_eq!(wave.read_time(), 20, "with no cursor the values read at the end");
     });
+    assert!(cx.debug_bounds("wave-row-0").is_some(), "clk row renders");
+    assert!(cx.debug_bounds("wave-row-1").is_some(), "cnt row renders");
 
-    // Click the board to focus it, then `1` presses PB0 (key down holds it).
-    let pcb = cx.debug_bounds("pb-0").expect("board painted");
-    cx.simulate_mouse_down(pcb.center(), MouseButton::Left, Modifiers::default());
-    cx.simulate_mouse_up(pcb.center(), MouseButton::Left, Modifiers::default());
+    let canvas = cx.debug_bounds("wave-canvas").expect("trace canvas painted");
+    cx.simulate_mouse_down(canvas.center(), gpui::MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_up(canvas.center(), gpui::MouseButton::Left, Modifiers::default());
     cx.run_until_parked();
-    cx.simulate_keystrokes("1");
     app.update_in(cx, |app, _w, _cx| {
-        assert!(app.hw.as_ref().unwrap().pb[0], "board keystroke presses PB0");
+        let wave = &app.hw.as_ref().unwrap().wave;
+        let c = wave.cursor.expect("a click places the cursor");
+        assert!(c <= 20, "the cursor stays inside the dump: {c}");
+        assert!(wave.drag.is_none(), "mouse up ends the pan");
+        // The row that reads `cnt` at the cursor shows the value in force.
+        let file = wave.file.as_ref().unwrap();
+        let cnt = file.signals[1].value_at(c).map(|v| v.label(4));
+        assert!(matches!(cnt.as_deref(), Some("0") | Some("5")), "cnt reads at the cursor: {cnt:?}");
     });
-    // The key-up releases it.
-    cx.simulate_event(gpui::KeyUpEvent {
-        keystroke: gpui::Keystroke::parse("1").unwrap(),
+}
+
+/// A re-run with a different signal set starts the rows from the new
+/// testbench scope, instead of keeping only the names both dumps share.
+#[gpui::test]
+async fn wave_rows_reset_when_the_signal_set_changes(cx: &mut TestAppContext) {
+    use crate::app::AppEvent;
+    use crate::wave::WaveEvent;
+    use std::sync::Arc;
+
+    let (dir, file) = test_hw_workspace();
+    let old = dir.join("old.vcd");
+    std::fs::write(
+        &old,
+        "$timescale 1ns $end\n$scope module tb $end\n$var wire 1 ! clk $end\n$var wire 4 \" top $end\n$upscope $end\n$enddefinitions $end\n#0\n0!\nb0 \"\n#10\n1!\n",
+    )
+    .unwrap();
+    let new = dir.join("new.vcd");
+    std::fs::write(
+        &new,
+        "$timescale 1ns $end\n$scope module tb $end\n$var wire 1 ! clk $end\n$var wire 4 \" a $end\n$var wire 4 # out $end\n$upscope $end\n$enddefinitions $end\n#0\n0!\nb0 \"\nb0 #\n#10\n1!\n",
+    )
+    .unwrap();
+    let (deps, app_rx, _hw_rx) = test_deps_hw(dir);
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(file.clone());
+        for path in [&old, &new] {
+            let loaded = jade_hw::wave::WaveFile::load(path).expect("vcd loads");
+            let generation = app.hw.as_ref().unwrap().wave.generation;
+            app.apply_app_event(AppEvent::Wave(WaveEvent::Loaded {
+                generation,
+                result: Ok(Arc::new(loaded)),
+            }));
+        }
+        cx.notify();
     });
     app.update_in(cx, |app, _w, _cx| {
-        assert!(!app.hw.as_ref().unwrap().pb[0], "key up releases PB0");
+        let wave = &app.hw.as_ref().unwrap().wave;
+        let names: Vec<String> = wave
+            .rows
+            .iter()
+            .map(|&i| wave.file.as_ref().unwrap().signals[i].name.clone())
+            .collect();
+        assert_eq!(names, vec!["clk", "a", "out"], "rows restart from the new testbench scope");
     });
 }
 
@@ -3967,9 +3990,9 @@ async fn markdown_preview_gates_on_the_active_tab(cx: &mut TestAppContext) {
 }
 
 /// The preview is universal: in hardware mode a Markdown tab replaces the
-/// board panel, and a Verilog tab brings the board back.
+/// wave panel, and a Verilog tab brings the wave panel back.
 #[gpui::test]
-async fn markdown_preview_replaces_the_board_in_hardware_mode(cx: &mut TestAppContext) {
+async fn markdown_preview_replaces_the_wave_panel_in_hardware_mode(cx: &mut TestAppContext) {
     let (dir, file) = test_hw_workspace();
     let md = dir.join("README.md");
     std::fs::write(&md, "# Board notes\n").unwrap();
@@ -3985,8 +4008,8 @@ async fn markdown_preview_replaces_the_board_in_hardware_mode(cx: &mut TestAppCo
         "preview renders in hardware mode"
     );
     assert!(
-        cx.debug_bounds("board-panel").is_none(),
-        "the preview takes the board's slot"
+        cx.debug_bounds("wave-panel").is_none(),
+        "the preview takes the wave panel's slot"
     );
 
     app.update_in(cx, |app, _w, cx| {
@@ -3996,7 +4019,116 @@ async fn markdown_preview_replaces_the_board_in_hardware_mode(cx: &mut TestAppCo
     cx.run_until_parked();
     assert!(cx.debug_bounds("markdown-panel").is_none());
     assert!(
-        cx.debug_bounds("board-panel").is_some(),
-        "the board returns on a Verilog tab"
+        cx.debug_bounds("wave-panel").is_some(),
+        "the wave panel returns on a Verilog tab"
     );
+}
+
+// ── Split panes (window management) ──────────────────────────────────────────
+
+/// Split, open a file in the new pane, move it back by drag, and close the
+/// pane: the layout and the live editor follow every step, and a file lives
+/// in one pane at most.
+#[test]
+fn split_panes_move_and_close() {
+    let (dir, main) = test_workspace();
+    let readme = dir.join("README.md");
+    std::fs::write(&readme, "# Title\n\ntext\n").unwrap();
+    let (deps, _rx) = test_deps(dir.clone());
+    let mut app = JadeApp::assemble(deps);
+    app.open_file(main.clone());
+    assert_eq!(app.pane_count(), 1);
+    assert!(!app.split_mode());
+
+    // ⌘\: a new empty pane to the right takes the keyboard.
+    app.split_pane();
+    assert_eq!(app.pane_count(), 2);
+    assert_eq!(app.focused_pane(), 1);
+    assert!(app.editor.tabs.is_empty());
+    assert_eq!(app.active_file, None);
+    assert_eq!(app.pane_active_tab(0).unwrap().path, main);
+
+    // The next open lands in the focused (right) pane; a Markdown tab there
+    // shows formatted by default, and the docked preview stays away.
+    app.open_file(readme.clone());
+    assert_eq!(app.editor.active_path(), Some(readme.clone()));
+    assert!(app.pane_shows_md(1));
+    assert!(!app.md_panel_active());
+    app.set_pane_md(1, false);
+    assert!(!app.pane_shows_md(1));
+
+    // An open of a file another pane holds focuses that pane, no second buffer.
+    app.open_file(main.clone());
+    assert_eq!(app.focused_pane(), 0);
+    assert_eq!(app.editor.active_path(), Some(main.clone()));
+    assert_eq!(app.pane_active_tab(1).unwrap().path, readme);
+
+    // Drag README from pane 1 onto pane 0's strip: pane 1 empties and closes.
+    app.move_tab(1, 0, 0, None);
+    assert_eq!(app.pane_count(), 1);
+    assert_eq!(app.editor.tabs.len(), 2);
+    assert_eq!(app.editor.active_path(), Some(readme.clone()));
+
+    // Drag main.cpp to the right edge: a new pane with it takes the keyboard.
+    app.split_with_tab(0, 0, 0);
+    assert_eq!(app.pane_count(), 2);
+    assert_eq!(app.focused_pane(), 1);
+    assert_eq!(app.editor.active_path(), Some(main.clone()));
+    assert_eq!(app.pane_active_tab(0).unwrap().path, readme);
+
+    // Persist + restore the two-pane layout in a fresh app.
+    app.save_ui_state();
+    let (deps2, _rx2) = test_deps(dir.clone());
+    let app2 = JadeApp::assemble(deps2);
+    assert_eq!(app2.pane_count(), 2);
+    assert_eq!(app2.focused_pane(), 1);
+    assert_eq!(app2.editor.active_path(), Some(main.clone()));
+    assert_eq!(app2.pane_active_tab(0).unwrap().path, readme);
+
+    // Close the focused pane: the neighbor takes the keyboard.
+    app.close_pane(1);
+    assert_eq!(app.pane_count(), 1);
+    assert_eq!(app.editor.active_path(), Some(readme));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Reorder inside one pane keeps the active tab the same tab.
+#[test]
+fn reorder_tabs_keeps_active() {
+    let (dir, main) = test_workspace();
+    let other = dir.join("util.cpp");
+    std::fs::write(&other, "int u();\n").unwrap();
+    let (deps, _rx) = test_deps(dir.clone());
+    let mut app = JadeApp::assemble(deps);
+    let _ = app.editor.open(&main);
+    let _ = app.editor.open(&other);
+    app.editor.switch(0);
+    app.move_tab(0, 0, 0, Some(2)); // main.cpp to the end
+    assert_eq!(app.editor.tabs[1].path, main);
+    assert_eq!(app.editor.active, Some(1));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A divider drag moves width share between two neighbors, stops at the
+/// minimum pane width, and a double-click equalizes.
+#[test]
+fn pane_divider_moves_share() {
+    let (dir, main) = test_workspace();
+    let (deps, _rx) = test_deps(dir.clone());
+    let mut app = JadeApp::assemble(deps);
+    app.open_file(main);
+    app.split_pane();
+    assert_eq!(app.pane_count(), 2);
+    // Row 1000px, shares 1:1 → 500px each. +100px on the divider → 600/400.
+    app.resize_panes(0, 100.0, 1.0, 1.0, 1000.0);
+    assert!((app.panes[0].weight - 1.2).abs() < 1e-4);
+    assert!((app.panes[1].weight - 0.8).abs() < 1e-4);
+    // The right pane cannot go under 160px: share 0.32 of 2.0.
+    app.resize_panes(0, 900.0, 1.0, 1.0, 1000.0);
+    assert!((app.panes[1].weight - 0.32).abs() < 1e-4);
+    assert!((app.panes[0].weight - 1.68).abs() < 1e-4);
+    app.equalize_panes();
+    assert_eq!(app.panes[0].weight, 1.0);
+    assert_eq!(app.panes[1].weight, 1.0);
+    let _ = std::fs::remove_dir_all(&dir);
 }

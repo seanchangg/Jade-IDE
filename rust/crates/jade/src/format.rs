@@ -8,8 +8,10 @@ pub fn format_bytes(bytes: f64) -> String {
         format!("{}B", bytes.round() as i64)
     } else if bytes < 1024.0 * 1024.0 {
         format!("{:.1}KB", bytes / 1024.0)
-    } else {
+    } else if bytes < 1024.0 * 1024.0 * 1024.0 {
         format!("{:.1}MB", bytes / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2}GB", bytes / (1024.0 * 1024.0 * 1024.0))
     }
 }
 
@@ -121,6 +123,7 @@ mod tests {
         assert_eq!(format_bytes(512.0), "512B");
         assert_eq!(format_bytes(2048.0), "2.0KB");
         assert_eq!(format_bytes(5.0 * 1024.0 * 1024.0), "5.0MB");
+        assert_eq!(format_bytes(11.5 * 1024.0 * 1024.0 * 1024.0), "11.50GB");
     }
 
     #[test]

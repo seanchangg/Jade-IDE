@@ -31,7 +31,7 @@ use super::camera::{OrbitCamera, HEIGHT_SCALE};
 use super::grid::{fmt_axis, Bar, BarGrid};
 use super::math::{self, Mat4};
 
-const TOOLBAR_H: f32 = 38.0;
+const TOOLBAR_H: f32 = 34.0;
 
 /// Lazily create + return the overlay's focus handle (needed for Esc / key
 /// dispatch). Called from `JadeApp::render` before building the tree.
@@ -103,7 +103,7 @@ pub fn overlay(
         .h(px(vp_h))
         .flex()
         .flex_col()
-        .bg(rgb(0x111214)) // near-opaque backdrop (z-index 4000 overlay)
+        .bg(rgb(theme.bg)) // the editor canvas, so the overlay reads as a page of the app
         .track_focus(&focus)
         .on_key_down(cx.listener(|app, ev: &KeyDownEvent, _win, cx| {
             if ev.keystroke.key == "escape" {
@@ -120,20 +120,25 @@ pub fn overlay(
 // ── Toolbar ───────────────────────────────────────────────────────────────────
 
 fn toolbar(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> gpui::AnyElement {
+    // The overlay covers the title bar, so the toolbar clears the traffic
+    // lights the way the action bar does.
     let mut bar = div()
         .flex()
         .flex_row()
         .items_center()
         .gap_2()
         .h(px(TOOLBAR_H))
-        .px(px(10.))
-        .bg(rgb(theme.panel))
+        .pl(px(80.))
+        .pr(px(6.))
+        .bg(theme.kumo.elevated)
         .border_b_1()
-        .border_color(rgb(theme.border))
+        .border_color(theme.kumo.hairline)
+        .window_control_area(gpui::WindowControlArea::Drag)
         .child(
             div()
-                .text_color(rgb(theme.accent))
+                .text_color(rgb(theme.muted))
                 .text_xs()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
                 .child("3D WEIGHTS"),
         );
 
@@ -144,12 +149,15 @@ fn toolbar(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> gpui::Any
         bar = bar.child(
             div()
                 .id(SharedString::from(format!("wg3d-buf-{name}")))
+                .h(px(22.))
                 .px_2()
-                .py_1()
-                .rounded_md()
+                .flex()
+                .items_center()
                 .text_xs()
-                .bg(rgb(theme.bg))
-                .text_color(rgb(if selected { theme.accent } else { theme.muted }))
+                .font_family(crate::fonts::mono_family())
+                .bg(if selected { theme.kumo.tint } else { theme.kumo.elevated })
+                .text_color(rgb(if selected { theme.text } else { theme.muted }))
+                .hover(|s| s.bg(theme.kumo.tint))
                 .cursor_pointer()
                 .on_click(cx.listener(move |app, _e, _w, cx| {
                     app.wg3d.select_buffer(&n);
@@ -180,7 +188,7 @@ fn toolbar(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> gpui::Any
                 .id(SharedString::from(format!("wg3d-res-{dim}")))
                 .px_1()
                 .text_size(px(10.))
-                .rounded_sm()
+                
                 .text_color(rgb(if active { theme.accent } else { theme.muted }))
                 .cursor_pointer()
                 .on_click(cx.listener(move |app, _e, _w, cx| {
@@ -212,7 +220,7 @@ fn toolbar(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> gpui::Any
                 .id("wg3d-live")
                 .px_1()
                 .text_size(px(10.))
-                .rounded_sm()
+                
                 .text_color(rgb(if app.wg3d.is_live() {
                     theme.accent
                 } else {
@@ -239,17 +247,12 @@ fn toolbar(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> gpui::Any
                 .child(app.wg3d.readout()),
         )
         .child(
-            div()
-                .id("wg3d-close")
-                .px_2()
-                .rounded_md()
-                .text_color(rgb(theme.muted))
-                .cursor_pointer()
-                .on_click(cx.listener(|app, _e, _w, cx| {
+            crate::kumo::button::icon_button("wg3d-close", "x", false, &theme.kumo).on_click(
+                cx.listener(|app, _e, _w, cx| {
                     app.wg3d.close();
                     cx.notify();
-                }))
-                .child("×"),
+                }),
+            ),
         );
 
     bar.into_any_element()
@@ -342,7 +345,7 @@ fn dim_field_chip(
         )))
         .px_1()
         .min_w(px(14.))
-        .rounded_sm()
+        
         .cursor_pointer()
         .text_color(rgb(if is_placeholder { theme.muted } else { theme.text }))
         .on_click(cx.listener(move |app: &mut JadeApp, _e, _w, cx| {
@@ -446,7 +449,7 @@ fn scrub_track(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> gpui:
                 .relative()
                 .w(px(W))
                 .h(px(6.))
-                .rounded_sm()
+                
                 .bg(bg)
                 .child(
                     // Invisible full-size canvas records the track's
@@ -464,7 +467,7 @@ fn scrub_track(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> gpui:
                     div()
                         .h_full()
                         .w(px(W * frac))
-                        .rounded_sm()
+                        
                         .bg(accent),
                 ),
         )

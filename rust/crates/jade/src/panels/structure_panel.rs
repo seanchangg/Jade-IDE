@@ -11,49 +11,72 @@
 use gpui::{div, prelude::*, px, rgb, Context, SharedString};
 
 use crate::app::{JadeApp, SidebarTab};
-use crate::kumo::{Empty, Size as KumoSize, TabBar, TabItem, TabsAppearance};
+use crate::kumo::{scale, Empty, Size as KumoSize};
 use crate::structure::{kind_color, Symbol, SymbolKind};
 use crate::theme::Theme;
 
 /// FILES | STRUCTURE switcher shown at the top of the left sidebar. Clicking a
 /// tab flips `JadeApp::sidebar_tab`.
 pub fn tab_switcher(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> impl IntoElement {
-    // A Kumo segmented Tabs at `size="sm"` — the same control the bottom panel
-    // uses for TERMINAL | OUTPUT, so the two sidebars read as one system.
+    // The old `.sidebar-tabs`: two equal cells across the top of the panel,
+    // a 2px brand rule under the active one, a hairline under the row.
     let t = &theme.kumo;
-    let bar = TabBar::new(TabsAppearance::Segmented).size(KumoSize::Sm);
-    let tab = |id: &'static str,
-                   icon: &'static str,
-                   label: &'static str,
-                   which: SidebarTab,
-                   active: bool| {
-        bar.trigger(TabItem::new(id, label, active).icon(icon), t)
+    let tab = |id: &'static str, label: &'static str, which: SidebarTab, active: bool| {
+        let ink = if active { t.text_default } else { t.text_subtle };
+        let hover_ink = t.text_default;
+        let mut cell = div()
+            .id(id)
+            .relative()
+            .flex()
+            .flex_1()
+            .items_center()
+            .justify_center()
+            .h_full()
+            .text_size(scale::TEXT_XS)
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(ink)
+            .cursor_pointer()
             .on_click(cx.listener(move |a: &mut JadeApp, _e, _w, cx| {
                 a.set_sidebar_tab(which);
                 cx.notify();
             }))
+            .child(label);
+        if active {
+            cell = cell.child(
+                div()
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(2.))
+                    .bg(t.brand),
+            );
+        } else {
+            cell = cell.hover(move |s| s.text_color(hover_ink));
+        }
+        cell
     };
 
-    let files = tab(
-        "sb-files",
-        "folder",
-        "Files",
-        SidebarTab::Files,
-        app.sidebar_tab == SidebarTab::Files,
-    );
-    let structure = tab(
-        "sb-structure",
-        "list-tree",
-        "Structure",
-        SidebarTab::Structure,
-        app.sidebar_tab == SidebarTab::Structure,
-    );
-
-    TabBar::new(TabsAppearance::Segmented)
-        .size(KumoSize::Sm)
-        .push(files)
-        .push(structure)
-        .render(t)
+    div()
+        .flex()
+        .flex_row()
+        .flex_none()
+        .h(px(28.))
+        .w_full()
+        .border_b_1()
+        .border_color(t.hairline)
+        .child(tab(
+            "sb-files",
+            "Files",
+            SidebarTab::Files,
+            app.sidebar_tab == SidebarTab::Files,
+        ))
+        .child(tab(
+            "sb-structure",
+            "Structure",
+            SidebarTab::Structure,
+            app.sidebar_tab == SidebarTab::Structure,
+        ))
 }
 
 /// Render the outline for the active tab (or a muted placeholder).
@@ -86,6 +109,7 @@ pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> impl IntoElement {
     div()
         .id("structure-scroll")
         .flex_1()
+        .px(scale::SPACE_1)
         .overflow_y_scroll()
         .child(list)
 }
@@ -101,12 +125,12 @@ fn node(sym: &Symbol, theme: &Theme, cx: &mut Context<JadeApp>) -> gpui::AnyElem
         .flex()
         .flex_row()
         .items_center()
-        .gap_1()
-        .h(px(20.))
-        .px_1()
-        .rounded_sm()
+        .gap(scale::SPACE_1_5)
+        .h(px(22.))
+        .px(scale::SPACE_2)
         .text_xs()
         .cursor_pointer()
+        .hover(|s| s.bg(theme.kumo.fill_hover))
         .on_click(cx.listener(move |a: &mut JadeApp, _e, _w, cx| {
             a.reveal_line(line);
             cx.notify();
@@ -122,7 +146,9 @@ fn node(sym: &Symbol, theme: &Theme, cx: &mut Context<JadeApp>) -> gpui::AnyElem
         )
         .child(div().text_color(rgb(theme.text)).child(sym.name.clone()));
 
-    if let Some(access) = sym.access {
+    // Public is the default reading of a member, so only the other two
+    // access levels earn a tag.
+    if let Some(access) = sym.access.filter(|a| a.label() != "public") {
         pill = pill.child(
             div()
                 .text_color(rgb(theme.muted))
@@ -143,10 +169,10 @@ fn node(sym: &Symbol, theme: &Theme, cx: &mut Context<JadeApp>) -> gpui::AnyElem
         let mut group = div()
             .flex()
             .flex_col()
-            .ml(px(9.))
-            .pl(px(8.))
+            .ml(px(11.))
+            .pl(px(4.))
             .border_l_1()
-            .border_color(rgb(theme.border));
+            .border_color(theme.kumo.hairline);
         for child in &sym.children {
             group = group.child(node(child, theme, cx));
         }

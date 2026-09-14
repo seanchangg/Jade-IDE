@@ -21,7 +21,7 @@ use gpui::{div, prelude::*, px, Context, MouseButton};
 
 use crate::app::JadeApp;
 use crate::beautiful::{
-    self, chip, icon_button, pixel_loader, radius, status_pill, stream, text, BeautifulTokens,
+    self, chip, icon_button, pixel_loader, status_pill, stream, text, BeautifulTokens,
     Card, LoaderPattern,
 };
 use crate::explain::{ExplainCard, ExplainPhase};
@@ -369,7 +369,7 @@ pub fn render(
         .top(px(top))
         .w(px(CARD_W))
         .max_h(px(max_h))
-        .rounded(radius::CARD)
+        
         // Clicks belong to the card, not to the buffer underneath it.
         .occlude()
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())

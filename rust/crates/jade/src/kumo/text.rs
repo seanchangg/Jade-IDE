@@ -82,8 +82,8 @@ impl Text {
             TextTone::Secondary => el.text_color(t.text_subtle),
             TextTone::Success => el.text_color(t.text_link),
             TextTone::Error => el.text_color(t.text_danger),
-            TextTone::Mono => el.font_family("JetBrains Mono").text_color(t.text_default),
-            TextTone::MonoSecondary => el.font_family("JetBrains Mono").text_color(t.text_subtle),
+            TextTone::Mono => el.font_family(crate::fonts::mono_family()).text_color(t.text_default),
+            TextTone::MonoSecondary => el.font_family(crate::fonts::mono_family()).text_color(t.text_subtle),
         };
         if self.medium {
             el = el.font_weight(gpui::FontWeight::MEDIUM);

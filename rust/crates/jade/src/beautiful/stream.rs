@@ -267,7 +267,7 @@ fn styled(t: &BeautifulTokens, text: &str, style: super::markdown::Style) -> Div
             .text_size(text::CHIP)
             .text_color(t.ink)
             .bg(t.field)
-            .rounded(px(4.))
+            
             .px(px(3.));
     }
     if style.bold {
@@ -286,7 +286,7 @@ fn styled(t: &BeautifulTokens, text: &str, style: super::markdown::Style) -> Div
 fn code_block(t: &BeautifulTokens, code: &str) -> Div {
     div()
         .w_full()
-        .rounded(super::radius::CHIP)
+        
         .bg(t.inset)
         .border_1()
         .border_color(t.line)

@@ -71,7 +71,7 @@ impl Meter {
                     div()
                         .text_size(scale::TEXT_SM)
                         .font_weight(gpui::FontWeight::MEDIUM)
-                        .font_family("JetBrains Mono") // tabular-nums
+                        .font_family(crate::fonts::mono_family()) // tabular-nums
                         .text_color(t.text_default)
                         .child(v),
                 );
@@ -85,7 +85,6 @@ impl Meter {
                 .h(px(8.)) // h-2
                 .w_full()
                 .overflow_hidden()
-                .rounded_full()
                 .bg(t.fill)
                 .child(
                     div()
@@ -94,7 +93,6 @@ impl Meter {
                         .bottom_0()
                         .left_0()
                         .w(relative(self.fraction))
-                        .rounded_full()
                         .bg(fill),
                 ),
         )

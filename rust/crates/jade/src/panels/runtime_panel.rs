@@ -58,9 +58,10 @@ pub fn render(app: &JadeApp, bench_handle: FocusHandle, cx: &mut Context<JadeApp
                 .flex_row()
                 .items_center()
                 .gap_1()
-                .text_color(rgb(theme.accent))
+                .text_color(rgb(theme.muted))
                 .text_xs()
-                .child(crate::assets::ui_icon("gauge", 13., theme.accent))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .child(crate::assets::ui_icon("gauge", 13., theme.muted))
                 .child("RUNTIME"),
         )
         .child(speed_section(app, &theme))
@@ -73,7 +74,8 @@ pub fn render(app: &JadeApp, bench_handle: FocusHandle, cx: &mut Context<JadeApp
 fn section_label(text: &str, theme: &Theme) -> impl IntoElement {
     div()
         .text_color(rgb(theme.muted))
-        .text_size(px(9.))
+        .text_size(px(10.))
+        .font_weight(gpui::FontWeight::MEDIUM)
         .child(text.to_string())
 }
 
@@ -225,11 +227,11 @@ fn hotspots_section(app: &JadeApp, theme: &Theme, cx: &mut Context<JadeApp>) -> 
             )
             .child(
                 // Horizontal bar: filled fraction of the hottest line.
-                div().h(px(4.)).w_full().rounded_sm().bg(rgb(theme.border)).child(
+                div().h(px(4.)).w_full().bg(rgb(theme.border)).child(
                     div()
                         .h(px(4.))
                         .w(gpui::relative(frac))
-                        .rounded_sm()
+                        
                         .bg(rgb(theme.accent)),
                 ),
             );
@@ -263,7 +265,7 @@ fn benchmarks_section(
                 .items_center()
                 .h(px(18.))
                 .px(px(4.))
-                .rounded_sm()
+                
                 .bg(rgb(theme.bg))
                 .border_1()
                 .border_color(rgb(theme.accent))
