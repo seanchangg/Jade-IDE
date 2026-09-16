@@ -967,7 +967,7 @@ pub struct JadeApp {
     pub md_scroll: gpui::ScrollHandle,
     /// Last `(path, caret row)` the preview scrolled to, so the sync fires
     /// once per caret move, not every frame.
-    md_synced: Option<(PathBuf, usize)>,
+    pub(crate) md_synced: Option<(PathBuf, usize)>,
 
     // Demo/telemetry counters (also drive the stdout log the spike printed).
     pub scalars_seen: u64,
@@ -4796,12 +4796,16 @@ impl JadeApp {
         }
     }
 
-    /// Scroll the code list to the active tab's remembered page position (a
-    /// deferred scroll honored on the next paint). Called after switching to a tab.
+    /// Put the active tab's remembered page row at the top of the code list.
+    /// Called after switching to a tab. The offset applies at once, so a
+    /// read of `editor_scroll_top` in the same frame sees the new page.
+    /// (`scroll_to_item` would not do: it skips the scroll when the row is
+    /// already on screen, so a tab switch could keep the old tab's page.)
     pub(crate) fn apply_scroll(&mut self) {
         let top = self.editor.active_tab().map(|t| t.scroll_top).unwrap_or(0);
-        self.code_scroll
-            .scroll_to_item(top, gpui::ScrollStrategy::Top);
+        let base = self.code_scroll.0.borrow().base_handle.clone();
+        let x = base.offset().x;
+        base.set_offset(gpui::point(x, px(-(top as f32 * LINE_H))));
     }
 
     /// Minimal follow-scroll: bring the caret row into the visible window only

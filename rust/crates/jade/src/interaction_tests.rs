@@ -4167,6 +4167,161 @@ fn split_panes_move_and_close() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A formatted Markdown pane keeps its scroll offset across a focus swap:
+/// the offset moves into the slot's own handle when the pane goes to the
+/// background, and back into the live handle when the pane gets the
+/// keyboard again. The caret sync does not fire on the swap.
+#[test]
+fn md_pane_keeps_scroll_across_focus() {
+    let (dir, main) = test_workspace();
+    let readme = dir.join("README.md");
+    std::fs::write(&readme, "# Title\n\ntext\n\nmore\n").unwrap();
+    let (deps, _rx) = test_deps(dir.clone());
+    let mut app = JadeApp::assemble(deps);
+    app.open_file(main.clone());
+    app.split_pane();
+    app.open_file(readme.clone());
+    assert_eq!(app.focused_pane(), 1);
+    assert!(app.pane_shows_md(1));
+
+    // A wheel scroll in the focused formatted view.
+    app.md_scroll.set_offset(gpui::point(px(0.), px(-240.)));
+
+    // Click off into pane 0: the offset lands in pane 1's own handle.
+    app.focus_pane(0);
+    assert_eq!(app.focused_pane(), 0);
+    assert_eq!(f32::from(app.panes[1].md_scroll.offset().y), -240.);
+
+    // A wheel scroll while pane 1 is in the background.
+    app.panes[1]
+        .md_scroll
+        .set_offset(gpui::point(px(0.), px(-120.)));
+
+    // Click back: the live handle takes the background offset, and the
+    // caret sync is marked done for the tab so the render does not jump.
+    app.focus_pane(1);
+    assert_eq!(app.focused_pane(), 1);
+    assert_eq!(f32::from(app.md_scroll.offset().y), -120.);
+    assert_eq!(app.md_synced, Some((readme, 0)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A code pane keeps its exact scroll offset across a focus swap, in both
+/// directions, and each active tab remembers its page row.
+#[test]
+fn code_pane_keeps_scroll_across_focus() {
+    use crate::panels::code_view::{LINE_H, PAD_TOP};
+    let (dir, main) = test_workspace();
+    let other = dir.join("other.cpp");
+    std::fs::write(&other, "int a;\n".repeat(200)).unwrap();
+    let (deps, _rx) = test_deps(dir.clone());
+    let mut app = JadeApp::assemble(deps);
+    app.open_file(main.clone());
+    app.split_pane();
+    app.open_file(other.clone());
+    assert_eq!(app.focused_pane(), 1);
+
+    // A wheel scroll in the focused code list: 12 rows and a bit, plus some
+    // horizontal travel.
+    let y = -(12.0 * LINE_H + PAD_TOP + 5.0);
+    app.code_scroll
+        .0
+        .borrow()
+        .base_handle
+        .set_offset(point(px(-30.), px(y)));
+
+    // Click into pane 0: pane 1's own list takes the exact offset, and pane
+    // 0 (never scrolled) shows from the top.
+    app.focus_pane(0);
+    assert_eq!(app.focused_pane(), 0);
+    let parked = app.panes[1].scroll.0.borrow().base_handle.offset();
+    assert_eq!((f32::from(parked.x), f32::from(parked.y)), (-30., y));
+    assert_eq!(app.panes[1].active_tab().unwrap().scroll_top, 13);
+    let live = app.code_scroll.0.borrow().base_handle.offset();
+    assert_eq!((f32::from(live.x), f32::from(live.y)), (0., 0.));
+
+    // A wheel scroll while pane 1 is in the background, then click back.
+    app.panes[1]
+        .scroll
+        .0
+        .borrow()
+        .base_handle
+        .set_offset(point(px(0.), px(-100.)));
+    app.focus_pane(1);
+    assert_eq!(app.focused_pane(), 1);
+    let live = app.code_scroll.0.borrow().base_handle.offset();
+    assert_eq!(f32::from(live.y), -100.);
+    assert_eq!(app.editor.active_tab().unwrap().scroll_top, 5);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A tab moved into another pane shows at its remembered page row, and the
+/// pane it left keeps the page of the tab that stays active there.
+#[test]
+fn moved_tab_keeps_its_page() {
+    use crate::panels::code_view::LINE_H;
+    let (dir, main) = test_workspace();
+    let a = dir.join("a.cpp");
+    let b = dir.join("b.cpp");
+    std::fs::write(&a, "int a;\n".repeat(200)).unwrap();
+    std::fs::write(&b, "int b;\n".repeat(200)).unwrap();
+    let (deps, _rx) = test_deps(dir.clone());
+    let mut app = JadeApp::assemble(deps);
+    app.open_file(main.clone());
+    app.editor.active_tab_mut().unwrap().preview = false; // keep it open
+    app.open_file(a.clone());
+    assert_eq!(app.editor.tabs.len(), 2);
+    let set_live = |app: &JadeApp, rows: f32| {
+        app.code_scroll
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(point(px(0.), px(-(rows * LINE_H))));
+    };
+    let live_y = |app: &JadeApp| f32::from(app.code_scroll.0.borrow().base_handle.offset().y);
+
+    // `a` at row 30, then back to main.cpp at row 7.
+    set_live(&app, 30.);
+    app.switch_tab(0);
+    assert_eq!(app.editor.tabs[1].scroll_top, 30);
+    assert_eq!(live_y(&app), 0.);
+    set_live(&app, 7.);
+
+    // A second pane with `b`, then drag `a` onto its strip.
+    app.split_pane();
+    app.open_file(b.clone());
+    app.move_tab(0, 1, 1, None);
+    assert_eq!(app.focused_pane(), 1);
+    assert_eq!(app.editor.active_path(), Some(a));
+    assert_eq!(live_y(&app), -(30. * LINE_H));
+    let parked = app.panes[0].scroll.0.borrow().base_handle.offset();
+    assert_eq!(f32::from(parked.y), -(7. * LINE_H));
+    assert_eq!(app.pane_active_tab(0).unwrap().path, main);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A drag from the right pane into the left pane's split zone: the new
+/// pane lands between the two, and the emptied right pane closes.
+#[test]
+fn split_with_tab_from_the_right_closes_the_empty_pane() {
+    let (dir, main) = test_workspace();
+    let a = dir.join("a.cpp");
+    std::fs::write(&a, "int a;\n").unwrap();
+    let (deps, _rx) = test_deps(dir.clone());
+    let mut app = JadeApp::assemble(deps);
+    app.open_file(main.clone());
+    app.split_pane();
+    app.open_file(a.clone());
+    assert_eq!(app.focused_pane(), 1);
+
+    app.split_with_tab(1, 0, 0);
+    assert_eq!(app.pane_count(), 2);
+    assert_eq!(app.focused_pane(), 1);
+    assert_eq!(app.editor.active_path(), Some(a));
+    assert_eq!(app.pane_active_tab(0).unwrap().path, main);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Reorder inside one pane keeps the active tab the same tab.
 #[test]
 fn reorder_tabs_keeps_active() {

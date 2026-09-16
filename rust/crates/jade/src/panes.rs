@@ -177,35 +177,84 @@ impl JadeApp {
         self.focus_pane(idx);
     }
 
-    /// Take a background pane's editor out of its slot. The pane's live
-    /// scroll offset moves into its active tab first, so a wheel scroll made
-    /// in the background is kept.
-    fn take_pane_editor(&mut self, idx: usize) -> Option<EditorState> {
-        let top = self.panes[idx]
-            .active_tab()
-            .map(|_| self.panes[idx].scroll_top());
-        let mut editor = self.panes[idx].editor.take()?;
-        if let (Some(top), Some(tab)) = (top, editor.active_tab_mut()) {
+    /// The pixel offset of a code list (x and y, both at most 0).
+    fn list_offset(h: &gpui::UniformListScrollHandle) -> gpui::Point<gpui::Pixels> {
+        h.0.borrow().base_handle.offset()
+    }
+
+    /// Set the pixel offset of a code list. The list paints at this offset
+    /// on the next frame (gpui clamps it to the content then).
+    fn set_list_offset(h: &gpui::UniformListScrollHandle, p: gpui::Point<gpui::Pixels>) {
+        h.0.borrow().base_handle.set_offset(p);
+    }
+
+    /// Snapshot a background pane's page position into its active tab, the
+    /// same as `stash_scroll` does for the live editor.
+    fn stash_pane_scroll(&mut self, idx: usize) {
+        let top = self.panes[idx].scroll_top();
+        if let Some(tab) = self.panes[idx]
+            .editor
+            .as_mut()
+            .and_then(|e| e.active_tab_mut())
+        {
             tab.scroll_top = top;
         }
+    }
+
+    /// Point a background pane's code list at its active tab's remembered
+    /// page row, after the pane's active tab changed.
+    fn apply_pane_scroll(&mut self, idx: usize) {
+        let Some(pane) = self.panes.get(idx) else {
+            return;
+        };
+        let top = pane.active_tab().map(|t| t.scroll_top).unwrap_or(0);
+        let x = Self::list_offset(&pane.scroll).x;
+        Self::set_list_offset(
+            &pane.scroll,
+            gpui::point(x, gpui::px(-(top as f32 * LINE_H))),
+        );
+    }
+
+    /// Take a background pane's editor out of its slot as the live editor.
+    /// The pane's active tab remembers its page row first. The live code
+    /// list and the live formatted Markdown view take the slot's exact pixel
+    /// offsets, so the pane shows the same pixels after the swap.
+    fn take_pane_editor(&mut self, idx: usize) -> Option<EditorState> {
+        self.stash_pane_scroll(idx);
+        let editor = self.panes[idx].editor.take()?;
+        Self::set_list_offset(&self.code_scroll, Self::list_offset(&self.panes[idx].scroll));
+        self.md_scroll.set_offset(self.panes[idx].md_scroll.offset());
         Some(editor)
     }
 
-    /// Park the live editor in pane slot `idx` and point the slot's own code
-    /// list at the tab's remembered page position.
-    fn park_editor(&mut self, idx: usize, editor: EditorState) {
-        if let Some(tab) = editor.active_tab() {
-            self.panes[idx]
-                .scroll
-                .scroll_to_item(tab.scroll_top, gpui::ScrollStrategy::Top);
-        }
+    /// Park the live editor in pane slot `idx`. `code_offset` and
+    /// `md_offset` are the live offsets, read before the incoming pane
+    /// replaced them; they move into the slot's own handles.
+    fn park_editor(
+        &mut self,
+        idx: usize,
+        editor: EditorState,
+        code_offset: gpui::Point<gpui::Pixels>,
+        md_offset: gpui::Point<gpui::Pixels>,
+    ) {
+        Self::set_list_offset(&self.panes[idx].scroll, code_offset);
+        self.panes[idx].md_scroll.set_offset(md_offset);
         self.panes[idx].editor = Some(editor);
     }
 
     /// Shared bookkeeping after the live editor changed: build target, LSP
-    /// `didOpen`, focus, popups, scroll, and the find bar.
+    /// `didOpen`, focus, popups, and the find bar. The scroll offsets came
+    /// across with the swap; a caller whose active tab changed applies the
+    /// tab's remembered page itself.
     fn after_pane_swap(&mut self) {
         self.md_edit = false;
+        // The formatted view keeps the offset that came across with the
+        // swap. Mark the caret sync as done for the incoming tab, so the
+        // next render does not scroll the view to the caret's block.
+        self.md_synced = self
+            .editor
+            .active_tab()
+            .map(|t| (t.path.clone(), t.caret_point().row));
         self.active_file = self.editor.active_path();
         match self.active_file.clone() {
             Some(path) => self.after_open_active(&path),
@@ -214,23 +263,25 @@ impl JadeApp {
                 self.pending_editor_focus = true;
             }
         }
-        self.apply_scroll();
         self.find_resync();
     }
 
     /// Give pane `idx` the keyboard: swap its editor in as the live one and
-    /// park the outgoing editor in the old slot.
+    /// park the outgoing editor in the old slot. Both panes keep their exact
+    /// scroll offsets.
     pub fn focus_pane(&mut self, idx: usize) {
         let from = self.focused_pane();
         if idx == from || idx >= self.panes.len() {
             return;
         }
         self.stash_scroll();
+        let code_offset = Self::list_offset(&self.code_scroll);
+        let md_offset = self.md_scroll.offset();
         let Some(incoming) = self.take_pane_editor(idx) else {
             return;
         };
         let outgoing = std::mem::replace(&mut self.editor, incoming);
-        self.park_editor(from, outgoing);
+        self.park_editor(from, outgoing, code_offset, md_offset);
         self.after_pane_swap();
     }
 
@@ -293,16 +344,23 @@ impl JadeApp {
             }
             return;
         }
-        if from_pane == self.focused_pane() {
-            self.stash_scroll();
+        // Every active tab remembers its page row before the tab sets change.
+        self.stash_scroll();
+        for i in [from_pane, to_pane] {
+            if self.panes[i].editor.is_some() {
+                self.stash_pane_scroll(i);
+            }
         }
+        let source_active = self.pane_editor(from_pane).active_path();
         let Some(tab) = self.pane_editor_mut(from_pane).detach(from_index) else {
             return;
         };
         self.pane_editor_mut(to_pane).insert_tab(tab, before);
         let mut target = to_pane;
+        let mut source = Some(from_pane);
         if self.pane_editor(from_pane).tabs.is_empty() && self.split_mode() {
             self.close_pane(from_pane);
+            source = None;
             if from_pane < target {
                 target -= 1;
             }
@@ -312,6 +370,21 @@ impl JadeApp {
         } else {
             self.focus_pane(target);
         }
+        self.show_moved_tab();
+        // The source pane is in the background now: if it lost its active
+        // tab, its list moves to the page of the tab that took over.
+        if let Some(src) = source {
+            if src != target && self.pane_editor(src).active_path() != source_active {
+                self.apply_pane_scroll(src);
+            }
+        }
+    }
+
+    /// The moved tab is the live editor's active tab now: show it at its
+    /// remembered page row, and let the formatted view sync to its caret.
+    fn show_moved_tab(&mut self) {
+        self.apply_scroll();
+        self.md_synced = None;
     }
 
     /// Move tab `from_index` of pane `from_pane` into a new pane to the right
@@ -326,9 +399,11 @@ impl JadeApp {
             self.move_tab(from_pane, from_index, after, None);
             return;
         }
-        if from_pane == self.focused_pane() {
-            self.stash_scroll();
+        self.stash_scroll();
+        if self.panes[from_pane].editor.is_some() {
+            self.stash_pane_scroll(from_pane);
         }
+        let source_active = self.pane_editor(from_pane).active_path();
         let Some(tab) = self.pane_editor_mut(from_pane).detach(from_index) else {
             return;
         };
@@ -336,13 +411,27 @@ impl JadeApp {
         editor.insert_tab(tab, None);
         let mut idx = after + 1;
         self.panes.insert(idx, SplitPane::background(editor));
-        if self.pane_editor(from_pane).tabs.is_empty() {
-            self.close_pane(from_pane);
-            if from_pane < idx {
+        // The insert shifted the slots at or after `idx` by one.
+        let src = if from_pane >= idx {
+            from_pane + 1
+        } else {
+            from_pane
+        };
+        let mut source = Some(src);
+        if self.pane_editor(src).tabs.is_empty() {
+            self.close_pane(src);
+            source = None;
+            if src < idx {
                 idx -= 1;
             }
         }
         self.focus_pane(idx);
+        self.show_moved_tab();
+        if let Some(src) = source {
+            if self.pane_editor(src).active_path() != source_active {
+                self.apply_pane_scroll(src);
+            }
+        }
     }
 
     /// A divider drag: move width share between pane `left` and its right
