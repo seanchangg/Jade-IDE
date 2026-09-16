@@ -51,6 +51,7 @@ mod format;
 mod frequency;
 mod ghost;
 mod highlight;
+mod implement;
 mod hw;
 mod kumo;
 #[cfg(test)]

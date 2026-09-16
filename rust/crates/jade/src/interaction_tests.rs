@@ -4362,3 +4362,227 @@ fn pane_divider_moves_share() {
     assert_eq!(app.panes[1].weight, 1.0);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Implement-from-header stubs: with `math.h` included, typing `ad` at file
+/// scope offers `int add(int a, int b)`; Enter fills the definition stub and
+/// puts the caret on the body line.
+#[gpui::test]
+async fn header_stub_completion_fills_a_definition(cx: &mut TestAppContext) {
+    let (dir, _main) = test_workspace();
+    std::fs::write(
+        dir.join("math.h"),
+        "int add(int a, int b);\nint sub(int a, int b);\n",
+    )
+    .unwrap();
+    let file = dir.join("impl.cpp");
+    std::fs::write(
+        &file,
+        "#include \"math.h\"\n\nint sub(int a, int b) { return a - b; }\n\n",
+    )
+    .unwrap();
+    let (deps, app_rx) = test_deps(dir);
+
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _window, cx| {
+        app.open_file(file.clone());
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    // Click the empty row 3 (file scope) and type a return type + name.
+    let cell = cx
+        .debug_bounds("code-cell-3")
+        .expect("code cell for row 3 was painted");
+    cx.simulate_click(
+        point(
+            cell.origin.x + px(1.0),
+            cell.origin.y + px(crate::panels::code_view::LINE_H / 2.0),
+        ),
+        Modifiers::default(),
+    );
+    cx.simulate_input("int ad");
+    app.update_in(cx, |app, _w, _cx| {
+        let c = app.completion.as_ref().expect("popup opened for the header stub");
+        let item = c.current().expect("a stub is selected");
+        assert_eq!(item.label, "int add(int a, int b)");
+        assert_eq!(item.detail.as_deref(), Some("implement · math.h"));
+        // `sub` is already defined in this file, so it is not offered.
+        assert!(
+            !c.items.iter().any(|it| it.label.contains("sub(")),
+            "defined function was offered again"
+        );
+    });
+
+    cx.simulate_keystrokes("enter");
+    app.update_in(cx, |app, _w, _cx| {
+        assert!(app.completion.is_none(), "popup closed on accept");
+        let tab = app.editor.active_tab().unwrap();
+        assert_eq!(tab.line(3), "int add(int a, int b) {");
+        assert_eq!(tab.line(4), "    ");
+        assert_eq!(tab.line(5), "}");
+        let caret = tab.caret_point();
+        assert_eq!((caret.row, caret.col), (4, 4), "caret sits on the body line");
+    });
+}
+
+/// Shared setup for the stub-and-ghost seam tests: a workspace with `math.h`
+/// and an `impl.cpp` that includes it, the AI backend marked Ready, and the
+/// caret on the empty row 3 with `int ad` typed so the stub popup is open.
+async fn stub_popup_with_ghost_ready(
+    cx: &mut TestAppContext,
+) -> (PathBuf, gpui::Entity<JadeApp>, &mut gpui::VisualTestContext) {
+    use jade_ai::AiState;
+
+    let (dir, _main) = test_workspace();
+    std::fs::write(dir.join("math.h"), "int add(int a, int b);\n").unwrap();
+    let file = dir.join("impl.cpp");
+    std::fs::write(&file, "#include \"math.h\"\n\n\n").unwrap();
+    let (deps, app_rx) = test_deps(dir.clone());
+
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+    app.update_in(cx, |app, _window, cx| {
+        app.open_file(file.clone());
+        app.ai_status.state = AiState::Ready;
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    let cell = cx
+        .debug_bounds("code-cell-2")
+        .expect("code cell for row 2 was painted");
+    cx.simulate_click(
+        point(
+            cell.origin.x + px(1.0),
+            cell.origin.y + px(crate::panels::code_view::LINE_H / 2.0),
+        ),
+        Modifiers::default(),
+    );
+    cx.simulate_input("int ad");
+    app.update_in(cx, |app, _w, _cx| {
+        let c = app.completion.as_ref().expect("stub popup is open");
+        assert_eq!(c.current().unwrap().label, "int add(int a, int b)");
+        assert!(app.ghost.is_none(), "ghost request is still in flight");
+    });
+    (dir, app, cx)
+}
+
+/// Deliver the `/infill` response for the current ghost generation, as the
+/// debounced task would, with `content` anchored at the caret.
+fn deliver_ghost(app: &gpui::Entity<JadeApp>, cx: &mut gpui::VisualTestContext, content: &str) {
+    use crate::app::AppEvent;
+    let (generation, prefix, suffix, anchor) = app.update_in(cx, |app, _w, _cx| {
+        let tab = app.editor.active_tab().unwrap();
+        let full = tab.buffer.to_string();
+        let caret = tab.buffer.selection().caret();
+        let p = tab.caret_point();
+        (
+            app.ghost_generation(),
+            full[..caret].to_string(),
+            full[caret..].to_string(),
+            (p.row, p.col),
+        )
+    });
+    let content = content.to_string();
+    app.update_in(cx, |app, _w, cx| {
+        app.apply_app_event(AppEvent::Ghost {
+            generation,
+            content: Some(content),
+            prefix,
+            suffix,
+            line_suffix: String::new(),
+            anchor,
+            max_lines: 6,
+        });
+        cx.notify();
+    });
+    cx.run_until_parked();
+}
+
+/// Seam 1: Enter takes the header stub, then the ghost picks up on the empty
+/// body line and Tab fills the body. The two hand off without a stale popup.
+#[gpui::test]
+async fn header_stub_hands_off_to_ghost_body(cx: &mut TestAppContext) {
+    let (dir, app, cx) = stub_popup_with_ghost_ready(cx).await;
+
+    cx.simulate_keystrokes("enter");
+    app.update_in(cx, |app, _w, _cx| {
+        assert!(app.completion.is_none(), "popup closed on stub accept");
+        assert!(app.ghost.is_none(), "old ghost cleared; body request in flight");
+        let tab = app.editor.active_tab().unwrap();
+        assert_eq!(tab.line(2), "int add(int a, int b) {");
+        assert_eq!((tab.caret_point().row, tab.caret_point().col), (3, 4));
+    });
+
+    deliver_ghost(&app, cx, "return a + b;");
+    app.update_in(cx, |app, _w, _cx| {
+        let g = app.ghost.as_ref().expect("ghost proposes the body");
+        assert_eq!(g.text, "return a + b;");
+        assert_eq!(g.anchor, (3, 4), "ghost sits on the stub's body line");
+        assert!(app.completion.is_none(), "no popup reopened by the ghost");
+    });
+    assert!(cx.debug_bounds("ghost-run").is_some(), "ghost paints on the body line");
+
+    cx.simulate_keystrokes("tab");
+    app.update_in(cx, |app, _w, _cx| {
+        let tab = app.editor.active_tab().unwrap();
+        assert_eq!(tab.line(2), "int add(int a, int b) {");
+        assert_eq!(tab.line(3), "    return a + b;");
+        assert_eq!(tab.line(4), "}");
+        assert!(app.ghost.is_none());
+        assert!(app.completion.is_none());
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Seam 2: with the stub popup open and a ghost up at the same caret, Tab
+/// takes the ghost and closes the popup, so a later Enter cannot apply a stale
+/// stub on top of the accepted text.
+#[gpui::test]
+async fn ghost_tab_closes_the_stub_popup(cx: &mut TestAppContext) {
+    let (dir, app, cx) = stub_popup_with_ghost_ready(cx).await;
+
+    deliver_ghost(&app, cx, "d(int a, int b) {");
+    app.update_in(cx, |app, _w, _cx| {
+        assert!(app.ghost.is_some(), "ghost shows next to the open popup");
+        assert!(app.completion.is_some(), "popup stays open beside the ghost");
+    });
+
+    cx.simulate_keystrokes("tab");
+    app.update_in(cx, |app, _w, _cx| {
+        let tab = app.editor.active_tab().unwrap();
+        assert_eq!(tab.line(2), "int add(int a, int b) {", "Tab took the ghost");
+        assert!(app.completion.is_none(), "popup closed with the ghost accept");
+    });
+
+    // A second Enter now only inserts a newline: nothing stale is applied.
+    cx.simulate_keystrokes("enter");
+    app.update_in(cx, |app, _w, _cx| {
+        let tab = app.editor.active_tab().unwrap();
+        assert_eq!(tab.line(2), "int add(int a, int b) {");
+        assert!(
+            !tab.buffer.to_string().contains("int add(int a, int b) {int add"),
+            "no stub landed on top of the ghost text"
+        );
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Seam 3: Esc clears the ghost first and the popup second, and Enter with a
+/// ghost up still takes the popup's stub (Enter is the popup's key, Tab the
+/// ghost's).
+#[gpui::test]
+async fn enter_prefers_stub_while_ghost_is_up(cx: &mut TestAppContext) {
+    let (dir, app, cx) = stub_popup_with_ghost_ready(cx).await;
+    deliver_ghost(&app, cx, "d(int a, int b) { return a + b; }");
+
+    cx.simulate_keystrokes("enter");
+    app.update_in(cx, |app, _w, _cx| {
+        let tab = app.editor.active_tab().unwrap();
+        assert_eq!(tab.line(2), "int add(int a, int b) {");
+        assert_eq!(tab.line(3), "    ");
+        assert_eq!(tab.line(4), "}");
+        assert!(app.completion.is_none());
+        assert!(app.ghost.is_none(), "the pre-accept ghost never survives the stub");
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}

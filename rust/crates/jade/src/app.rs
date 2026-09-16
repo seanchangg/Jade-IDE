@@ -654,6 +654,9 @@ pub struct JadeApp {
     pub completion: Option<CompletionState>,
     /// Monotonic completion-request generation (supersede stale responses).
     completion_gen: u64,
+    /// Parsed header declarations for implement-from-header stubs, keyed by
+    /// header path with the file mtime that produced them.
+    implement_cache: HashMap<PathBuf, (Option<std::time::SystemTime>, Vec<crate::implement::HeaderFn>)>,
     /// Hover panel (E2). `Some` when a dwell resolved hover contents.
     pub hover: Option<HoverState>,
     /// Monotonic hover-request generation (supersede stale dwell responses).
@@ -1184,6 +1187,7 @@ impl JadeApp {
             lsp_include,
             completion: None,
             completion_gen: 0,
+            implement_cache: HashMap::new(),
             hover: None,
             hover_gen: 0,
             hover_target: None,
@@ -5458,6 +5462,76 @@ impl JadeApp {
         self.refresh_frequency_completion();
     }
 
+    /// Implement-from-header stub items for the caret (`implement.rs`): one per
+    /// function the included headers declare and this file does not define.
+    /// Empty when no word is in progress, the file is not C/C++, or the caret
+    /// sits inside a body.
+    fn stub_items_for_caret(&mut self) -> Vec<CompletionItem> {
+        let (path, text, caret) = match self.editor.active_tab() {
+            Some(tab) if lsp_eligible(&tab.path) => {
+                (tab.path.clone(), tab.buffer.to_string(), tab.buffer.selection().caret())
+            }
+            _ => return Vec::new(),
+        };
+        let ident = match self.editor.active_tab() {
+            Some(tab) => editor_view::ident_range_before(&tab.buffer, caret),
+            None => return Vec::new(),
+        };
+        if ident.is_empty() {
+            return Vec::new();
+        }
+        let root = self.workspace_root.clone();
+        let mut out = Vec::new();
+        let mut scope_checked: Option<bool> = None;
+        for (inc, quoted) in crate::implement::includes(&text) {
+            let Some(header) = crate::implement::resolve_include(&path, &root, &inc, quoted) else {
+                continue;
+            };
+            if header == path {
+                continue;
+            }
+            let fns = self.header_declarations(&header);
+            if fns.is_empty() {
+                continue;
+            }
+            // The parse is the expensive part: run it once, and only when a
+            // header actually declared something.
+            let ok = *scope_checked
+                .get_or_insert_with(|| crate::implement::at_definition_scope(&text, caret));
+            if !ok {
+                return Vec::new();
+            }
+            let stubs = crate::implement::missing_stubs(&fns, &text);
+            let origin = header
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&inc)
+                .to_string();
+            for it in crate::implement::completion_items(&stubs, &origin) {
+                if !out.iter().any(|o: &CompletionItem| o.label == it.label) {
+                    out.push(it);
+                }
+            }
+        }
+        out
+    }
+
+    /// The parsed declarations of `header`, re-read when its mtime changes.
+    fn header_declarations(&mut self, header: &Path) -> Vec<crate::implement::HeaderFn> {
+        let mtime = std::fs::metadata(header).and_then(|m| m.modified()).ok();
+        if let Some((seen, fns)) = self.implement_cache.get(header) {
+            if *seen == mtime {
+                return fns.clone();
+            }
+        }
+        let fns = std::fs::read_to_string(header)
+            .map(|h| crate::implement::declarations(&h))
+            .unwrap_or_default();
+        self.implement_cache
+            .insert(header.to_path_buf(), (mtime, fns.clone()));
+        fns
+    }
+
     /// Frequency-completion items for the identifier being typed at the caret
     /// (§4.12). Empty when there is no in-progress word or no eligible tab.
     fn frequency_items_for_caret(&self) -> Vec<CompletionItem> {
@@ -5481,7 +5555,12 @@ impl JadeApp {
     /// Merge frequency suggestions into the popup (creating it if the LSP hasn't
     /// answered yet). Dedupe by label — LSP items win (§4.12 merge rule).
     fn refresh_frequency_completion(&mut self) {
-        let freq = self.frequency_items_for_caret();
+        let mut freq = self.frequency_items_for_caret();
+        // Implement-from-header stubs go first: at definition scope they are
+        // the most likely intent behind a typed function name.
+        let mut stubs = self.stub_items_for_caret();
+        stubs.append(&mut freq);
+        let freq = stubs;
         let (prefix, anchor) = match self.editor.active_tab() {
             Some(tab) => {
                 let caret = tab.buffer.selection().caret();
@@ -5595,7 +5674,12 @@ impl JadeApp {
         // Merge frequency completion (§4.12) into the LSP results — dedupe by
         // label, LSP wins (LSP items keep their server order first, then the
         // frequency words ranked by count).
-        let mut merged = items;
+        let mut merged = self.stub_items_for_caret();
+        for it in items {
+            if !merged.iter().any(|m| m.label == it.label) {
+                merged.push(it);
+            }
+        }
         for f in self.frequency_items_for_caret() {
             if !merged.iter().any(|it| it.label == f.label) {
                 merged.push(f);
@@ -5698,8 +5782,24 @@ impl JadeApp {
             Some(tab) => {
                 let caret = tab.buffer.selection().caret();
                 let ident = editor_view::ident_range_before(&tab.buffer, caret);
-                let (range, text) = editor_view::completion_edit(&item, &tab.buffer, ident);
-                Some(tab.buffer.edit(range, &text))
+                if crate::implement::is_stub_item(&item) {
+                    // A stub replaces the whole partial line (a typed return
+                    // type included), keeps the line's indentation for its
+                    // body, and lands the caret on the empty body line.
+                    let point = tab.buffer.offset_to_point(ident.start);
+                    let line = tab.buffer.line(point.row).to_string();
+                    let start_col = crate::implement::replace_start_col(&line, point.col);
+                    let indent: String = line.chars().take_while(|c| c.is_whitespace()).collect();
+                    let start = tab.buffer.point_to_offset(Point::new(point.row, start_col));
+                    let raw = item.insert_text.clone().unwrap_or_default();
+                    let (text, caret_in) = crate::implement::indent_stub(&raw, &indent);
+                    let record = tab.buffer.edit(start..caret, &text);
+                    tab.buffer.set_caret(start + caret_in);
+                    Some(record)
+                } else {
+                    let (range, text) = editor_view::completion_edit(&item, &tab.buffer, ident);
+                    Some(tab.buffer.edit(range, &text))
+                }
             }
             None => None,
         };
@@ -5933,11 +6033,21 @@ impl JadeApp {
         });
     }
 
-    /// Accept the ghost text (Tab): insert it at the caret.
+    /// The current ghost request generation (test seam: a test delivers the
+    /// `/infill` response the never-driven runtime would have sent).
+    pub fn ghost_generation(&self) -> u64 {
+        self.ghost_gen
+    }
+
+    /// Accept the ghost text (Tab): insert it at the caret. The completion
+    /// popup closes: its anchor and its typed prefix belong to the caret
+    /// before the insert, and a later Enter would apply a stale item (an
+    /// implement-from-header stub would land a second definition).
     fn ghost_accept(&mut self, cx: &mut Context<Self>) {
         let Some(g) = self.ghost.take() else {
             return;
         };
+        self.completion = None;
         let record = self.with_edit(|b| b.insert_text(&g.text));
         self.after_edit(record, cx);
     }
@@ -5966,6 +6076,8 @@ impl JadeApp {
             let suffix = crate::ghost::cap_suffix(&full[caret..], crate::ghost::MAX_SUFFIX_CHARS);
             self.ghost_cache.put(prefix, suffix, g.text.clone());
         }
+        // Same reason as `ghost_accept`: the popup was filtered for the old caret.
+        self.completion = None;
         let record = self.with_edit(|b| b.insert_text(&word));
         self.after_edit(record, cx);
     }
