@@ -123,6 +123,8 @@ impl OpenTab {
     pub fn from_file(path: &Path, palette: TokenPalette) -> std::io::Result<OpenTab> {
         let raw = std::fs::read(path)?;
         let text = String::from_utf8_lossy(&raw).into_owned();
+        // The tab keeps the path as given; `index_of` compares canonical
+        // forms, so two opens through different spellings share one tab.
         Ok(Self::from_text(path, &text, palette))
     }
 
@@ -411,8 +413,15 @@ impl EditorState {
         }
     }
 
+    /// The tab for `path`. Exact match first; then the canonical form, so
+    /// `dir/./a.csv`, a symlinked folder, and `/private/tmp` against `/tmp`
+    /// all find the tab that was opened under another spelling.
     pub fn index_of(&self, path: &Path) -> Option<usize> {
-        self.tabs.iter().position(|t| t.path == path)
+        if let Some(i) = self.tabs.iter().position(|t| t.path == path) {
+            return Some(i);
+        }
+        let canon = std::fs::canonicalize(path).ok()?;
+        self.tabs.iter().position(|t| t.path == canon || std::fs::canonicalize(&t.path).is_ok_and(|c| c == canon))
     }
 
     /// Open a file: dedupe by path, else read + build an editable tab and append.
@@ -1876,5 +1885,32 @@ mod fold_tests {
         t.folds.clear();
         t.folds.insert(6);
         assert_eq!(t.visible_rows(), vec![0, 1, 2, 3, 4, 5, 6, 8, 9, 10]);
+    }
+}
+
+#[cfg(test)]
+mod path_dedupe_tests {
+    use super::*;
+
+    /// The same file opened as `dir/a.csv`, `dir/./a.csv`, and through a
+    /// symlinked folder is one tab.
+    #[test]
+    fn one_tab_per_file_across_path_spellings() {
+        let dir = std::env::temp_dir().join(format!("jade-dedupe-{}", std::process::id()));
+        let real = dir.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let file = real.join("a.csv");
+        std::fs::write(&file, "x,y\n1,2\n").unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let mut e = EditorState::new(TokenPalette::default());
+        e.open(&file).unwrap();
+        e.open(&real.join(".").join("a.csv")).unwrap();
+        e.open(&link.join("a.csv")).unwrap();
+        e.open_preview(&link.join("a.csv")).unwrap();
+        assert_eq!(e.tabs.len(), 1, "{:?}", e.tabs.iter().map(|t| t.path.clone()).collect::<Vec<_>>());
+        assert!(e.index_of(&link.join("a.csv")).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
