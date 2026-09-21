@@ -4726,25 +4726,42 @@ async fn csv_tab_toggles_chart_and_cycles_columns(cx: &mut TestAppContext) {
         assert_eq!(std::sync::Arc::as_ptr(&app.csv.chart.as_ref().unwrap().3), before);
         assert_eq!(app.csv.table.as_ref().unwrap().1, v1);
 
-        // A control change rebuilds the chart from the cached table.
-        app.csv_cycle_group();
+        // A menu pick rebuilds the chart from the cached table and closes
+        // the menu.
+        app.csv_toggle_menu(crate::panels::csv_view::CsvMenu::Group);
+        assert_eq!(app.csv.menu, Some(crate::panels::csv_view::CsvMenu::Group));
+        app.csv_pick_group(Some(1));
+        assert_eq!(app.csv.menu, None);
         app.csv_prepare();
         let (_, _, cfg2, chart2) = app.csv.chart.clone().unwrap();
         assert_eq!(cfg2.group, Some(1));
         assert_ne!(std::sync::Arc::as_ptr(&chart2), before);
-        app.csv_toggle_kind();
-        app.csv_toggle_log();
+        app.csv_pick_kind(ChartKind::Line);
+        app.csv_pick_log(true);
         app.csv_prepare();
         let cfg3 = app.csv.chart.as_ref().unwrap().2.clone();
         assert_eq!(cfg3.kind, ChartKind::Line);
-        assert!(cfg3.log_x, "40 to 1023 is under two decades, so log starts off and toggles on");
-
-        // Group cycles past the last column back to none.
-        app.csv_cycle_group();
-        app.csv_cycle_group();
-        app.csv_cycle_group();
+        assert!(cfg3.log_x);
+        app.csv_pick_group(None);
         app.csv_prepare();
         assert_eq!(app.csv.chart.as_ref().unwrap().2.group, None);
+
+        // Zoom and pan need the painted bounds: fake a 400 px wide canvas.
+        *app.csv.bounds.lock().unwrap() = Some([100.0, 0.0, 400.0, 300.0]);
+        let full = app.csv_view_range().unwrap();
+        app.csv_zoom(300.0, 0.5); // cursor at the middle
+        let v = app.csv_view_range().unwrap();
+        assert!(v.0 > full.0 && v.1 < full.1, "zoomed in: {v:?} inside {full:?}");
+        assert!(app.csv.view.is_some());
+        app.csv.drag = Some((300.0, v));
+        app.csv_pan_to(200.0); // mouse moved left: view moves right
+        let p = app.csv_view_range().unwrap();
+        assert!(p.0 > v.0 && p.1 - p.0 - (v.1 - v.0) < 1e-9, "panned: {p:?} from {v:?}");
+        app.csv.hover_x = Some(300.0);
+        let (_, pts) = app.csv_hover_points().expect("a readout at the hover");
+        assert_eq!(pts.len(), 1, "one series after group none");
+        app.csv_reset_view();
+        assert!(app.csv.view.is_none());
 
         app.toggle_md_preview(cx);
         assert!(!app.csv_chart_active(), "toggle back to text");
