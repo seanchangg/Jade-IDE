@@ -191,6 +191,8 @@ pub struct SeriesData {
     pub name: String,
     /// Points sorted by x, x already log10 when the config asks.
     pub points: Vec<(f64, f64)>,
+    /// Sum of the y values: for a histogram, the number of samples.
+    pub sum_y: f64,
 }
 
 impl SeriesData {
@@ -285,7 +287,8 @@ pub fn build_chart(t: &CsvTable, cfg: &CsvConfig) -> Option<ChartData> {
             y_min = y_min.min(y);
             y_max = y_max.max(y);
         }
-        series.push(SeriesData { name, points: pts });
+        let sum_y = pts.iter().map(|p| p.1).sum();
+        series.push(SeriesData { name, points: pts, sum_y });
     }
     if series.is_empty() {
         return None;
@@ -852,7 +855,12 @@ fn toolbar(
                             .border_color(rgb(color).alpha(if shown { 1.0 } else { 0.4 })),
                     )
                     .child(name)
-                    .child(div().text_color(t.text_subtle).font_family(crate::fonts::mono_family()).child(format!("{}", s.points.len()))),
+                    .child(div().text_color(t.text_subtle).font_family(crate::fonts::mono_family()).child(match d.kind {
+                        // A histogram's legend counts samples (the sum of the
+                        // count column), a line's counts points.
+                        ChartKind::Bars => format!("{} samples", format_num(s.sum_y)),
+                        ChartKind::Line => format!("{} points", s.points.len()),
+                    })),
             );
         }
         if any_hidden {
@@ -1327,6 +1335,7 @@ mod tests {
         assert_eq!(d.series.len(), 2);
         assert_eq!(d.series[0].name, "apply warm");
         assert_eq!(d.series[0].points.len(), 3);
+        assert_eq!(d.series[0].sum_y, 685.0 + 2651.0 + 3.0, "the legend's sample count");
         assert!((d.series[0].points[0].0 - 40f64.log10()).abs() < 1e-9);
         assert!(d.series[1].points.windows(2).all(|p| p[0].0 <= p[1].0));
         assert_eq!(d.y_min, 0.0);
@@ -1350,12 +1359,12 @@ mod tests {
 
     #[test]
     fn nearest_point_and_visible_y_limits() {
-        let s = SeriesData { name: "s".into(), points: vec![(1.0, 10.0), (2.0, 20.0), (4.0, 40.0)] };
+        let s = SeriesData { name: "s".into(), points: vec![(1.0, 10.0), (2.0, 20.0), (4.0, 40.0)], sum_y: 70.0 };
         assert_eq!(s.nearest(0.0), Some((1.0, 10.0)));
         assert_eq!(s.nearest(2.9), Some((2.0, 20.0)));
         assert_eq!(s.nearest(3.1), Some((4.0, 40.0)));
         assert_eq!(s.nearest(9.0), Some((4.0, 40.0)));
-        assert_eq!(SeriesData { name: "e".into(), points: vec![] }.nearest(1.0), None);
+        assert_eq!(SeriesData { name: "e".into(), points: vec![], sum_y: 0.0 }.nearest(1.0), None);
 
         let d = ChartData {
             series: vec![s],
@@ -1407,8 +1416,8 @@ mod tests {
     fn hidden_series_leave_the_y_fit() {
         let d = ChartData {
             series: vec![
-                SeriesData { name: "big".into(), points: vec![(1.0, 1000.0)] },
-                SeriesData { name: "small".into(), points: vec![(1.0, 10.0)] },
+                SeriesData { name: "big".into(), points: vec![(1.0, 1000.0)], sum_y: 1000.0 },
+                SeriesData { name: "small".into(), points: vec![(1.0, 10.0)], sum_y: 10.0 },
             ],
             x_min: 1.0, x_max: 1.0, y_min: 0.0, y_max: 1000.0,
             x_label: "x".into(), y_label: "y".into(), log_x: false, kind: ChartKind::Bars, rows: 2,
