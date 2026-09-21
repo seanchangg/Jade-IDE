@@ -20,7 +20,7 @@
 //! quads and one stroked path per series on a canvas; the zoom and hover
 //! state is a few numbers, so each interaction is one cheap repaint.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -30,13 +30,11 @@ use gpui::{
 };
 
 use crate::app::JadeApp;
-use crate::kumo::scale;
+use crate::kumo::{self, scale};
 use crate::theme::Theme;
 
 /// Series beyond this many collapse into one "other" series.
 pub const MAX_SERIES: usize = 8;
-const CHART_H: f32 = 300.0;
-const Y_GUTTER_W: f32 = 132.0;
 /// Zoom cannot narrow the view below this share of the full range.
 const MIN_VIEW_SHARE: f64 = 1e-4;
 
@@ -235,30 +233,10 @@ impl ChartData {
         }
     }
 
-    /// Y limits of the points inside an X range, from zero when all are
-    /// positive. Falls back to the full limits when nothing is visible.
+    /// Y limits of every series inside an X range.
     pub fn y_limits(&self, range: (f64, f64)) -> (f64, f64) {
-        let (mut lo, mut hi) = (f64::MAX, f64::MIN);
-        for s in &self.series {
-            let a = s.points.partition_point(|p| p.0 < range.0);
-            for &(x, y) in &s.points[a..] {
-                if x > range.1 {
-                    break;
-                }
-                lo = lo.min(y);
-                hi = hi.max(y);
-            }
-        }
-        if lo > hi {
-            return (self.y_min, self.y_max);
-        }
-        if lo > 0.0 {
-            lo = 0.0;
-        }
-        if hi <= lo {
-            hi = lo + 1.0;
-        }
-        (lo, hi)
+        let all: Vec<usize> = (0..self.series.len()).collect();
+        self.y_limits_of(range, &all)
     }
 }
 
@@ -362,6 +340,56 @@ fn clamp_range(mut r: (f64, f64), full: (f64, f64)) -> (f64, f64) {
     r
 }
 
+// ── ticks ───────────────────────────────────────────────────────────────────
+
+/// Round tick positions for a linear axis: about `n` steps of 1, 2, or 5
+/// times a power of ten, inside `[lo, hi]`.
+pub fn linear_ticks(lo: f64, hi: f64, n: usize) -> Vec<f64> {
+    if !(hi > lo) || n == 0 {
+        return vec![lo];
+    }
+    let raw = (hi - lo) / n as f64;
+    let mag = 10f64.powf(raw.log10().floor());
+    let step = [1.0, 2.0, 5.0, 10.0]
+        .iter()
+        .map(|m| m * mag)
+        .find(|s| *s >= raw)
+        .unwrap_or(10.0 * mag);
+    let mut v = Vec::new();
+    let mut t = (lo / step).ceil() * step;
+    while t <= hi + step * 1e-9 {
+        v.push(if t.abs() < step * 1e-9 { 0.0 } else { t });
+        t += step;
+    }
+    v
+}
+
+/// Tick positions for a log10 axis whose values are already log10: every
+/// decade inside the range, plus the 2 and 5 marks when three decades or
+/// fewer are visible.
+pub fn log_ticks(lo: f64, hi: f64) -> Vec<f64> {
+    if !(hi > lo) {
+        return vec![lo];
+    }
+    let fine = hi - lo <= 3.0;
+    let mut v = Vec::new();
+    let mut d = lo.floor() as i64;
+    while (d as f64) <= hi + 1e-9 {
+        let marks: &[f64] = if fine { &[1.0, 2.0, 5.0] } else { &[1.0] };
+        for m in marks {
+            let t = d as f64 + m.log10();
+            if t >= lo - 1e-9 && t <= hi + 1e-9 {
+                v.push(t);
+            }
+        }
+        d += 1;
+    }
+    if v.is_empty() {
+        v.push(lo);
+    }
+    v
+}
+
 // ── app state ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -388,11 +416,14 @@ pub struct CsvState {
     /// The zoomed X range in chart units; `None` is the full range. Reset
     /// when the chart data changes.
     pub view: Option<(f64, f64)>,
+    /// Series hidden from the legend. Reset when the chart data changes.
+    pub hidden: HashSet<String>,
     /// Mouse x in window px while over the chart.
     pub hover_x: Option<f32>,
     /// A pan in progress: mouse x at press and the view then.
     pub drag: Option<(f32, (f64, f64))>,
-    /// The chart canvas bounds from its last paint: x, y, w, h in window px.
+    /// The plot area of the canvas from its last paint: x, y, w, h in
+    /// window px, without the axis gutters.
     pub bounds: Arc<Mutex<Option<[f32; 4]>>>,
 }
 
@@ -427,6 +458,7 @@ impl JadeApp {
         if !same {
             self.csv.chart = build_chart(&table, &cfg).map(|d| (path, version, cfg, Arc::new(d)));
             self.csv.view = None;
+            self.csv.hidden.clear();
             self.csv.hover_x = None;
             self.csv.drag = None;
         }
@@ -480,19 +512,42 @@ impl JadeApp {
         self.csv.menu = None;
     }
 
+    /// Hide or show one series. Y refits to what is shown.
+    pub fn csv_toggle_series(&mut self, name: &str) {
+        if !self.csv.hidden.remove(name) {
+            self.csv.hidden.insert(name.to_string());
+        }
+    }
+
+    pub fn csv_show_all_series(&mut self) {
+        self.csv.hidden.clear();
+    }
+
+    /// The series currently shown, in chart order.
+    pub fn csv_visible_series(&self) -> Vec<usize> {
+        match &self.csv.chart {
+            Some((_, _, _, d)) => (0..d.series.len()).filter(|&i| !self.csv.hidden.contains(&d.series[i].name)).collect(),
+            None => Vec::new(),
+        }
+    }
+
     /// The chart's current X range.
     pub fn csv_view_range(&self) -> Option<(f64, f64)> {
         let d = &self.csv.chart.as_ref()?.3;
         Some(self.csv.view.unwrap_or_else(|| d.full_range()))
     }
 
-    /// Window px → chart x, using the last painted canvas bounds.
+    /// Y limits over the shown series inside the current X range.
+    pub fn csv_y_limits(&self) -> Option<(f64, f64)> {
+        let d = &self.csv.chart.as_ref()?.3;
+        Some(d.y_limits_of(self.csv_view_range()?, &self.csv_visible_series()))
+    }
+
+    /// Window px → chart x, using the last painted plot bounds.
     fn csv_x_at(&self, px_x: f32) -> Option<f64> {
         let b = (*self.csv.bounds.lock().ok()?)?;
         let range = self.csv_view_range()?;
-        let (pad_l, pad_r) = (6.0f32, 6.0f32);
-        let iw = (b[2] - pad_l - pad_r).max(1.0);
-        let t = ((px_x - b[0] - pad_l) / iw) as f64;
+        let t = ((px_x - b[0]) / b[2].max(1.0)) as f64;
         Some(range.0 + t * (range.1 - range.0))
     }
 
@@ -518,8 +573,7 @@ impl JadeApp {
         ) else {
             return;
         };
-        let iw = (b[2] - 12.0).max(1.0);
-        let delta = -((px_x - start_px) / iw) as f64 * (start_view.1 - start_view.0);
+        let delta = -((px_x - start_px) / b[2].max(1.0)) as f64 * (start_view.1 - start_view.0);
         let next = pan_range(start_view, full, delta);
         self.csv.view = (next != full).then_some(next);
     }
@@ -529,18 +583,49 @@ impl JadeApp {
     }
 
     /// Hover readout: chart x at the mouse, and the nearest point of every
-    /// series as `(name, x_shown, y)`, x back in the file's units.
-    pub fn csv_hover_points(&self) -> Option<(f64, Vec<(String, f64, f64)>)> {
+    /// shown series as `(series index, x_shown, y)`, x back in the file's
+    /// units.
+    pub fn csv_hover_points(&self) -> Option<(f64, Vec<(usize, f64, f64)>)> {
         let hx = self.csv.hover_x?;
         let x = self.csv_x_at(hx)?;
         let d = &self.csv.chart.as_ref()?.3;
         let show = |v: f64| if d.log_x { 10f64.powf(v) } else { v };
-        let pts = d
-            .series
-            .iter()
-            .filter_map(|s| s.nearest(x).map(|(px_, py)| (s.name.clone(), show(px_), py)))
+        let pts = self
+            .csv_visible_series()
+            .into_iter()
+            .filter_map(|i| d.series[i].nearest(x).map(|(px_, py)| (i, show(px_), py)))
             .collect();
         Some((show(x), pts))
+    }
+}
+
+impl ChartData {
+    /// Y limits of the listed series inside an X range, from zero when
+    /// all are positive. Falls back to the full limits when nothing is
+    /// visible.
+    pub fn y_limits_of(&self, range: (f64, f64), series: &[usize]) -> (f64, f64) {
+        let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+        for &i in series {
+            let s = &self.series[i];
+            let a = s.points.partition_point(|p| p.0 < range.0);
+            for &(x, y) in &s.points[a..] {
+                if x > range.1 {
+                    break;
+                }
+                lo = lo.min(y);
+                hi = hi.max(y);
+            }
+        }
+        if lo > hi {
+            return (self.y_min, self.y_max);
+        }
+        if lo > 0.0 {
+            lo = 0.0;
+        }
+        if hi <= lo {
+            hi = lo + 1.0;
+        }
+        (lo, hi)
     }
 }
 
@@ -548,6 +633,7 @@ impl JadeApp {
 
 /// The focused pane's chart view of its CSV tab.
 pub fn pane_body(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> AnyElement {
+    let t = &theme.kumo;
     let Some(tab) = app.editor.active_tab() else {
         return div().into_any_element();
     };
@@ -561,52 +647,40 @@ pub fn pane_body(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> Any
         .flex()
         .flex_col()
         .gap(scale::SPACE_2)
-        .px(scale::SPACE_4)
-        .py(scale::SPACE_3)
+        .p(scale::SPACE_3)
         .size_full()
-        .text_xs()
-        .font_family(crate::fonts::mono_family());
+        .min_h(px(0.))
+        .bg(t.canvas)
+        .text_size(scale::TEXT_XS)
+        .text_color(t.text_default)
+        .font_family(crate::fonts::ui_family());
 
     let (Some(table), Some(cfg)) = (table, cfg) else {
         return crate::panels::code_view::focus_shell(
             app,
             cx,
-            body.child(div().text_color(rgb(theme.muted)).child("no rows")).into_any_element(),
+            body.child(div().text_color(t.text_subtle).child("no rows")).into_any_element(),
         );
     };
 
-    let range = app.csv_view_range();
-    let ylim = chart.as_ref().zip(range).map(|(d, r)| d.y_limits(r));
+    body = body.child(toolbar(app, &table, &cfg, chart.as_deref(), theme, cx));
 
-    // Legend row: series on the left, the group and kind menus on the right.
-    body = body.child(legend_row(app, &table, &cfg, chart.as_deref(), theme, cx));
-
-    match (chart.clone(), range, ylim) {
+    match (chart, app.csv_view_range(), app.csv_y_limits()) {
         (Some(d), Some(range), Some(ylim)) => {
-            let zoomed = app.csv.view.is_some();
-            body = body
-                .child(chart_row(app, &table, &cfg, d.clone(), range, ylim, theme, cx))
-                .child(x_axis_row(app, &table, &cfg, &d, range, zoomed, theme, cx));
+            body = body.child(chart_card(app, &table, &cfg, d, range, ylim, theme, cx));
         }
         _ => {
             body = body.child(
-                div()
-                    .text_color(rgb(theme.muted))
-                    .child("pick numeric X and Y columns to draw a chart"),
+                kumo::Card::new(t)
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(t.text_subtle)
+                    .child("Pick numeric X and Y columns to draw a chart."),
             );
         }
     }
-
-    body = body.child(
-        div()
-            .text_color(rgb(theme.muted))
-            .text_size(px(10.))
-            .child(format!(
-                "{} rows · {} columns · wheel zooms, drag pans, double-click resets · ⌘⇧D for text",
-                table.rows.len(),
-                table.headers.len()
-            )),
-    );
 
     // A click anywhere else closes an open menu.
     if app.csv.menu.is_some() {
@@ -629,68 +703,62 @@ pub fn pane_body(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> Any
     crate::panels::code_view::focus_shell(app, cx, body.into_any_element())
 }
 
-/// A dropdown: the chip shows the value; open, a list hangs under it. The
-/// list is deferred so it paints over the chart.
+type Pick = Box<dyn Fn(&mut JadeApp)>;
+
+/// A dropdown: a Kumo outline button with the value and a chevron; open,
+/// an overlay list hangs under it. The list is deferred so it paints over
+/// the chart.
+#[allow(clippy::too_many_arguments)]
 fn dropdown(
     id: &'static str,
-    caption: &str,
+    caption: &'static str,
     value: String,
     open: bool,
-    options: Vec<(String, bool, Box<dyn Fn(&mut JadeApp)>)>,
-    on_open: CsvMenu,
+    options: Vec<(String, bool, Pick)>,
+    menu: CsvMenu,
     theme: &Theme,
     cx: &mut Context<JadeApp>,
 ) -> impl IntoElement {
-    let chip = div()
-        .id(id)
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(4.))
-        .h(px(20.))
-        .px(scale::SPACE_2)
-        .rounded(px(4.))
-        .bg(rgb(theme.panel))
-        .border_1()
-        .border_color(rgb(if open { theme.accent } else { theme.border }))
-        .cursor_pointer()
-        .hover(|s| s.bg(gpui::rgba(0x88888833)))
+    let t = &theme.kumo;
+    let button = kumo::Button::new(id, format!("{caption}  {value}"))
+        .size(kumo::Size::Xs)
+        .variant(kumo::ButtonVariant::Outline)
+        .icon_right("chevron-down")
+        .active(open)
+        .render(t)
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |a: &mut JadeApp, _e: &MouseDownEvent, _w, cx| {
                 cx.stop_propagation();
-                a.csv_toggle_menu(on_open);
+                a.csv_toggle_menu(menu);
                 cx.notify();
             }),
-        )
-        .child(div().text_color(rgb(theme.muted)).child(caption.to_string()))
-        .child(div().text_color(rgb(theme.text)).child(value))
-        .child(div().text_color(rgb(theme.muted)).child("▾"));
+        );
 
-    let mut wrap = div().relative().child(chip);
+    let mut wrap = div().relative().child(button);
     if open {
-        let mut list = div()
+        let mut list = kumo::Surface::overlay(t)
             .id(gpui::ElementId::Name(format!("{id}-menu").into()))
             .flex()
             .flex_col()
-            .min_w(px(160.))
-            .max_h(px(240.))
+            .min_w(px(180.))
+            .max_h(px(260.))
             .overflow_y_scroll()
-            .py(px(2.))
-            .rounded(px(4.))
-            .bg(rgb(theme.panel))
-            .border_1()
-            .border_color(rgb(theme.border));
+            .py(scale::SPACE_1);
         for (i, (label, selected, pick)) in options.into_iter().enumerate() {
             let pick = Arc::new(pick);
             list = list.child(
                 div()
                     .id(gpui::ElementId::Name(format!("{id}-opt-{i}").into()))
-                    .px(scale::SPACE_2)
-                    .py(px(3.))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(scale::SPACE_2)
+                    .h(scale::H_6_5)
+                    .px(scale::SPACE_2_5)
                     .cursor_pointer()
-                    .text_color(rgb(if selected { theme.accent } else { theme.text }))
-                    .hover(|s| s.bg(gpui::rgba(0x88888833)))
+                    .text_color(if selected { t.text_brand } else { t.text_default })
+                    .hover(|s| s.bg(t.fill_hover))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |a: &mut JadeApp, _e: &MouseDownEvent, _w, cx| {
@@ -699,11 +767,21 @@ fn dropdown(
                             cx.notify();
                         }),
                     )
-                    .child(format!("{}{label}", if selected { "• " } else { "  " })),
+                    .child(div().w(px(12.)).flex_none().child(if selected {
+                        crate::assets::ui_icon("check", 12., kumo::pack(t.text_brand)).into_any_element()
+                    } else {
+                        div().into_any_element()
+                    }))
+                    .child(label),
             );
         }
         wrap = wrap.child(deferred(
-            div().id(gpui::ElementId::Name(format!("{id}-list").into())).absolute().top(px(22.)).left_0().child(list),
+            div()
+                .id(gpui::ElementId::Name(format!("{id}-list").into()))
+                .absolute()
+                .top(px(24.))
+                .left_0()
+                .child(list),
         ));
     }
     wrap
@@ -714,7 +792,7 @@ fn column_options(
     current: usize,
     numeric_only: bool,
     pick: impl Fn(&mut JadeApp, usize) + Clone + 'static,
-) -> Vec<(String, bool, Box<dyn Fn(&mut JadeApp)>)> {
+) -> Vec<(String, bool, Pick)> {
     table
         .headers
         .iter()
@@ -722,12 +800,14 @@ fn column_options(
         .filter(|(c, _)| !numeric_only || table.is_numeric(*c))
         .map(|(c, h)| {
             let pick = pick.clone();
-            (h.clone(), c == current, Box::new(move |a: &mut JadeApp| pick(a, c)) as Box<dyn Fn(&mut JadeApp)>)
+            (h.clone(), c == current, Box::new(move |a: &mut JadeApp| pick(a, c)) as Pick)
         })
         .collect()
 }
 
-fn legend_row(
+/// Above the card: the series toggles on the left, the group and chart
+/// kind menus on the right.
+fn toolbar(
     app: &JadeApp,
     table: &CsvTable,
     cfg: &CsvConfig,
@@ -735,19 +815,59 @@ fn legend_row(
     theme: &Theme,
     cx: &mut Context<JadeApp>,
 ) -> impl IntoElement {
-    let mut legend = div().flex().flex_row().flex_wrap().items_center().gap(scale::SPACE_3).flex_1();
+    let t = &theme.kumo;
+    let mut legend = div().flex().flex_row().flex_wrap().items_center().gap(scale::SPACE_1).flex_1();
     if let Some(d) = chart {
+        let any_hidden = !app.csv.hidden.is_empty();
         for (i, s) in d.series.iter().enumerate() {
             let color = theme.series[i % theme.series.len()];
+            let shown = !app.csv.hidden.contains(&s.name);
             let name = if s.name.is_empty() { d.y_label.clone() } else { s.name.clone() };
+            let key = s.name.clone();
             legend = legend.child(
                 div()
+                    .id(gpui::ElementId::Name(format!("csv-series-{i}").into()))
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(4.))
-                    .child(div().w(px(8.)).h(px(8.)).rounded(px(2.)).bg(rgb(color)))
-                    .child(div().text_color(rgb(theme.text)).child(format!("{name} ({})", s.points.len()))),
+                    .gap(scale::SPACE_1_5)
+                    .h(scale::H_5)
+                    .px(scale::SPACE_2)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(t.fill_hover))
+                    .text_color(if shown { t.text_default } else { t.text_inactive })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |a: &mut JadeApp, _e: &MouseDownEvent, _w, cx| {
+                            a.csv_toggle_series(&key);
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .w(px(10.))
+                            .h(px(10.))
+                            .bg(rgb(color).alpha(if shown { 0.85 } else { 0.25 }))
+                            .border_1()
+                            .border_color(rgb(color).alpha(if shown { 1.0 } else { 0.4 })),
+                    )
+                    .child(name)
+                    .child(div().text_color(t.text_subtle).font_family(crate::fonts::mono_family()).child(format!("{}", s.points.len()))),
+            );
+        }
+        if any_hidden {
+            legend = legend.child(
+                kumo::Button::new("csv-show-all", "show all")
+                    .size(kumo::Size::Xs)
+                    .variant(kumo::ButtonVariant::Ghost)
+                    .render(t)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|a: &mut JadeApp, _e: &MouseDownEvent, _w, cx| {
+                            a.csv_show_all_series();
+                            cx.notify();
+                        }),
+                    ),
             );
         }
     }
@@ -756,15 +876,14 @@ fn legend_row(
         Some(g) => table.headers.get(g).cloned().unwrap_or_default(),
         None => "none".to_string(),
     };
-    let mut group_opts: Vec<(String, bool, Box<dyn Fn(&mut JadeApp)>)> =
+    let mut group_opts: Vec<(String, bool, Pick)> =
         vec![("none".to_string(), cfg.group.is_none(), Box::new(|a: &mut JadeApp| a.csv_pick_group(None)))];
     group_opts.extend(column_options(table, cfg.group.unwrap_or(usize::MAX), false, |a, c| a.csv_pick_group(Some(c))));
-
     let kind_value = match cfg.kind {
         ChartKind::Bars => "bars",
         ChartKind::Line => "line",
     };
-    let kind_opts: Vec<(String, bool, Box<dyn Fn(&mut JadeApp)>)> = vec![
+    let kind_opts: Vec<(String, bool, Pick)> = vec![
         ("bars".to_string(), cfg.kind == ChartKind::Bars, Box::new(|a: &mut JadeApp| a.csv_pick_kind(ChartKind::Bars))),
         ("line".to_string(), cfg.kind == ChartKind::Line, Box::new(|a: &mut JadeApp| a.csv_pick_kind(ChartKind::Line))),
     ];
@@ -775,14 +894,14 @@ fn legend_row(
         .items_center()
         .gap(scale::SPACE_2)
         .child(legend)
-        .child(dropdown("csv-group", "group", group_value, app.csv.menu == Some(CsvMenu::Group), group_opts, CsvMenu::Group, theme, cx))
-        .child(dropdown("csv-kind", "chart", kind_value.to_string(), app.csv.menu == Some(CsvMenu::Kind), kind_opts, CsvMenu::Kind, theme, cx))
+        .child(dropdown("csv-group", "Group", group_value, app.csv.menu == Some(CsvMenu::Group), group_opts, CsvMenu::Group, theme, cx))
+        .child(dropdown("csv-kind", "Chart", kind_value.to_string(), app.csv.menu == Some(CsvMenu::Kind), kind_opts, CsvMenu::Kind, theme, cx))
 }
 
-/// The Y gutter (max tick, the Y menu, min tick) beside the canvas, with
-/// the hover tooltip over the canvas.
+/// The plot card: a header with the Y menu, the plot canvas filling the
+/// rest, and a footer with the X menu, the scale menu, and the hint.
 #[allow(clippy::too_many_arguments)]
-fn chart_row(
+fn chart_card(
     app: &JadeApp,
     table: &CsvTable,
     cfg: &CsvConfig,
@@ -792,29 +911,101 @@ fn chart_row(
     theme: &Theme,
     cx: &mut Context<JadeApp>,
 ) -> impl IntoElement {
+    let t = &theme.kumo;
+    let zoomed = app.csv.view.is_some();
+
     let y_value = table.headers.get(cfg.y).cloned().unwrap_or_default();
     let y_opts = column_options(table, cfg.y, true, |a, c| a.csv_pick_y(c));
-    let gutter = div()
-        .w(px(Y_GUTTER_W))
-        .flex_none()
-        .h(px(CHART_H))
+    let header = div()
         .flex()
-        .flex_col()
+        .flex_row()
+        .items_center()
         .justify_between()
-        .items_end()
-        .pr(scale::SPACE_2)
-        .child(div().text_color(rgb(theme.muted)).child(format_num(ylim.1)))
+        .px(scale::SPACE_2_5)
+        .py(scale::SPACE_1_5)
+        .border_b_1()
+        .border_color(t.hairline)
         .child(dropdown("csv-y", "Y", y_value, app.csv.menu == Some(CsvMenu::Y), y_opts, CsvMenu::Y, theme, cx))
-        .child(div().text_color(rgb(theme.muted)).child(format_num(ylim.0)));
+        .child(
+            div()
+                .text_color(t.text_subtle)
+                .font_family(crate::fonts::mono_family())
+                .child(format!("{} rows · {} columns", table.rows.len(), table.headers.len())),
+        );
 
+    let x_value = table.headers.get(cfg.x).cloned().unwrap_or_default();
+    let x_opts = column_options(table, cfg.x, true, |a, c| a.csv_pick_x(c));
+    let scale_opts: Vec<(String, bool, Pick)> = vec![
+        ("linear".to_string(), !cfg.log_x, Box::new(|a: &mut JadeApp| a.csv_pick_log(false))),
+        ("log".to_string(), cfg.log_x, Box::new(|a: &mut JadeApp| a.csv_pick_log(true))),
+    ];
+    let mut footer_mid = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(scale::SPACE_2)
+        .child(dropdown("csv-x", "X", x_value, app.csv.menu == Some(CsvMenu::X), x_opts, CsvMenu::X, theme, cx))
+        .child(dropdown(
+            "csv-scale",
+            "Scale",
+            if cfg.log_x { "log" } else { "linear" }.to_string(),
+            app.csv.menu == Some(CsvMenu::Scale),
+            scale_opts,
+            CsvMenu::Scale,
+            theme,
+            cx,
+        ));
+    if zoomed {
+        footer_mid = footer_mid.child(
+            kumo::Button::new("csv-reset", "Reset zoom")
+                .size(kumo::Size::Xs)
+                .variant(kumo::ButtonVariant::Ghost)
+                .render(t)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|a: &mut JadeApp, _e: &MouseDownEvent, _w, cx| {
+                        a.csv_reset_view();
+                        cx.notify();
+                    }),
+                ),
+        );
+    }
+    let footer = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .px(scale::SPACE_2_5)
+        .py(scale::SPACE_1_5)
+        .border_t_1()
+        .border_color(t.hairline)
+        .child(div().w(px(120.)))
+        .child(footer_mid)
+        .child(
+            div()
+                .w(px(120.))
+                .flex()
+                .justify_end()
+                .text_color(t.text_subtle)
+                .child("wheel zooms · drag pans · ⌘⇧D text"),
+        );
+
+    // Ticks, in chart units.
+    let y_ticks = linear_ticks(ylim.0, ylim.1, 5);
+    let x_ticks = if d.log_x { log_ticks(range.0, range.1) } else { linear_ticks(range.0, range.1, 6) };
+    let log_x = d.log_x;
+    let show_x = move |v: f64| if log_x { format_num(10f64.powf(v)) } else { format_num(v) };
+    let x_labels: Vec<(f64, String)> = x_ticks.iter().map(|&v| (v, show_x(v))).collect();
+    let y_labels: Vec<(f64, String)> = y_ticks.iter().map(|&v| (v, format_num(v))).collect();
+
+    let visible = app.csv_visible_series();
     let bounds = app.csv.bounds.clone();
     let hover_x = app.csv.hover_x;
-    let mut canvas_box = div()
+    let mut plot = div()
         .id("csv-canvas")
         .relative()
         .flex_1()
-        .h(px(CHART_H))
-        .bg(rgb(theme.bg))
+        .min_h(px(120.))
         .cursor_crosshair()
         .on_mouse_move(cx.listener(|a: &mut JadeApp, e: &MouseMoveEvent, _w, cx| {
             let x = f32::from(e.position.x);
@@ -853,122 +1044,68 @@ fn chart_row(
                 cx.notify();
             }
         }))
-        .child(chart_canvas(d.clone(), range, ylim, hover_x, bounds, theme.series, rgb(theme.grid_line).alpha(theme.grid_alpha)));
+        .child(plot_canvas(PlotSpec {
+            data: d.clone(),
+            visible,
+            range,
+            ylim,
+            x_labels,
+            y_labels,
+            hover_x,
+            bounds,
+            palette: theme.series,
+            grid: t.hairline,
+            text: kumo::pack(t.text_subtle),
+        }));
 
     if let Some((x, pts)) = app.csv_hover_points() {
-        let b = app.csv.bounds.lock().ok().and_then(|b| *b);
-        let hx = app.csv.hover_x.unwrap_or(0.0);
-        let left = b.map(|b| hx - b[0]).unwrap_or(0.0);
-        let flip = b.is_some_and(|b| left > b[2] * 0.6);
-        let mut tip = div()
-            .absolute()
-            .top(px(8.))
-            .flex()
-            .flex_col()
-            .gap(px(1.))
-            .px(scale::SPACE_2)
-            .py(px(4.))
-            .rounded(px(4.))
-            .bg(rgb(theme.panel))
-            .border_1()
-            .border_color(rgb(theme.border))
-            .child(div().text_color(rgb(theme.muted)).child(format!("{} {}", d.x_label, format_num(x))));
-        for (i, (name, px_, py)) in pts.iter().enumerate() {
-            let color = theme.series[i % theme.series.len()];
-            let label = if name.is_empty() { d.y_label.clone() } else { name.clone() };
-            tip = tip.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(4.))
-                    .child(div().w(px(6.)).h(px(6.)).rounded(px(1.)).bg(rgb(color)))
-                    .child(div().text_color(rgb(theme.text)).child(format!("{label}: {} at {}", format_num(*py), format_num(*px_)))),
-            );
+        if !pts.is_empty() {
+            let b = app.csv.bounds.lock().ok().and_then(|b| *b);
+            let hx = app.csv.hover_x.unwrap_or(0.0);
+            // Tooltip left edge relative to the plot element, which starts
+            // one gutter left of the plot area.
+            let left = b.map(|b| hx - b[0] + Y_GUTTER_W).unwrap_or(0.0);
+            let flip = b.is_some_and(|b| hx - b[0] > b[2] * 0.6);
+            let mut tip = kumo::Surface::overlay(t)
+                .absolute()
+                .top(scale::SPACE_2)
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .px(scale::SPACE_2_5)
+                .py(scale::SPACE_1_5)
+                .font_family(crate::fonts::mono_family())
+                .child(div().text_color(t.text_subtle).child(format!("{} {}", d.x_label, format_num(x))));
+            for (i, px_, py) in &pts {
+                let color = theme.series[i % theme.series.len()];
+                let s = &d.series[*i];
+                let label = if s.name.is_empty() { d.y_label.clone() } else { s.name.clone() };
+                tip = tip.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(scale::SPACE_1_5)
+                        .child(div().w(px(8.)).h(px(8.)).bg(rgb(color)))
+                        .child(div().text_color(t.text_default).child(format!("{label}  {}", format_num(*py))))
+                        .child(div().text_color(t.text_subtle).child(format!("at {}", format_num(*px_)))),
+                );
+            }
+            let total_w = b.map(|b| b[2] + Y_GUTTER_W).unwrap_or(0.0);
+            tip = if flip { tip.right(px(total_w - left + 12.0)) } else { tip.left(px(left + 12.0)) };
+            plot = plot.child(deferred(tip));
         }
-        tip = if flip { tip.right(px(b.map(|b| b[2] - left + 10.0).unwrap_or(0.0))) } else { tip.left(px(left + 10.0)) };
-        canvas_box = canvas_box.child(deferred(tip));
     }
 
-    div().flex().flex_row().items_start().w_full().child(gutter).child(canvas_box)
-}
-
-/// Under the chart: the min tick, the X menu and scale menu, the max tick,
-/// and a reset chip while zoomed.
-#[allow(clippy::too_many_arguments)]
-fn x_axis_row(
-    app: &JadeApp,
-    table: &CsvTable,
-    cfg: &CsvConfig,
-    d: &ChartData,
-    range: (f64, f64),
-    zoomed: bool,
-    theme: &Theme,
-    cx: &mut Context<JadeApp>,
-) -> impl IntoElement {
-    let show = |v: f64| if d.log_x { format_num(10f64.powf(v)) } else { format_num(v) };
-    let x_value = table.headers.get(cfg.x).cloned().unwrap_or_default();
-    let x_opts = column_options(table, cfg.x, true, |a, c| a.csv_pick_x(c));
-    let scale_opts: Vec<(String, bool, Box<dyn Fn(&mut JadeApp)>)> = vec![
-        ("linear".to_string(), !cfg.log_x, Box::new(|a: &mut JadeApp| a.csv_pick_log(false))),
-        ("log".to_string(), cfg.log_x, Box::new(|a: &mut JadeApp| a.csv_pick_log(true))),
-    ];
-    let mut middle = div()
+    kumo::Card::new(t)
+        .flex_1()
+        .min_h(px(0.))
         .flex()
-        .flex_row()
-        .items_center()
-        .gap(scale::SPACE_2)
-        .child(dropdown("csv-x", "X", x_value, app.csv.menu == Some(CsvMenu::X), x_opts, CsvMenu::X, theme, cx))
-        .child(dropdown(
-            "csv-scale",
-            "scale",
-            if cfg.log_x { "log" } else { "linear" }.to_string(),
-            app.csv.menu == Some(CsvMenu::Scale),
-            scale_opts,
-            CsvMenu::Scale,
-            theme,
-            cx,
-        ));
-    if zoomed {
-        middle = middle.child(
-            div()
-                .id("csv-reset")
-                .px(scale::SPACE_2)
-                .h(px(20.))
-                .flex()
-                .items_center()
-                .rounded(px(4.))
-                .border_1()
-                .border_color(rgb(theme.accent))
-                .text_color(rgb(theme.accent))
-                .cursor_pointer()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|a: &mut JadeApp, _e: &MouseDownEvent, _w, cx| {
-                        a.csv_reset_view();
-                        cx.notify();
-                    }),
-                )
-                .child("reset zoom"),
-        );
-    }
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .w_full()
-        .child(div().w(px(Y_GUTTER_W)).flex_none())
-        .child(
-            div()
-                .flex_1()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .child(div().text_color(rgb(theme.muted)).child(show(range.0)))
-                .child(middle)
-                .child(div().text_color(rgb(theme.muted)).child(show(range.1))),
-        )
+        .flex_col()
+        .overflow_hidden()
+        .child(header)
+        .child(plot)
+        .child(footer)
 }
 
 pub fn format_num(v: f64) -> String {
@@ -986,54 +1123,103 @@ pub fn format_num(v: f64) -> String {
     }
 }
 
-/// The chart: grid, then one stroked polyline or one row of quads per
-/// series inside the X range, then the hover crosshair. Bars of several
-/// series interleave at each x so a histogram per series stays readable.
-/// The paint records its bounds so mouse positions map back to data.
-#[allow(clippy::too_many_arguments)]
-fn chart_canvas(
-    d: Arc<ChartData>,
+/// Everything one paint of the plot needs.
+struct PlotSpec {
+    data: Arc<ChartData>,
+    visible: Vec<usize>,
     range: (f64, f64),
     ylim: (f64, f64),
+    x_labels: Vec<(f64, String)>,
+    y_labels: Vec<(f64, String)>,
     hover_x: Option<f32>,
-    bounds_out: Arc<Mutex<Option<[f32; 4]>>>,
+    bounds: Arc<Mutex<Option<[f32; 4]>>>,
     palette: [u32; 5],
     grid: gpui::Rgba,
-) -> impl IntoElement {
+    text: u32,
+}
+
+const Y_GUTTER_W: f32 = 56.0;
+const X_GUTTER_H: f32 = 20.0;
+const TICK_FONT: f32 = 11.0;
+
+/// The plot: a left gutter with the Y tick labels, a bottom gutter with
+/// the X tick labels, grid lines at the ticks, then the series. Bars span
+/// from each x to the next in the same series, as a histogram's buckets
+/// do, and are translucent so overlapping series both show. Lines are
+/// one stroked path per series. The hover crosshair comes last. The paint
+/// records the plot area so mouse positions map back to data.
+fn plot_canvas(spec: PlotSpec) -> impl IntoElement {
     canvas(
         move |_, _, _| {},
-        move |bounds: Bounds<Pixels>, _, window: &mut gpui::Window, _| {
-            let (ox, oy) = (f32::from(bounds.origin.x), f32::from(bounds.origin.y));
-            let (w, h) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
-            if w <= 0.0 || h <= 0.0 {
+        move |bounds: Bounds<Pixels>, _, window: &mut gpui::Window, cx: &mut gpui::App| {
+            let (bx, by) = (f32::from(bounds.origin.x), f32::from(bounds.origin.y));
+            let (bw, bh) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+            let (ox, oy) = (bx + Y_GUTTER_W, by + 6.0);
+            let (w, h) = (bw - Y_GUTTER_W - 8.0, bh - X_GUTTER_H - 6.0);
+            if w <= 4.0 || h <= 4.0 {
                 return;
             }
-            if let Ok(mut b) = bounds_out.lock() {
+            if let Ok(mut b) = spec.bounds.lock() {
                 *b = Some([ox, oy, w, h]);
             }
-            for i in 0..5 {
-                let y = oy + (h / 5.0) * i as f32;
-                window.paint_quad(fill(Bounds { origin: point(px(ox), px(y)), size: size(px(w), px(1.)) }, grid));
-            }
-            let (pad_l, pad_r, pad_t, pad_b) = (6.0f32, 6.0f32, 8.0f32, 4.0f32);
+            let d = &spec.data;
+            let (range, ylim) = (spec.range, spec.ylim);
             let xr = (range.1 - range.0).abs().max(1e-12);
             let yr = (ylim.1 - ylim.0).abs().max(1e-12);
-            let iw = (w - pad_l - pad_r).max(1.0);
-            let ih = (h - pad_t - pad_b).max(1.0);
-            let map_x = |x: f64| ox + pad_l + ((x - range.0) / xr) as f32 * iw;
-            let map_y = |y: f64| oy + pad_t + ih - ((y - ylim.0) / yr) as f32 * ih;
+            let map_x = |x: f64| ox + ((x - range.0) / xr) as f32 * w;
+            let map_y = |y: f64| oy + h - ((y - ylim.0) / yr) as f32 * h;
+
+            // Text runs for the tick labels, in the mono face.
+            let mut font = window.text_style().font();
+            font.family = crate::fonts::mono_family().into();
+            let text_color: gpui::Hsla = rgb(spec.text).into();
+            let run = |len: usize| gpui::TextRun {
+                len,
+                font: font.clone(),
+                color: text_color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            let line_h = px(TICK_FONT + 3.0);
+            let paint_label = |window: &mut gpui::Window, cx: &mut gpui::App, text: &str, x: f32, y: f32, right_align: bool| {
+                let shaped = window.text_system().shape_line(text.to_string().into(), px(TICK_FONT), &[run(text.len())], None);
+                let lw = f32::from(shaped.width);
+                let x0 = if right_align { x - lw } else { x - lw / 2.0 };
+                let _ = shaped.paint(point(px(x0), px(y)), line_h, gpui::TextAlign::Left, None, window, cx);
+            };
+
+            // Grid and Y labels.
+            for (v, label) in &spec.y_labels {
+                let y = map_y(*v);
+                if y < oy - 1.0 || y > oy + h + 1.0 {
+                    continue;
+                }
+                window.paint_quad(fill(Bounds { origin: point(px(ox), px(y)), size: size(px(w), px(1.)) }, spec.grid));
+                paint_label(window, cx, label, ox - 8.0, y - f32::from(line_h) / 2.0, true);
+            }
+            // X ticks and labels.
+            for (v, label) in &spec.x_labels {
+                let x = map_x(*v);
+                if x < ox - 1.0 || x > ox + w + 1.0 {
+                    continue;
+                }
+                window.paint_quad(fill(Bounds { origin: point(px(x), px(oy)), size: size(px(1.), px(h)) }, spec.grid.alpha(0.5)));
+                paint_label(window, cx, label, x, oy + h + 4.0, false);
+            }
+            // Axes.
+            window.paint_quad(fill(Bounds { origin: point(px(ox), px(oy + h)), size: size(px(w), px(1.)) }, spec.grid.alpha(1.0)));
+            window.paint_quad(fill(Bounds { origin: point(px(ox), px(oy)), size: size(px(1.), px(h)) }, spec.grid.alpha(1.0)));
+
             let base_y = map_y(ylim.0.max(0.0).min(ylim.1));
-            let n_series = d.series.len().max(1) as f32;
-            // A margin of one slot keeps edge bars and line segments drawn.
             let margin = xr * 0.02;
-            for (si, s) in d.series.iter().enumerate() {
-                let color = rgb(palette[si % palette.len()]);
+            for &si in &spec.visible {
+                let s = &d.series[si];
+                let color = rgb(spec.palette[si % spec.palette.len()]);
                 let a = s.points.partition_point(|p| p.0 < range.0 - margin);
                 let b = s.points.partition_point(|p| p.0 <= range.1 + margin);
-                let visible = &s.points[a..b];
                 match d.kind {
                     ChartKind::Line => {
-                        // Include one point either side so the line enters and leaves.
                         let a2 = a.saturating_sub(1);
                         let b2 = (b + 1).min(s.points.len());
                         let seg = &s.points[a2..b2];
@@ -1041,41 +1227,50 @@ fn chart_canvas(
                             continue;
                         }
                         let mut pb = PathBuilder::stroke(px(1.5));
-                        pb.move_to(point(px(map_x(seg[0].0)), px(map_y(seg[0].1))));
+                        pb.move_to(point(px(map_x(seg[0].0).clamp(ox, ox + w)), px(map_y(seg[0].1))));
                         for &(x, y) in &seg[1..] {
-                            pb.line_to(point(px(map_x(x)), px(map_y(y))));
+                            pb.line_to(point(px(map_x(x).clamp(ox, ox + w)), px(map_y(y))));
                         }
                         if let Ok(path) = pb.build() {
                             window.paint_path(path, color);
                         }
                     }
                     ChartKind::Bars => {
-                        let mut gaps: Vec<f32> = visible
-                            .windows(2)
-                            .map(|p| map_x(p[1].0) - map_x(p[0].0))
-                            .filter(|g| *g > 0.0)
-                            .collect();
-                        gaps.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                        let slot = gaps.get(gaps.len() / 2).copied().unwrap_or(iw / 20.0).min(iw / 4.0);
-                        let bw = (slot / n_series * 0.85).max(1.0);
-                        for &(x, y) in visible {
-                            let cx = map_x(x) - slot / 2.0 + bw * si as f32 + bw / 2.0;
+                        // Each bar spans to the next point of its series; the
+                        // last reuses the previous width.
+                        let n = s.points.len();
+                        let mut last_w = 0.0f32;
+                        for k in a..b {
+                            let (x, y) = s.points[k];
+                            let x0 = map_x(x);
+                            let x1 = if k + 1 < n { map_x(s.points[k + 1].0) } else { x0 + last_w };
+                            let bw = (x1 - x0).max(1.0);
+                            last_w = bw;
+                            let left = x0.max(ox);
+                            let right = (x0 + bw - 1.0).min(ox + w);
+                            if right <= left {
+                                continue;
+                            }
                             let top = map_y(y);
                             let (y0, y1) = if top < base_y { (top, base_y) } else { (base_y, top) };
                             let hgt = (y1 - y0).max(1.0);
                             window.paint_quad(fill(
-                                Bounds { origin: point(px(cx - bw / 2.0), px(y0)), size: size(px(bw), px(hgt)) },
+                                Bounds { origin: point(px(left), px(y0)), size: size(px(right - left), px(hgt)) },
+                                color.alpha(0.55),
+                            ));
+                            window.paint_quad(fill(
+                                Bounds { origin: point(px(left), px(y0)), size: size(px(right - left), px(1.)) },
                                 color,
                             ));
                         }
                     }
                 }
             }
-            if let Some(hx) = hover_x {
+            if let Some(hx) = spec.hover_x {
                 if hx >= ox && hx <= ox + w {
                     window.paint_quad(fill(
                         Bounds { origin: point(px(hx), px(oy)), size: size(px(1.), px(h)) },
-                        grid.alpha(0.9),
+                        rgb(spec.text).alpha(0.6),
                     ));
                 }
             }
@@ -1192,6 +1387,35 @@ mod tests {
         assert_eq!(pan_range(z, full, 10.0), (35.0, 85.0));
         assert_eq!(pan_range(z, full, 90.0), (50.0, 100.0), "panning stops at the edge");
         assert_eq!(pan_range(z, full, -90.0), (0.0, 50.0));
+    }
+
+    #[test]
+    fn ticks_are_round_and_inside_the_range() {
+        assert_eq!(linear_ticks(0.0, 24300.0, 5), vec![0.0, 5000.0, 10000.0, 15000.0, 20000.0]);
+        assert_eq!(linear_ticks(0.3, 2.2, 5), vec![0.5, 1.0, 1.5, 2.0]);
+        assert_eq!(linear_ticks(5.0, 5.0, 5), vec![5.0]);
+        // log10 of 40 ns to 4.19 ms: decades only, over three of them.
+        let t = log_ticks(40f64.log10(), 4.19e6f64.log10());
+        assert_eq!(t.len(), 5, "{t:?}");
+        assert!((t[0] - 2.0).abs() < 1e-9 && (t[4] - 6.0).abs() < 1e-9);
+        // Under three decades: the 2 and 5 marks come in.
+        let f = log_ticks(2.0, 3.0);
+        assert_eq!(f.len(), 4, "{f:?}"); // 100, 200, 500, 1000
+    }
+
+    #[test]
+    fn hidden_series_leave_the_y_fit() {
+        let d = ChartData {
+            series: vec![
+                SeriesData { name: "big".into(), points: vec![(1.0, 1000.0)] },
+                SeriesData { name: "small".into(), points: vec![(1.0, 10.0)] },
+            ],
+            x_min: 1.0, x_max: 1.0, y_min: 0.0, y_max: 1000.0,
+            x_label: "x".into(), y_label: "y".into(), log_x: false, kind: ChartKind::Bars, rows: 2,
+        };
+        assert_eq!(d.y_limits_of((0.0, 2.0), &[0, 1]), (0.0, 1000.0));
+        assert_eq!(d.y_limits_of((0.0, 2.0), &[1]), (0.0, 10.0), "only the shown series sets the scale");
+        assert_eq!(d.y_limits_of((0.0, 2.0), &[]), (0.0, 1000.0), "nothing shown falls back");
     }
 
     #[test]
