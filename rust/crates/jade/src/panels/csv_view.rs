@@ -1131,6 +1131,26 @@ pub fn format_num(v: f64) -> String {
     }
 }
 
+/// Bar widths in px for bucket edges at `xs` (sorted, px): each bar spans
+/// to the next edge, the last reuses the previous width, and a lone point
+/// gets `default_w` centered on itself. Nothing narrower than 2 px, so a
+/// bar never vanishes.
+pub fn bar_widths(xs: &[f32], default_w: f32) -> Vec<f32> {
+    let n = xs.len();
+    let mut out = Vec::with_capacity(n);
+    for k in 0..n {
+        let w = if k + 1 < n {
+            xs[k + 1] - xs[k]
+        } else if n >= 2 {
+            xs[n - 1] - xs[n - 2]
+        } else {
+            default_w
+        };
+        out.push(w.max(2.0));
+    }
+    out
+}
+
 /// Everything one paint of the plot needs.
 struct PlotSpec {
     data: Arc<ChartData>,
@@ -1244,18 +1264,16 @@ fn plot_canvas(spec: PlotSpec) -> impl IntoElement {
                         }
                     }
                     ChartKind::Bars => {
-                        // Each bar spans to the next point of its series; the
-                        // last reuses the previous width.
-                        let n = s.points.len();
-                        let mut last_w = 0.0f32;
-                        for k in a..b {
-                            let (x, y) = s.points[k];
-                            let x0 = map_x(x);
-                            let x1 = if k + 1 < n { map_x(s.points[k + 1].0) } else { x0 + last_w };
-                            let bw = (x1 - x0).max(1.0);
-                            last_w = bw;
+                        // Each bar spans to the next point of its series; see
+                        // `bar_widths` for the last bar and single points.
+                        let xs: Vec<f32> = s.points[a..b].iter().map(|p| map_x(p.0)).collect();
+                        let widths = bar_widths(&xs, w * 0.03);
+                        for (k, &bw) in widths.iter().enumerate() {
+                            let (_, y) = s.points[a + k];
+                            let x0 = if xs.len() == 1 { xs[0] - bw / 2.0 } else { xs[k] };
+                            let gap = if bw > 3.0 { 1.0 } else { 0.0 };
                             let left = x0.max(ox);
-                            let right = (x0 + bw - 1.0).min(ox + w);
+                            let right = (x0 + bw - gap).min(ox + w);
                             if right <= left {
                                 continue;
                             }
@@ -1425,6 +1443,14 @@ mod tests {
         assert_eq!(d.y_limits_of((0.0, 2.0), &[0, 1]), (0.0, 1000.0));
         assert_eq!(d.y_limits_of((0.0, 2.0), &[1]), (0.0, 10.0), "only the shown series sets the scale");
         assert_eq!(d.y_limits_of((0.0, 2.0), &[]), (0.0, 1000.0), "nothing shown falls back");
+    }
+
+    #[test]
+    fn bar_widths_never_vanish() {
+        assert_eq!(bar_widths(&[10.0, 20.0, 35.0], 30.0), vec![10.0, 15.0, 15.0], "last reuses the previous width");
+        assert_eq!(bar_widths(&[10.0], 30.0), vec![30.0], "a lone point gets the default");
+        assert_eq!(bar_widths(&[10.0, 10.5], 30.0), vec![2.0, 2.0], "a hairline gap still draws");
+        assert!(bar_widths(&[], 30.0).is_empty());
     }
 
     #[test]
