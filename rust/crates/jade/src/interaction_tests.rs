@@ -4704,9 +4704,11 @@ async fn csv_tab_toggles_chart_and_cycles_columns(cx: &mut TestAppContext) {
 
     app.update_in(cx, |app, _w, cx| {
         app.open_file(csv.clone());
-        assert!(!app.csv_chart_active(), "text first");
+        assert!(app.csv_chart_active(), "a CSV tab opens as its chart");
         app.toggle_md_preview(cx);
-        assert!(app.csv_chart_active(), "⌘⇧D on a CSV tab shows the chart");
+        assert!(!app.csv_chart_active(), "⌘⇧D shows the text");
+        app.toggle_md_preview(cx);
+        assert!(app.csv_chart_active(), "and back to the chart");
         cx.notify();
     });
     cx.run_until_parked();

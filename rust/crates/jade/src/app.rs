@@ -1176,7 +1176,11 @@ impl JadeApp {
                 ui.counter_events.clone()
             }),
             counters_focus: None,
-            csv: crate::panels::csv_view::CsvState::default(),
+            // The chart is the first view of a CSV tab; ⌘⇧D shows the text.
+            csv: crate::panels::csv_view::CsvState {
+                visible: true,
+                ..Default::default()
+            },
             diag_anchor: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             term_origin: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             bottom_height: 220.,
@@ -9980,9 +9984,15 @@ fn center_content(app: &JadeApp, cx: &mut Context<JadeApp>, theme: &Theme) -> im
 
     let asm_on = app.asm_visible && app.mode == AppMode::Software;
     if !app.split_mode() {
+        // A CSV tab shows its chart in place of the text (⌘⇧D swaps).
+        let body = if app.csv_chart_active() {
+            crate::panels::csv_view::pane_body(app, cx, theme)
+        } else {
+            code_view::render(app, cx).into_any_element()
+        };
         let mut center = base
             .child(code_view::pane_strip(app, 0, cx, theme))
-            .child(code_view::render(app, cx));
+            .child(body);
         // §6 ASM viewer: right-half overlay over the editor when toggled on.
         // Software mode only — there is no clang ASM for Verilog.
         if asm_on {

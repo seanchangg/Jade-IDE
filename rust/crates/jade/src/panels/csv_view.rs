@@ -1,6 +1,7 @@
 //! CSV visualizer: a chart view of the active CSV tab with column controls.
 //!
-//! ⌘⇧D on a `.csv` or `.tsv` tab swaps the text for a chart. A control row
+//! A `.csv` or `.tsv` tab opens as a chart; ⌘⇧D swaps to the text and back.
+//! The single-pane mount and the split-pane body both route here. A control row
 //! picks the X column, the Y column, an optional group column that splits
 //! the rows into series, bars or lines, and a log X axis. Every control is
 //! a chip that cycles on click, so there is no text input to focus.
