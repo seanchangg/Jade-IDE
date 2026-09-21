@@ -1476,6 +1476,19 @@ impl JadeApp {
                 }
                 // Quick Open's cached file list is now stale (§5.7).
                 self.file_cache = None;
+                // Clean tabs follow the disk, so a CSV a benchmark just
+                // rewrote shows its new rows without a reopen.
+                let reloaded = self.editor.reload_clean_from_disk();
+                if !reloaded.is_empty() {
+                    self.active_file = self.editor.active_path();
+                    // A reloaded buffer restarts its version count, so the
+                    // CSV caches keyed on it must go too.
+                    if self.csv.table.as_ref().is_some_and(|(p, _, _)| reloaded.contains(p)) {
+                        self.csv.table = None;
+                        self.csv.chart = None;
+                    }
+                    self.status_line(&format!("[jade] Reloaded {} changed file(s) from disk", reloaded.len()));
+                }
             }
             AppEvent::LspReady { handle, sync_kind } => self.on_lsp_ready(handle, sync_kind),
             AppEvent::Lsp(ev) => self.on_lsp_event(ev),

@@ -378,6 +378,31 @@ pub struct EditorState {
 }
 
 impl EditorState {
+    /// Reload every clean tab whose file changed on disk (a benchmark
+    /// rewrote its CSV, a formatter touched a source). A dirty tab keeps
+    /// its edits. The reloaded tab keeps its scroll position, preview
+    /// state, and language-server registration. Returns the reloaded paths.
+    pub fn reload_clean_from_disk(&mut self) -> Vec<PathBuf> {
+        let mut reloaded = Vec::new();
+        for tab in &mut self.tabs {
+            if tab.buffer.is_dirty() {
+                continue;
+            }
+            let Ok(raw) = std::fs::read(&tab.path) else { continue };
+            let text = String::from_utf8_lossy(&raw).into_owned();
+            if text == tab.buffer.to_string() {
+                continue;
+            }
+            let mut fresh = OpenTab::from_text(&tab.path, &text, self.palette);
+            fresh.lsp_opened = tab.lsp_opened;
+            fresh.preview = tab.preview;
+            fresh.scroll_top = tab.scroll_top;
+            reloaded.push(tab.path.clone());
+            *tab = fresh;
+        }
+        reloaded
+    }
+
     pub fn new(palette: TokenPalette) -> Self {
         EditorState {
             tabs: Vec::new(),

@@ -4770,3 +4770,47 @@ async fn csv_tab_toggles_chart_and_cycles_columns(cx: &mut TestAppContext) {
     cx.run_until_parked();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A clean CSV tab follows the file on disk: when a benchmark rewrites it,
+/// the tree-changed event reloads the buffer and the chart reparses. A
+/// dirty tab keeps its edits.
+#[gpui::test]
+async fn clean_tabs_reload_when_the_file_changes_on_disk(cx: &mut TestAppContext) {
+    use crate::app::AppEvent;
+
+    let (dir, src) = test_workspace();
+    let csv = dir.join("latency.csv");
+    std::fs::write(&csv, "name,lower_ns,count\nwarm,40,2000\n").unwrap();
+    let (deps, app_rx) = test_deps(dir.clone());
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(csv.clone());
+        cx.notify();
+    });
+    cx.run_until_parked();
+    app.update_in(cx, |app, _w, _cx| {
+        assert_eq!(app.csv.chart.as_ref().unwrap().3.series[0].sum_y, 2000.0);
+    });
+
+    // The benchmark ran again and appended a bigger series.
+    std::fs::write(&csv, "name,lower_ns,count\nwarm,40,10000\n").unwrap();
+    app.update_in(cx, |app, _w, cx| {
+        app.apply_app_event(AppEvent::TreeChanged);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    app.update_in(cx, |app, _w, cx| {
+        assert_eq!(app.csv.chart.as_ref().unwrap().3.series[0].sum_y, 10000.0, "the chart follows the disk");
+
+        // A dirty tab is left alone.
+        app.open_file(src.clone());
+        app.editor.active_tab_mut().unwrap().buffer.edit(0..0, "// edit\n");
+        assert!(app.editor.active_tab().unwrap().buffer.is_dirty());
+        std::fs::write(&src, "int changed;\n").unwrap();
+        app.apply_app_event(AppEvent::TreeChanged);
+        assert!(app.editor.active_tab().unwrap().buffer.to_string().starts_with("// edit"), "edits survive");
+        cx.notify();
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
