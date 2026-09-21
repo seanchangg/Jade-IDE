@@ -40,6 +40,19 @@ pub(crate) struct Label {
     color: u32,
 }
 
+impl Series {
+    /// A series for another panel's chart (the trace popup).
+    pub(crate) fn new(color: Rgba, width: f32, fill: bool, values: Vec<f32>, min: f32, max: f32) -> Self {
+        Self { color, width, fill, values, min, max }
+    }
+}
+
+impl Label {
+    pub(crate) fn new(text: String, color: u32) -> Self {
+        Self { text, color }
+    }
+}
+
 pub fn render(app: &JadeApp, cx: &mut Context<JadeApp>) -> impl IntoElement {
     let theme = &app.theme;
     let grid = rgb(theme.grid_line).alpha(theme.grid_alpha);
@@ -406,7 +419,7 @@ fn chart_box_sized(
     card.child(chart_canvas(series, grid)).child(overlay)
 }
 
-fn chart_box(
+pub(crate) fn chart_box(
     theme: &Theme,
     series: Vec<Series>,
     labels: Vec<Label>,

@@ -5,6 +5,7 @@ use gpui::{div, prelude::*, px, rgb, Div};
 
 pub mod asm_view;
 pub mod code_view;
+pub mod csv_view;
 pub mod debug_panel;
 pub mod explain_card;
 pub mod explain_popout;

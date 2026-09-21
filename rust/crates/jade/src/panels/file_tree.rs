@@ -105,10 +105,14 @@ fn tree_row(
     }
 
     let is_dir = row.is_dir;
+    let is_trace = is_dir && crate::trace::is_trace_bundle(&row.path);
     el.on_click(cx.listener(move |app, _ev, _win, cx| {
         // Every click sets the selection, so the next terminal opens here.
         app.select_tree_path(path.clone());
-        if is_dir {
+        if is_trace {
+            // An Instruments bundle opens its analysis popup, not its insides.
+            app.open_trace(path.clone());
+        } else if is_dir {
             app.toggle_dir(path.clone());
         } else {
             app.open_file(path.clone());

@@ -54,6 +54,10 @@ pub struct WorkspaceUi {
     pub breakpoints: HashMap<String, Vec<u32>>,
     #[serde(default)]
     pub benchmarks: Vec<Benchmark>,
+    /// CPU counter events chosen in the RUNTIME panel's COUNTERS section.
+    /// Empty means the defaults.
+    #[serde(default)]
+    pub counter_events: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_completion_enabled: Option<bool>,
     /// Timer bundles (synthetic summed series, e.g. "Forward") — the member
@@ -124,6 +128,7 @@ const OWNED_KEYS: &[&str] = &[
     "terminalHeight",
     "breakpoints",
     "benchmarks",
+    "counterEvents",
     "aiCompletionEnabled",
     "timerGroups",
     "mode",
@@ -217,6 +222,7 @@ mod tests {
     fn roundtrip_full_state() {
         let path = tmp("rt");
         let ui = WorkspaceUi {
+            counter_events: Vec::new(),
             open_tabs: vec![
                 TabState { path: "/p/a.cpp".into(), is_dirty: false },
                 TabState { path: "/p/b.cpp".into(), is_dirty: true },

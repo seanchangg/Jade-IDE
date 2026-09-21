@@ -4586,3 +4586,168 @@ async fn enter_prefers_stub_while_ghost_is_up(cx: &mut TestAppContext) {
     });
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Clicking a `.trace` bundle opens the RUNTIME sidebar with a TRACE section
+/// that waits for the export; the export result lands only for the newest
+/// generation; the × clears it.
+#[gpui::test]
+async fn trace_bundle_opens_runtime_trace_section(cx: &mut TestAppContext) {
+    use crate::app::AppEvent;
+    use crate::trace::{TraceAnalysis, TraceKind};
+    use std::sync::Arc;
+
+    let (dir, _file) = test_workspace();
+    let bundle = dir.join("ob.trace");
+    std::fs::create_dir_all(&bundle).unwrap();
+    let (deps, app_rx) = test_deps(dir);
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+
+    app.update_in(cx, |app, _w, cx| {
+        assert!(!app.runtime_visible);
+        app.open_file(bundle.clone()); // the tree and Quick Open both land here
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    app.update_in(cx, |app, _w, cx| {
+        assert!(app.runtime_visible, "the sidebar opens so the section is visible");
+        let state = app.trace.as_ref().expect("a TRACE section is pending");
+        assert_eq!(state.path, bundle);
+        assert!(state.result.is_none(), "still exporting");
+        assert!(app.editor.active_tab().is_none(), "a bundle never becomes a buffer");
+
+        let stale = app.trace_gen - 1;
+        app.apply_app_event(AppEvent::Trace {
+            generation: stale,
+            result: Err("old".into()),
+        });
+        assert!(app.trace.as_ref().unwrap().result.is_none(), "stale generations drop");
+
+        let analysis = TraceAnalysis {
+            path: bundle.clone(),
+            template: Some("CPU Counters".into()),
+            instruments: vec![],
+            kind: TraceKind::Other,
+        };
+        app.apply_app_event(AppEvent::Trace {
+            generation: app.trace_gen,
+            result: Ok(Arc::new(analysis)),
+        });
+        let got = app.trace.as_ref().unwrap().result.as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(got.describe(), "CPU Counters");
+
+        app.clear_trace();
+        assert!(app.trace.is_none());
+        cx.notify();
+    });
+    cx.run_until_parked();
+}
+
+/// The COUNTERS picker: typing a mnemonic and Enter adds it, × removes it,
+/// the set persists in the workspace `ui` blob, and the copy command names
+/// the workspace trace path.
+#[gpui::test]
+async fn counters_picker_adds_removes_and_persists(cx: &mut TestAppContext) {
+    use gpui::Keystroke;
+
+    let (dir, _file) = test_workspace();
+    let (deps, app_rx) = test_deps(dir.clone());
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+
+    app.update_in(cx, |app, _w, cx| {
+        assert_eq!(app.counters.events.len(), 8, "the defaults fill the set");
+        app.counters_remove("INST_BRANCH");
+        app.counters_remove("BRANCH_MISPRED_NONSPEC");
+        assert_eq!(app.counters.events.len(), 6);
+
+        app.counters.editing = true;
+        for ch in "inst_branch".chars() {
+            let mut ks = Keystroke::parse(&ch.to_string()).unwrap();
+            ks.key_char = Some(ch.to_string());
+            assert!(app.counters_key(&ks));
+        }
+        assert_eq!(app.counters.query, "inst_branch");
+        assert!(app.counters_key(&Keystroke::parse("enter").unwrap()));
+        assert!(app.counters.events.iter().any(|e| e == "INST_BRANCH"), "{:?}", app.counters.events);
+        assert!(app.counters.query.is_empty());
+
+        let cmd = app.counters_command();
+        assert!(cmd.starts_with("xcrun xctrace record --template "));
+        assert!(cmd.contains("run.trace"), "no build yet: {cmd}");
+        assert!(cmd.ends_with("-- <program>"));
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    let ui = crate::workspace_state::load(&dir);
+    assert_eq!(ui.counter_events.len(), 7);
+    assert!(ui.counter_events.contains(&"INST_BRANCH".to_string()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A CSV tab: ⌘⇧D swaps the text for the chart, the render-time prepare
+/// parses once per buffer version and rebuilds the chart only when the
+/// configuration changes, and the chips cycle the columns.
+#[gpui::test]
+async fn csv_tab_toggles_chart_and_cycles_columns(cx: &mut TestAppContext) {
+    use crate::panels::csv_view::ChartKind;
+
+    let (dir, _file) = test_workspace();
+    let csv = dir.join("latency.csv");
+    std::fs::write(
+        &csv,
+        "name,lower_ns,upper_ns,count\napply warm,40,43,685\napply warm,80,87,2651\napply cold,960,1023,400\n",
+    )
+    .unwrap();
+    let (deps, app_rx) = test_deps(dir.clone());
+    let (app, cx) = cx.add_window_view(|_window, cx| JadeApp::new(cx, deps, app_rx));
+
+    app.update_in(cx, |app, _w, cx| {
+        app.open_file(csv.clone());
+        assert!(!app.csv_chart_active(), "text first");
+        app.toggle_md_preview(cx);
+        assert!(app.csv_chart_active(), "⌘⇧D on a CSV tab shows the chart");
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    app.update_in(cx, |app, _w, cx| {
+        let (_, v1, table) = app.csv.table.clone().expect("parsed at render");
+        assert_eq!(table.headers.len(), 4);
+        let (_, _, cfg, chart) = app.csv.chart.clone().expect("chart built at render");
+        assert_eq!((cfg.x, cfg.y, cfg.group), (1, 3, Some(0)));
+        assert_eq!(chart.series.len(), 2);
+
+        // Same version, same config: prepare keeps both caches.
+        let before = std::sync::Arc::as_ptr(&chart);
+        app.csv_prepare();
+        assert_eq!(std::sync::Arc::as_ptr(&app.csv.chart.as_ref().unwrap().3), before);
+        assert_eq!(app.csv.table.as_ref().unwrap().1, v1);
+
+        // A control change rebuilds the chart from the cached table.
+        app.csv_cycle_group();
+        app.csv_prepare();
+        let (_, _, cfg2, chart2) = app.csv.chart.clone().unwrap();
+        assert_eq!(cfg2.group, Some(1));
+        assert_ne!(std::sync::Arc::as_ptr(&chart2), before);
+        app.csv_toggle_kind();
+        app.csv_toggle_log();
+        app.csv_prepare();
+        let cfg3 = app.csv.chart.as_ref().unwrap().2.clone();
+        assert_eq!(cfg3.kind, ChartKind::Line);
+        assert!(cfg3.log_x, "40 to 1023 is under two decades, so log starts off and toggles on");
+
+        // Group cycles past the last column back to none.
+        app.csv_cycle_group();
+        app.csv_cycle_group();
+        app.csv_cycle_group();
+        app.csv_prepare();
+        assert_eq!(app.csv.chart.as_ref().unwrap().2.group, None);
+
+        app.toggle_md_preview(cx);
+        assert!(!app.csv_chart_active(), "toggle back to text");
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let _ = std::fs::remove_dir_all(&dir);
+}

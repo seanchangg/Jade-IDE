@@ -236,6 +236,12 @@ pub enum AppEvent {
     BuildDone(BuildResult),
     /// A wave-panel background result: testbench done, dump loaded.
     Wave(crate::wave::WaveEvent),
+    /// An Instruments `.trace` export finished (or failed) for the popup
+    /// opened at `generation`. Stale generations are dropped.
+    Trace {
+        generation: u64,
+        result: Result<Arc<crate::trace::TraceAnalysis>, String>,
+    },
     /// A run event: program output or a memory event (incl. `AllocBatch`).
     Run(RunEvent),
     /// A run finished with its terminal result.
@@ -566,6 +572,16 @@ pub struct JadeApp {
     /// Which action-bar diagnostic pill is open, listing the active tab's
     /// diagnostics of that severity. `None` = no popup.
     pub diag_popup: Option<DiagKind>,
+    /// The Instruments trace shown in the RUNTIME panel's TRACE section.
+    pub trace: Option<crate::trace::TraceState>,
+    /// The CPU counter picker in the RUNTIME panel's COUNTERS section.
+    pub counters: crate::counters::CountersState,
+    /// The CSV chart view: toggle, per-file column choices, parse caches.
+    pub csv: crate::panels::csv_view::CsvState,
+    /// Focus of the picker's search box; created on first use.
+    pub counters_focus: Option<FocusHandle>,
+    /// Generation of the newest trace export; older results are dropped.
+    pub trace_gen: u64,
     /// Bottom-left corner of the diagnostic pill row in window px
     /// (`x.to_bits()<<32 | y.to_bits()`), recorded by a canvas each paint so the
     /// popup can hang under the pills (same trick as `term_origin`).
@@ -1152,6 +1168,15 @@ impl JadeApp {
             term_focus: None,
             bottom_view: BottomView::Terminal,
             diag_popup: None,
+            trace: None,
+            trace_gen: 0,
+            counters: crate::counters::CountersState::with_events(if ui.counter_events.is_empty() {
+                crate::counters::DEFAULT_EVENTS.iter().map(|s| s.to_string()).collect()
+            } else {
+                ui.counter_events.clone()
+            }),
+            counters_focus: None,
+            csv: crate::panels::csv_view::CsvState::default(),
             diag_anchor: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             term_origin: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             bottom_height: 220.,
@@ -1502,6 +1527,7 @@ impl JadeApp {
             }
             AppEvent::Hw(ev) => self.on_hw_event(ev),
             AppEvent::Wave(ev) => self.on_wave_event(ev),
+            AppEvent::Trace { generation, result } => self.on_trace_ready(generation, result),
         }
     }
 
@@ -2894,6 +2920,12 @@ impl JadeApp {
     /// through the single preview ("temp") tab: a new open replaces the
     /// unedited preview tab, and the first edit makes the tab permanent.
     pub fn open_file(&mut self, path: PathBuf) {
+        // An Instruments bundle is a directory: it opens as an analysis
+        // popup, not as a buffer (Quick Open reaches here too).
+        if crate::trace::is_trace_bundle(&path) {
+            self.open_trace(path);
+            return;
+        }
         // A file lives in one pane at most: when another pane already holds
         // it, that pane takes the keyboard instead of a second buffer.
         if self.editor.index_of(&path).is_none() {
@@ -3034,6 +3066,9 @@ impl JadeApp {
         let ui = crate::workspace_state::load(&dir);
         self.breakpoints = crate::debug::Breakpoints::from_map(ui.breakpoints.clone());
         self.benchmarks = ui.benchmarks.clone();
+        if !ui.counter_events.is_empty() {
+            self.counters = crate::counters::CountersState::with_events(ui.counter_events.clone());
+        }
         // Timer bundles are per-workspace (kernel names differ per project).
         self.timer_groups = crate::timer_groups::GroupAggregator::new(ui.timer_groups.clone());
         self.declare_loaded_timer_groups();
@@ -6425,6 +6460,11 @@ impl JadeApp {
     /// the panel also leaves preview-edit mode. In split mode the chord flips
     /// the focused pane between formatted and raw instead.
     pub fn toggle_md_preview(&mut self, cx: &mut Context<Self>) {
+        // A CSV tab has its own rendered view: the chart.
+        if self.editor.active_tab().is_some_and(|t| crate::panels::csv_view::is_csv(&t.path)) {
+            self.csv.visible = !self.csv.visible;
+            return;
+        }
         if self.split_mode() {
             let idx = self.focused_pane();
             let rendered = self.panes[idx].md_rendered;
@@ -6788,6 +6828,7 @@ impl JadeApp {
             terminal_height: None,
             breakpoints: self.breakpoints.to_map(),
             benchmarks: self.benchmarks.clone(),
+            counter_events: self.counters.events.clone(),
             ai_completion_enabled: Some(self.ai_completion_enabled),
             timer_groups: self.timer_groups.defs().to_vec(),
             mode: Some(
@@ -8080,6 +8121,8 @@ fn meta_dims(meta: Option<&Map<String, Value>>) -> (Option<u32>, Option<u32>) {
 
 impl Render for JadeApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // CSV chart caches: parse and aggregate before the immutable build.
+        self.csv_prepare();
         // §4.15 risk 1: a playing clip repaints this whole tree per frame.
         // `JADE_RENDER_TRACE=1` prints the element-build time so a stutter can
         // be measured against the 16ms budget instead of argued about.
@@ -8307,6 +8350,12 @@ impl Render for JadeApp {
             && self.dim_edit.is_none()
         {
             bench_handle.focus(window, cx);
+        }
+
+        // COUNTERS event search box: focused while the user types in it.
+        let counters_handle = self.counters_handle(cx);
+        if self.counters.editing && !counters_handle.is_focused(window) && self.dim_edit.is_none() {
+            counters_handle.focus(window, cx);
         }
 
         // Rows×cols dim-editor focus (§7.2/§5.6): keep keystrokes routed to the
@@ -8606,7 +8655,7 @@ impl Render for JadeApp {
                     } else if self.mode == AppMode::Hardware {
                         crate::panels::wave_view::panel(self, cx, &theme)
                     } else {
-                        runtime_sidebar(self, cx, &theme, bench_handle)
+                        runtime_sidebar(self, cx, &theme, bench_handle, counters_handle)
                     }),
             );
 
@@ -10044,7 +10093,9 @@ fn pane_body(
 ) -> gpui::AnyElement {
     let formatted = app.pane_shows_md(idx);
     if idx == app.focused_pane() {
-        if formatted {
+        if app.csv_chart_active() {
+            crate::panels::csv_view::pane_body(app, cx, theme)
+        } else if formatted {
             crate::panels::md_view::pane_body(app, cx, theme)
         } else {
             code_view::render(app, cx)
@@ -10193,6 +10244,7 @@ fn runtime_sidebar(
     cx: &mut Context<JadeApp>,
     theme: &Theme,
     bench_handle: FocusHandle,
+    counters_handle: FocusHandle,
 ) -> gpui::AnyElement {
     use gpui::{Animation, AnimationExt as _};
 
@@ -10212,7 +10264,7 @@ fn runtime_sidebar(
         .p(scale::SPACE_2_5)
         .bg(theme.kumo.elevated)
         .overflow_y_scroll()
-        .child(runtime_panel::render(app, bench_handle, cx))
+        .child(runtime_panel::render(app, bench_handle, counters_handle, cx))
         .child(training_view::render(app, cx))
         .child(telemetry_sidebar::render(app, cx));
 

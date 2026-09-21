@@ -73,6 +73,13 @@ smallvec = "1"
 # view can overlay & compare historical runs. `bundled` compiles SQLite in —
 # no system-lib version drift, same choice Zed makes for its sqlez.
 rusqlite = { version = "0.40.1", features = ["bundled"] }
+# Instruments templates are NSKeyedArchiver binary plists; the CPU Counters
+# event list inside them is base64 plists inside JSON. `plist` reads and
+# writes both layers, `base64` the inner encoding. `libloading` opens the
+# private kperfdata framework for the event catalog.
+plist = "1"
+base64 = { workspace = true }
+libloading = "0.8"
 # Setting the app-scoped AppleFontSmoothing=0 default at startup (crisp/thin
 # text, same trick as Chromium's -webkit-font-smoothing: antialiased); gpui's
 # mac text system reads it to skip glyph dilation. Version matches gpui's.
